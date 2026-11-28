@@ -31,6 +31,7 @@ use heph::pluginexec;
 use heph::pluginstatictarget::Target;
 use hplugin::diagnostic::{Boundary, Stage};
 use hplugin::error::{CancelledError, Culprit, MissingDep, TargetFailure};
+use hplugin::provider::DeclAt;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -213,6 +214,10 @@ fn missing_dep(f: &TargetFailure) -> MissingDep {
         dep: addr(&m.dep),
         declarer: addr(&m.declarer),
         origin_id: m.origin_id.clone(),
+        at: f.record.diagnostic.location.clone().map(|loc| DeclAt {
+            changed: f.record.diagnostic.message.contains(DeclAt::CHANGED),
+            loc,
+        }),
     }
 }
 
@@ -612,19 +617,38 @@ async fn deep_missing_dep_blames_declarer() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// PR 1's interim text: before targets carry a source location, the
-/// `MissingDep` names the declarer's package (U27: the engine names no
-/// provider's file kind).
+/// D3: the `MissingDep` names where the declarer was declared, from its
+/// spec's `SpecSource` (the file its provider reported), and the record's
+/// location is that place. `//c:y` is on line 2, after a comment.
 #[tokio::test]
-async fn missing_dep_interim_text_names_the_package() -> anyhow::Result<()> {
-    let ws = chain_to_c(r#"deps = ["//d:missing"]"#, &[("d", D_PRESENT)]);
+async fn missing_dep_names_the_declaring_call() -> anyhow::Result<()> {
+    let c = format!("# y\n{}", t("y", r#"deps = ["//d:missing"]"#));
+    let ws = chain_to_c("", &[("d", D_PRESENT)]);
+    ws.write_build_file("c", &c);
     let r = run(&ws.engine, "//a:root").await;
-    let text = crate::common::failure_text(r.assert_blames("//c:y"));
+    let f = r.assert_blames("//c:y");
+    let text = crate::common::failure_text(f);
     assert!(
         text.contains("//c:y depends on //d:missing, which does not exist"),
         "{text}"
     );
-    assert!(text.contains("(`deps`, declared in package //c)"), "{text}");
+    // At the `deps` option of the declaring call, not the call's start.
+    let col = c
+        .lines()
+        .nth(1)
+        .and_then(|l| l.find("deps"))
+        .expect("deps on line 2")
+        + 1;
+    assert!(
+        text.contains(&format!("(`deps`, declared at c/BUILD:2:{col}")),
+        "{text}"
+    );
+    let at = f.record.diagnostic.location.as_ref().expect("a location");
+    assert_eq!(
+        (at.file.as_str(), at.line, at.col as usize),
+        ("c/BUILD", 2, col),
+        "{at}"
+    );
     Ok(())
 }
 

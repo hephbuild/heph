@@ -15,7 +15,7 @@ use crate::engine::error::{CancelledError, MultiError};
 use crate::engine::provider::{
     ConfigRequest, ConfigResponse, GetError, GetRequest, GetResponse, ListPackageResponse,
     ListPackagesRequest, ListRequest, ListResponse, ListedFacts, ProbeRequest, ProbeResponse,
-    Provider, State,
+    Provider, SourceIndex, SpecSource, State,
 };
 use futures::future::BoxFuture;
 use hbuiltins::pluginstatictarget;
@@ -95,6 +95,32 @@ pub struct Faults {
     /// timing. Size the barrier to the addr count; resolving them one at a
     /// time hangs, so wrap the call in a timeout.
     pub rendezvous: Option<(Vec<Addr>, Arc<tokio::sync::Barrier>)>,
+    /// The [`SpecSource`] `get` reports for each of these addrs; every other
+    /// spec has none, as the static provider reports.
+    pub sources: Vec<(Addr, SpecSource)>,
+    /// What [`Provider::source_index`] answers for a file; `None` keeps the
+    /// trait's default (no index), as a cdylib provider does.
+    pub source_index: Option<SourceIndexFn>,
+}
+
+/// [`Faults::source_index`]: the index of a file, called as the engine
+/// calls [`Provider::source_index`].
+#[derive(Clone)]
+pub struct SourceIndexFn(pub Arc<SourceIndexFnInner>);
+
+/// The function behind a [`SourceIndexFn`].
+pub type SourceIndexFnInner = dyn Fn(&str) -> Option<Arc<dyn SourceIndex>> + Send + Sync;
+
+impl SourceIndexFn {
+    pub fn new(f: impl Fn(&str) -> Option<Arc<dyn SourceIndex>> + Send + Sync + 'static) -> Self {
+        Self(Arc::new(f))
+    }
+}
+
+impl std::fmt::Debug for SourceIndexFn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SourceIndexFn(..)")
+    }
 }
 
 /// [`Faults::listed_facts`]: what `list` says about an entry.
@@ -416,8 +442,17 @@ impl Provider for FaultProvider {
                         .map_err(GetError::Other)?;
                 }
             }
-            self.inner.get(req, ctoken).await
+            let addr = req.addr.clone();
+            let mut res = self.inner.get(req, ctoken).await?;
+            if let Some((_, source)) = self.faults.sources.iter().find(|(a, _)| *a == addr) {
+                res.target_spec.source = Some(source.clone());
+            }
+            Ok(res)
         })
+    }
+
+    fn source_index(&self, file: &str) -> Option<Arc<dyn SourceIndex>> {
+        self.faults.source_index.as_ref().and_then(|f| (f.0)(file))
     }
 
     fn probe<'a>(
@@ -632,6 +667,353 @@ mod tests {
             .await
             .expect("a second failing get waited on the gate forever")?;
         assert_eq!(gaps.report().skipped, 2);
+        Ok(())
+    }
+
+    /// An index that answers every lookup with what it holds.
+    struct FixedIndex(crate::engine::provider::Located);
+
+    impl SourceIndex for FixedIndex {
+        fn locate(
+            &self,
+            _source: &SpecSource,
+            _name: &str,
+            _field: Option<&str>,
+        ) -> crate::engine::provider::Located {
+            self.0
+        }
+    }
+
+    fn span(line: u32, col: u32) -> hcore::diagnostic::Span {
+        hcore::diagnostic::Span {
+            start_line: line,
+            start_col: col,
+            end_line: line,
+            end_col: col + 1,
+        }
+    }
+
+    fn source(file: &str, line: u32) -> SpecSource {
+        SpecSource::checked(Arc::from(file), span(line, 1)).expect("a source")
+    }
+
+    /// An engine whose `//a:x` and `//b:x` name a driver no plugin registered,
+    /// each declared in its own file (`a/BUILD`, `b/BUILD`) at line 2.
+    fn located_engine(
+        source_index: Option<SourceIndexFn>,
+    ) -> anyhow::Result<(Arc<Engine>, tempfile::TempDir)> {
+        located_engine_with("nope", source_index, None)
+    }
+
+    /// [`located_engine`] with its targets naming `driver`, and `registered`
+    /// registered.
+    fn located_engine_with(
+        driver: &str,
+        source_index: Option<SourceIndexFn>,
+        registered: Option<Box<dyn crate::engine::driver::Driver>>,
+    ) -> anyhow::Result<(Arc<Engine>, tempfile::TempDir)> {
+        let root = tempfile::tempdir()?;
+        let mut engine = Engine::new(Config::for_tests(root.path()))?;
+        if let Some(d) = registered {
+            engine.register_driver(move |_| d)?;
+        }
+        let nope = |a: &str| pluginstatictarget::Target {
+            addr: a.to_string(),
+            driver: driver.to_string(),
+            ..Default::default()
+        };
+        let provider = FaultProvider::new(
+            vec![nope("//a:x"), nope("//b:x")],
+            Faults {
+                sources: vec![
+                    (addr("//a:x"), source("a/BUILD", 2)),
+                    (addr("//b:x"), source("b/BUILD", 2)),
+                ],
+                source_index,
+                ..Default::default()
+            },
+        )?;
+        engine.register_provider(move |_| Box::new(provider))?;
+        Ok((Arc::new(engine), root))
+    }
+
+    /// `targets`, which must fail, in a fresh request: the request, and the
+    /// failures it recorded.
+    async fn failures(
+        engine: &Arc<Engine>,
+        targets: &[&str],
+    ) -> (
+        Arc<crate::engine::request_state::RequestState>,
+        Vec<Arc<hplugin::error::TargetFailure>>,
+    ) {
+        use crate::engine::result::{OutputMatcher, ResultOptions};
+        let rs = engine.new_state_with_events(false, None);
+        let m = Matcher::Or(targets.iter().map(|a| Matcher::Addr(addr(a))).collect());
+        let res = Arc::clone(engine)
+            .result(
+                Arc::clone(&rs),
+                &m,
+                OutputMatcher::All,
+                &ResultOptions::default(),
+            )
+            .await;
+        assert!(res.map_or(true, |b| !b.errors.is_empty()), "must fail");
+        let failures = rs.take_failures();
+        (rs, failures)
+    }
+
+    /// `targets`, which must fail, in a fresh request: each failure's culprit
+    /// and location, sorted, and how many indexes the request loaded.
+    async fn locations(
+        engine: &Arc<Engine>,
+        targets: &[&str],
+    ) -> (Vec<(String, Option<(String, u32, u32)>)>, usize) {
+        let (rs, failures) = failures(engine, targets).await;
+        let mut got: Vec<_> = failures
+            .iter()
+            .map(|f| {
+                let d = &f.record.diagnostic;
+                assert!(
+                    !d.message.contains(crate::engine::provider::DeclAt::CHANGED),
+                    "nothing changed: {}",
+                    d.message
+                );
+                (
+                    f.culprit().to_string(),
+                    d.location.as_ref().map(|l| (l.file.clone(), l.line, l.col)),
+                )
+            })
+            .collect();
+        got.sort();
+        (got, rs.source_index_loads())
+    }
+
+    /// A provider that reports where a target was declared but cannot index
+    /// the file (a cdylib provider keeps the default): the diagnostic points
+    /// at the declaring call, and says nothing of the file having changed.
+    #[tokio::test]
+    async fn a_source_without_an_index_points_at_the_call() -> anyhow::Result<()> {
+        let (engine, _root) = located_engine(None)?;
+        let (got, _) = locations(&engine, &["//a:x"]).await;
+        assert_eq!(got, [("//a:x".into(), Some(("a/BUILD".into(), 2, 1)))]);
+        Ok(())
+    }
+
+    /// A message `compact` already cut to the cap, in a file that changed
+    /// since evaluation: the message makes room for the marker, so the record
+    /// stays within the cap and still says the file changed (CQ r2).
+    #[tokio::test]
+    async fn a_changed_marker_keeps_the_message_within_its_cap() -> anyhow::Result<()> {
+        use hcore::diagnostic::MESSAGE_CAP;
+        let index = SourceIndexFn::new(|_| {
+            Some(
+                Arc::new(FixedIndex(crate::engine::provider::Located::Changed))
+                    as Arc<dyn SourceIndex>,
+            )
+        });
+        let (engine, _root) = located_engine_with(&"n".repeat(MESSAGE_CAP), Some(index), None)?;
+        let (_, failures) = failures(&engine, &["//a:x"]).await;
+        let [f] = failures.as_slice() else {
+            panic!("one failure, got {}", failures.len());
+        };
+        let d = &f.record.diagnostic;
+        let marker = format!(" ({})", crate::engine::provider::DeclAt::CHANGED);
+        assert!(d.message.len() <= MESSAGE_CAP, "{} bytes", d.message.len());
+        assert!(d.message.ends_with(&marker), "{}", d.message);
+        assert!(d.message.contains("driver not found: nnn"), "{}", d.message);
+        assert!(d.truncated, "the message was cut");
+        Ok(())
+    }
+
+    /// A not-found of the dep a target declares, in a request that loaded no
+    /// index yet: the `MissingDep` is located at the option its origin names,
+    /// because locating it loads the index first (FQ r2 N-3). Any other
+    /// failure is `otherwise`'s, and loads nothing.
+    #[tokio::test]
+    async fn a_missing_dep_loads_the_index_it_is_located_in() -> anyhow::Result<()> {
+        let index = SourceIndexFn::new(|_| {
+            Some(
+                Arc::new(FixedIndex(crate::engine::provider::Located::Field(span(
+                    4, 9,
+                )))) as Arc<dyn SourceIndex>,
+            )
+        });
+        let (engine, _root) = located_engine(Some(index))?;
+        let rs = engine.new_state();
+        let declarer = addr("//a:x");
+        Arc::clone(&engine)
+            .get_spec(Arc::clone(&rs), &declarer)
+            .await?;
+        let dep = addr("//d:gone");
+
+        let other = rs
+            .missing_dep_or(
+                anyhow::anyhow!("boom"),
+                &dep,
+                &declarer,
+                || "deps".to_owned(),
+                |e| e.context("otherwise"),
+            )
+            .await;
+        assert_eq!(format!("{other:#}"), "otherwise: boom");
+        assert_eq!(rs.source_index_loads(), 0, "not a not-found: no load");
+
+        let e = rs
+            .missing_dep_or(
+                hplugin::error::TargetNotFoundError { addr: dep.clone() }.into(),
+                &dep,
+                &declarer,
+                || "deps".to_owned(),
+                |e| e.context("otherwise"),
+            )
+            .await;
+        let missing = hcore::hmemoizer::downcast_chain_ref::<hplugin::error::MissingDep>(&e)
+            .expect("a MissingDep");
+        let at = missing.at.as_ref().expect("a location");
+        assert_eq!(
+            (at.loc.file.as_str(), at.loc.line, at.loc.col),
+            ("a/BUILD", 4, 9)
+        );
+        assert_eq!(rs.source_index_loads(), 1);
+        Ok(())
+    }
+
+    /// A driver named `refuse` whose `parse` fails: with a cancellation when
+    /// it holds `true`, else with a refusal.
+    struct RefusingDriver(bool);
+
+    #[async_trait::async_trait]
+    impl crate::engine::driver::Driver for RefusingDriver {
+        fn config(
+            &self,
+            _r: crate::engine::driver::ConfigRequest,
+        ) -> anyhow::Result<crate::engine::driver::ConfigResponse> {
+            Ok(crate::engine::driver::ConfigResponse {
+                name: "refuse".to_string(),
+            })
+        }
+        fn schema(&self) -> crate::engine::driver::DriverSchema {
+            crate::engine::driver::DriverSchema::default()
+        }
+        async fn parse(
+            &self,
+            _r: crate::engine::driver::ParseRequest,
+            _c: &(dyn hcore::hasync::Cancellable + Send + Sync),
+        ) -> anyhow::Result<crate::engine::driver::ParseResponse> {
+            if self.0 {
+                return Err(hplugin::error::CancelledError.into());
+            }
+            anyhow::bail!("refused")
+        }
+        async fn apply_transitive(
+            &self,
+            _r: crate::engine::driver::ApplyTransitiveRequest,
+            _c: &(dyn hcore::hasync::Cancellable + Send + Sync),
+        ) -> anyhow::Result<crate::engine::driver::ApplyTransitiveResponse> {
+            anyhow::bail!("not under test")
+        }
+        async fn run<'a, 'io>(
+            &self,
+            _r: crate::engine::driver::RunRequest<'a, 'io>,
+            _c: &(dyn hcore::hasync::Cancellable + Send + Sync),
+        ) -> anyhow::Result<crate::engine::driver::RunResponse> {
+            anyhow::bail!("not under test")
+        }
+        async fn run_shell<'a, 'io>(
+            &self,
+            _r: crate::engine::driver::RunRequest<'a, 'io>,
+            _c: &(dyn hcore::hasync::Cancellable + Send + Sync),
+        ) -> anyhow::Result<crate::engine::driver::RunResponse> {
+            anyhow::bail!("not under test")
+        }
+    }
+
+    /// A parse refused by the driver loads the file's index, for the
+    /// diagnostic about it; a cancelled parse does not, since no diagnostic
+    /// is shown for it (FQ r2 N-2).
+    #[tokio::test]
+    async fn a_cancelled_parse_loads_no_index() -> anyhow::Result<()> {
+        use crate::engine::result::{OutputMatcher, ResultOptions};
+        let mut loads = Vec::new();
+        for cancelled in [false, true] {
+            let index = SourceIndexFn::new(|_| {
+                Some(Arc::new(FixedIndex(crate::engine::provider::Located::Call))
+                    as Arc<dyn SourceIndex>)
+            });
+            let (engine, _root) = located_engine_with(
+                "refuse",
+                Some(index),
+                Some(Box::new(RefusingDriver(cancelled))),
+            )?;
+            let rs = engine.new_state_with_events(false, None);
+            let res = Arc::clone(&engine)
+                .result(
+                    Arc::clone(&rs),
+                    &Matcher::Addr(addr("//a:x")),
+                    OutputMatcher::All,
+                    &ResultOptions::default(),
+                )
+                .await;
+            // A cancellation is not tallied as a failure.
+            assert!(
+                cancelled || res.map_or(true, |b| !b.errors.is_empty()),
+                "must fail"
+            );
+            loads.push((cancelled, rs.source_index_loads()));
+        }
+        assert_eq!(loads, [(false, 1), (true, 0)], "(cancelled, index loads)");
+        Ok(())
+    }
+
+    /// The engine asks for a file's index on the blocking pool, never on a
+    /// reactor worker (the provider may read and parse the file), and two
+    /// files' indexes load at the same time: each ask waits until the other
+    /// is in flight, which a lock held across the ask would make impossible.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn source_indexes_load_on_the_blocking_pool_in_parallel() -> anyhow::Result<()> {
+        let met = Arc::new((parking_lot::Mutex::new(0usize), parking_lot::Condvar::new()));
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::<(String, bool, bool)>::new()));
+        let index = SourceIndexFn::new({
+            let (met, seen) = (Arc::clone(&met), Arc::clone(&seen));
+            move |file| {
+                let blocking = hcore::blocking::in_blocking_job();
+                let (count, cv) = &*met;
+                let mut n = count.lock();
+                *n += 1;
+                cv.notify_all();
+                let both = !cv
+                    .wait_while_for(&mut n, |n| *n < 2, Duration::from_secs(10))
+                    .timed_out();
+                drop(n);
+                seen.lock().push((file.to_owned(), blocking, both));
+                Some(
+                    Arc::new(FixedIndex(crate::engine::provider::Located::Field(span(
+                        3, 7,
+                    )))) as Arc<dyn SourceIndex>,
+                )
+            }
+        });
+        let (engine, _root) = located_engine(Some(index))?;
+        let (got, loads) = locations(&engine, &["//a:x", "//b:x"]).await;
+        assert_eq!(
+            got,
+            [
+                ("//a:x".into(), Some(("a/BUILD".into(), 3, 7))),
+                ("//b:x".into(), Some(("b/BUILD".into(), 3, 7))),
+            ],
+            "each failure points where its file's index put `driver`"
+        );
+        assert_eq!(loads, 2, "one load per file");
+        let mut seen = seen.lock().clone();
+        seen.sort();
+        assert_eq!(
+            seen,
+            [
+                ("a/BUILD".to_owned(), true, true),
+                ("b/BUILD".to_owned(), true, true),
+            ],
+            "(file, on the blocking pool, met the other file's load)"
+        );
         Ok(())
     }
 }

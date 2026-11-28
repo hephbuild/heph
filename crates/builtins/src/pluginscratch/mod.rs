@@ -584,6 +584,7 @@ mod tests {
             labels: vec![],
             transitive: Default::default(),
             approval: Default::default(),
+            source: None,
         };
         let res = Driver
             .parse(
@@ -647,6 +648,7 @@ mod tests {
                 labels: vec![],
                 transitive: Default::default(),
                 approval: Default::default(),
+                source: None,
             };
             async move {
                 Driver

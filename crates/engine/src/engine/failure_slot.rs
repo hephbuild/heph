@@ -67,6 +67,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::engine::spec::EngineTargetSpec;
+
 /// The directory under the home that holds every slot.
 pub(crate) const FAILURES_DIR: &str = "failures";
 /// Name prefix of a slot being built or being discarded. A key never starts
@@ -174,6 +176,45 @@ pub struct SlotManifest {
     /// file's slot when `//d:t` has none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub packages: Vec<String>,
+    /// For a source file's slot: the provider whose evaluation of the file
+    /// failed. Only a target that provider resolves clears the slot through
+    /// [`packages`](Self::packages). `None` in a slot from an older heph,
+    /// which any provider's target clears.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+}
+
+/// What a source file's slot is cleared by ([`FailureSlots::clear`]): the
+/// packages its manifest lists, and the provider that evaluated it.
+#[derive(Debug, Clone, Default)]
+struct FileSlot {
+    /// The workspace-relative file the slot is about: compared as a string,
+    /// so a clear never hashes a key.
+    file: Arc<str>,
+    packages: Vec<String>,
+    provider: Option<String>,
+}
+
+impl FileSlot {
+    /// Whether a spec `provider` resolved for a target of `package`, declared
+    /// in the file `source`, says this slot's file evaluated again: the spec
+    /// was declared in that very file (H-M3 rule a), or the provider that
+    /// failed on the file evaluated one of the packages the file was reached
+    /// through without error, and so loaded every file of that package
+    /// cleanly (rule b).
+    ///
+    /// Rule (b) assumes a listed package still loads the file, which the
+    /// engine cannot see: no provider reports a package's loaded files. A
+    /// listed package that stops loading a still-broken `F` clears `F`'s slot,
+    /// although other packages still fail on it. Accepted: a slot is
+    /// diagnostics only (never hashed, never selects an artifact), and the
+    /// next evaluation of a package that still loads `F` fills it again.
+    /// Closing it needs the provider to report each package's load set.
+    fn cleared_by(&self, source: Option<&str>, package: &str, provider: &str) -> bool {
+        source == Some(&*self.file)
+            || (self.provider.as_deref().is_none_or(|p| p == provider)
+                && self.packages.iter().any(|p| p == package))
+    }
 }
 
 /// The engine's record of a failure's log on the error chain: what
@@ -330,13 +371,19 @@ pub struct FailureSlots {
     /// Slot names this engine knows exist: what `failures/` held when it was
     /// first listed, plus the slots filled since. Listed on first use.
     known: tokio::sync::OnceCell<std::sync::Mutex<HashSet<String>>>,
-    /// Of the known slots, each source file's (`file:` manifests): the
-    /// packages it lists. Filled with `known`; a target of one of those
-    /// packages resolving means the file evaluated again, and its slot is
-    /// cleared with the target's ([`clear`](Self::clear)).
-    file_packages: std::sync::Mutex<HashMap<String, Vec<String>>>,
+    /// Each source file's slot (`file:` manifests), known or with a claim
+    /// write in flight: the packages and provider it lists. Filled with
+    /// `known`, and by [`write_claim`] when it registers (CQ-4); a target
+    /// that says the file evaluated again ([`FileSlot::cleared_by`]) clears
+    /// it ([`clear`](Self::clear)).
+    file_slots: std::sync::Mutex<HashMap<String, FileSlot>>,
     /// Claim writes ([`write_claim`]) registered and not yet done.
     writes: PendingCounter,
+    /// Of [`writes`](Self::writes), how many each slot key has: raised when
+    /// the write registers, lowered once it has landed and is known. A clear
+    /// of a key with one waits for that key's to land (CQ-4), not for every
+    /// claim write of the engine.
+    claims: Claims,
     /// One exclusion per slot key, held by a fill, a claim write or a clear
     /// while it changes that slot: a clear or a fill never lands under a
     /// claim write registered before it. The entries no one holds are pruned
@@ -346,6 +393,10 @@ pub struct FailureSlots {
     slot_locks: std::sync::Mutex<SlotLocks>,
     #[cfg(any(test, feature = "test-support"))]
     fills: std::sync::atomic::AtomicU64,
+    /// Run by the next [`write_claim`] of a file right after it puts the
+    /// file into `file_slots`: a test holds the registration there.
+    #[cfg(test)]
+    after_file_insert: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 /// The slot exclusions ([`FailureSlots::slot_lock`]): one per key, the ones
@@ -391,11 +442,14 @@ impl FailureSlots {
         Self {
             root: home.join(FAILURES_DIR),
             known: tokio::sync::OnceCell::new(),
-            file_packages: std::sync::Mutex::default(),
+            file_slots: std::sync::Mutex::default(),
             writes: PendingCounter::default(),
+            claims: Arc::default(),
             slot_locks: std::sync::Mutex::default(),
             #[cfg(any(test, feature = "test-support"))]
             fills: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            after_file_insert: std::sync::Mutex::default(),
         }
     }
 
@@ -413,14 +467,17 @@ impl FailureSlots {
             .get(key)
     }
 
-    /// Whether someone holds or awaits the exclusion of the slot `key`.
+    /// Whether a claim write of the slot `key` is registered and not yet
+    /// landed. Only claims count: a fill or a clear holding the exclusion is
+    /// not a slot a clear has to wait for (CQ-4).
     fn slot_busy(&self, key: &str) -> bool {
-        self.slot_locks
+        self.lock_claims().get(key).is_some_and(|c| c.n > 0)
+    }
+
+    fn lock_claims(&self) -> std::sync::MutexGuard<'_, HashMap<String, ClaimCount>> {
+        self.claims
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .map
-            .get(key)
-            .is_some_and(|l| Arc::strong_count(l) > 1)
     }
 
     /// `<home>/failures`.
@@ -483,35 +540,86 @@ impl FailureSlots {
             .get_or_init(|| async {
                 let root = self.root.clone();
                 let (slots, files) = hcore::blocking::run(move || list_slots(&root)).await;
-                self.lock_file_packages().extend(files);
+                // A claim write registered before the listing is newer.
+                let mut map = self.lock_file_slots();
+                for (k, f) in files {
+                    map.entry(k).or_insert(f);
+                }
+                drop(map);
                 std::sync::Mutex::new(slots)
             })
             .await
     }
 
-    fn lock_file_packages(&self) -> std::sync::MutexGuard<'_, HashMap<String, Vec<String>>> {
-        self.file_packages
+    fn lock_file_slots(&self) -> std::sync::MutexGuard<'_, HashMap<String, FileSlot>> {
+        self.file_slots
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Take out of `known` (and the file map) every source file slot that
-    /// lists `package`: its targets resolve, so the file evaluated again.
-    fn take_files_of(&self, known: &mut HashSet<String>, package: &str) -> Vec<String> {
-        let mut files = self.lock_file_packages();
+    /// Every source file slot that `spec`, resolved for a target of
+    /// `package`, says evaluated again ([`FileSlot::cleared_by`]). `spec` is
+    /// asked only when there is a file slot; without it (the target's spec
+    /// was not resolved in this request) there is none. They stay in the
+    /// file map until [`clear`](Self::clear) has removed them.
+    fn files_of(
+        &self,
+        package: &str,
+        spec: impl FnOnce() -> Option<Arc<EngineTargetSpec>>,
+    ) -> Vec<String> {
+        let files = self.lock_file_slots();
         if files.is_empty() {
             return Vec::new();
         }
-        let keys: Vec<String> = files
+        let Some(spec) = spec() else {
+            return Vec::new();
+        };
+        let source = spec.spec.source.as_ref().map(|s| s.file());
+        files
             .iter()
-            .filter(|(_, pkgs)| pkgs.iter().any(|p| p == package))
+            .filter(|(_, f)| f.cleared_by(source, package, &spec.provider))
             .map(|(k, _)| k.clone())
-            .collect();
-        for k in &keys {
-            files.remove(k);
-            known.remove(k);
+            .collect()
+    }
+
+    /// Forget the slot `key` that a clear has just removed, under its
+    /// exclusion: unless a claim of it registered meanwhile, whose write
+    /// lands after this and is then the slot.
+    fn forget_removed(&self, known: &std::sync::Mutex<HashSet<String>>, key: &str) {
+        let mut set = known
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut files = self.lock_file_slots();
+        if !self.slot_busy(key) {
+            set.remove(key);
+            files.remove(key);
         }
-        keys
+    }
+
+    /// Undo a file claim's `file_slots` entry when its write built no slot:
+    /// nothing is on disk to clear, and the entry would defeat `clear`'s
+    /// empty fast path. Kept when the file has a slot this engine knows of,
+    /// or when another claim of it is still in flight (this one is still
+    /// counted: the caller holds its [`Claimed`]).
+    ///
+    /// One case keeps an entry with nothing on disk: a clear that ran while
+    /// this claim was registered keeps the key in `known`
+    /// ([`Self::forget_removed`] sees the claim busy), so a write that then fails leaves both entries.
+    /// The cost is one remove that finds nothing on a later clear, so it is
+    /// accepted rather than tracked with a flag.
+    fn forget_file_claim(&self, key: &str) {
+        let known = self
+            .known
+            .get()
+            .map(|k| k.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+        if known.as_ref().is_some_and(|k| k.contains(key)) {
+            return;
+        }
+        let mut files = self.lock_file_slots();
+        if self.lock_claims().get(key).is_some_and(|c| c.n > 1) {
+            return;
+        }
+        files.remove(key);
     }
 
     /// Remove `addr`'s slot, if this engine knows of one. The first call lists
@@ -519,39 +627,64 @@ impl FailureSlots {
     /// lookup, never a syscall. Best-effort: a failure to remove is logged.
     ///
     /// A claim write registered for the slot before this call
-    /// ([`write_claim`]) lands first, and is then removed with it.
+    /// ([`write_claim`]) lands first, and is then removed with it. The wait
+    /// is for that key's claims only. A slot leaves this engine's record
+    /// only once it is removed, so a clear dropped while it waits leaves
+    /// the slot for the next one.
     ///
-    /// The slot of each source file that lists `addr`'s package goes too: the
-    /// target resolved, so its package's files evaluated (D5, "a target
-    /// fixed and rebuilt green clears its slot").
-    pub async fn clear(&self, addr: &Addr) {
+    /// A source file's slot goes too when `spec`, the target's resolved
+    /// spec, says the file evaluated again ([`FileSlot::cleared_by`]): D5's
+    /// "a target fixed and rebuilt green clears its slot". `spec` is asked
+    /// only when a source file has a slot.
+    pub async fn clear(&self, addr: &Addr, spec: impl FnOnce() -> Option<Arc<EngineTargetSpec>>) {
         let known = self.known().await;
         let pending = self.writes.load(std::sync::atomic::Ordering::Acquire) > 0;
         let keys = {
-            let mut set = known
+            let set = known
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             // The common case, a home with no failures: not even the key.
             if set.is_empty() && !pending {
                 return;
             }
-            let mut keys = self.take_files_of(&mut set, addr.package.as_str());
+            let mut keys = self.files_of(addr.package.as_str(), spec);
             let key = addr_key(addr);
-            if set.remove(&key) || (pending && self.slot_busy(&key)) {
+            if set.contains(&key) || (pending && self.slot_busy(&key)) {
                 keys.push(key);
             }
             keys
         };
         for key in keys {
-            let _excl = self.slot_lock(&key).lock_owned().await;
+            let _excl = loop {
+                let excl = self.slot_lock(&key).lock_owned().await;
+                // A claim write registered before this clear that has not
+                // taken the exclusion yet: let it land first, then remove it.
+                // The wakeup is armed under the count's lock, so a claim
+                // that lands after the check cannot be missed.
+                let landed;
+                let notified;
+                {
+                    let claims = self.lock_claims();
+                    let Some(c) = claims.get(&key) else {
+                        break excl;
+                    };
+                    landed = Arc::clone(&c.landed);
+                    notified = landed.notified();
+                }
+                drop(excl);
+                notified.await;
+            };
             let dir = self.root.join(&key);
             let removed = hcore::blocking::run(move || match std::fs::remove_dir_all(&dir) {
                 Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
                 res => res.map_err(|e| (dir, e)),
             })
             .await;
-            if let Err((dir, e)) = removed {
-                tracing::warn!(addr = %addr, dir = %dir.display(), error = %e, "clearing a failure slot");
+            match removed {
+                Ok(()) => self.forget_removed(known, &key),
+                Err((dir, e)) => {
+                    tracing::warn!(addr = %addr, dir = %dir.display(), error = %e, "clearing a failure slot");
+                }
             }
         }
     }
@@ -617,6 +750,7 @@ impl FailureSlots {
             failed_at: crate::engine::event::now_unix_ms(),
             fill_id: Some(new_fill_id()),
             packages: Vec::new(),
+            provider: None,
         };
         let (root, lines, material, roots, scrub) = (
             self.root.clone(),
@@ -759,6 +893,8 @@ pub(crate) struct ClaimWrite {
     pub fill_id: Option<String>,
     /// For a file culprit: the packages its targets were reached through.
     pub packages: Vec<String>,
+    /// For a file culprit: the provider whose evaluation of it failed.
+    pub provider: Option<String>,
 }
 
 impl ClaimWrite {
@@ -791,6 +927,52 @@ impl Drop for Registered {
     }
 }
 
+/// The claim writes of each slot key ([`FailureSlots::claims`]).
+type Claims = Arc<std::sync::Mutex<HashMap<String, ClaimCount>>>;
+
+/// One slot key's claim writes in flight, and the wakeup of the clears that
+/// wait for them.
+#[derive(Default)]
+struct ClaimCount {
+    n: usize,
+    /// Notified each time one of them is done.
+    landed: Arc<tokio::sync::Notify>,
+}
+
+/// One claim write of a slot key on [`FailureSlots::claims`], until dropped.
+struct Claimed {
+    claims: Claims,
+    key: String,
+}
+
+impl Claimed {
+    fn new(claims: Claims, key: String) -> Self {
+        claims
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(key.clone())
+            .or_default()
+            .n += 1;
+        Self { claims, key }
+    }
+}
+
+impl Drop for Claimed {
+    fn drop(&mut self) {
+        let mut claims = self
+            .claims
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(c) = claims.get_mut(&self.key) {
+            c.n = c.n.saturating_sub(1);
+            c.landed.notify_waiters();
+            if c.n == 0 {
+                claims.remove(&self.key);
+            }
+        }
+    }
+}
+
 /// Write `claim` into the failure slots of `engine`, in the background.
 ///
 /// Registered here, synchronously, before the claim's winner returns: on
@@ -804,12 +986,36 @@ pub(crate) fn write_claim(
     claim: ClaimWrite,
 ) {
     let key = claim.key();
-    let file_packages =
-        matches!(claim.culprit, hplugin::error::Culprit::File(_)).then(|| claim.packages.clone());
     let slots = &engine.failure_slots;
+    let is_file = matches!(claim.culprit, hplugin::error::Culprit::File(_));
+    // Counted before the file goes into `file_slots`: a clear that finds the
+    // file there finds it busy too, and a clear that comes after the insert
+    // sees a write pending, so its empty fast path does not skip it.
+    let registered = Registered::new([bg_pending, Arc::clone(&slots.writes)]);
+    let claimed = Claimed::new(Arc::clone(&slots.claims), key.clone());
+    // A file's slot is clearable from now, not from when it lands: a clear
+    // that comes first finds it, and waits for it (CQ-4).
+    if let hplugin::error::Culprit::File(rel) = &claim.culprit {
+        slots.lock_file_slots().insert(
+            key.clone(),
+            FileSlot {
+                file: rel.clone(),
+                packages: claim.packages.clone(),
+                provider: claim.provider.clone(),
+            },
+        );
+        #[cfg(test)]
+        if let Some(hook) = slots
+            .after_file_insert
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            hook();
+        }
+    }
     let lock = slots.slot_lock(&key);
     let held = Arc::clone(&lock).try_lock_owned().ok();
-    let registered = Registered::new([bg_pending, Arc::clone(&slots.writes)]);
     match tokio::runtime::Handle::try_current() {
         Ok(handle) => {
             handle.spawn(async move {
@@ -818,36 +1024,38 @@ pub(crate) fn write_claim(
                     Some(g) => g,
                     None => lock.lock_owned().await,
                 };
+                // Lowered first, while the exclusion is still held.
+                let _claimed = claimed;
                 let root = engine.failure_slots.root.clone();
                 let (new_slot, key) =
                     hcore::blocking::run(move || (write_claim_logged(&root, &key, &claim), key))
                         .await;
                 if new_slot {
-                    let slots = &engine.failure_slots;
-                    let known = slots.known().await;
-                    if let Some(pkgs) = file_packages {
-                        slots.lock_file_packages().insert(key.clone(), pkgs);
-                    }
-                    known
+                    engine
+                        .failure_slots
+                        .known()
+                        .await
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .insert(key);
+                } else if is_file {
+                    engine.failure_slots.forget_file_claim(&key);
                 }
             });
         }
         Err(_) => {
             let _registered = registered;
             let _excl = held.unwrap_or_else(|| lock.blocking_lock_owned());
-            if write_claim_logged(&slots.root, &key, &claim)
-                && let Some(known) = slots.known.get()
-            {
-                if let Some(pkgs) = file_packages {
-                    slots.lock_file_packages().insert(key.clone(), pkgs);
+            let _claimed = claimed;
+            if write_claim_logged(&slots.root, &key, &claim) {
+                if let Some(known) = slots.known.get() {
+                    known
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(key);
                 }
-                known
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(key);
+            } else if is_file {
+                slots.forget_file_claim(&key);
             }
         }
     }
@@ -920,6 +1128,7 @@ fn write_claim_files(root: &Path, key: &str, claim: &ClaimWrite) -> anyhow::Resu
                 failed_at: crate::engine::event::now_unix_ms(),
                 fill_id: Some(fill_id),
                 packages: claim.packages.clone(),
+                provider: claim.provider.clone(),
             };
             fill_slot(
                 root,
@@ -1399,6 +1608,7 @@ pub(crate) fn write_test_slot(root: &Path, addr: &Addr, failed_at: u64, log: &[u
         failed_at,
         fill_id: Some(new_fill_id()),
         packages: Vec::new(),
+        provider: None,
     };
     std::fs::write(dir.join(MANIFEST), serde_json::to_vec(&m).expect("json")).expect("manifest");
     dir
@@ -1424,6 +1634,7 @@ pub(crate) fn write_test_file_slot(root: &Path, rel: &str, failed_at: u64) -> Pa
         failed_at,
         fill_id: Some(fill_id),
         packages: Vec::new(),
+        provider: None,
     };
     std::fs::write(dir.join(MANIFEST), serde_json::to_vec(&m).expect("json")).expect("manifest");
     dir
@@ -1432,7 +1643,7 @@ pub(crate) fn write_test_file_slot(root: &Path, rel: &str, failed_at: u64) -> Pa
 /// The slot names under `root`; temporaries are not slots. With them, each
 /// source file slot's name and the packages its manifest lists: a file key's
 /// readable part starts `file_`, so only those manifests are read.
-fn list_slots(root: &Path) -> (HashSet<String>, HashMap<String, Vec<String>>) {
+fn list_slots(root: &Path) -> (HashSet<String>, HashMap<String, FileSlot>) {
     let Ok(entries) = std::fs::read_dir(root) else {
         return Default::default();
     };
@@ -1445,8 +1656,15 @@ fn list_slots(root: &Path) -> (HashSet<String>, HashMap<String, Vec<String>>) {
         .filter(|n| n.starts_with("file_"))
         .filter_map(|n| {
             let m = read_any_manifest(&root.join(n))?;
-            (m.addr.starts_with(FILE_ADDR_PREFIX) && !m.packages.is_empty())
-                .then(|| (n.clone(), m.packages))
+            let file = m.addr.strip_prefix(FILE_ADDR_PREFIX)?;
+            (!m.packages.is_empty()).then(|| {
+                let slot = FileSlot {
+                    file: file.into(),
+                    packages: m.packages,
+                    provider: m.provider,
+                };
+                (n.clone(), slot)
+            })
         })
         .collect();
     (slots, files)
@@ -1455,6 +1673,7 @@ fn list_slots(root: &Path) -> (HashSet<String>, HashMap<String, Vec<String>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context as _;
     use hplugin::error::{log_file_artifact, with_failure_artifacts};
 
     fn addr(s: &str) -> Addr {
@@ -1502,6 +1721,7 @@ mod tests {
             failed_at: 1,
             fill_id: Some("f".into()),
             packages: Vec::new(),
+            provider: None,
         }
     }
 
@@ -2009,6 +2229,7 @@ mod tests {
                     record: Arc::new(rec),
                     fill_id: None,
                     packages: Vec::new(),
+                    provider: None,
                 },
             );
         }
@@ -2265,33 +2486,336 @@ mod tests {
         assert!(!slots.slot_dir(&b).exists());
     }
 
-    /// A source file's slot lists the packages reached through it; a target of
-    /// one of them resolving clears it (the file evaluated), a target of
-    /// another package does not, and a slot listing no package stays.
+    /// A spec `provider` resolved, declared in `file`.
+    fn resolved(provider: &str, file: Option<&str>) -> Option<Arc<EngineTargetSpec>> {
+        let source = file.map(|f| {
+            let call = hcore::diagnostic::Span {
+                start_line: 1,
+                start_col: 1,
+                end_line: 1,
+                end_col: 2,
+            };
+            hplugin::provider::SpecSource::checked(Arc::from(f), call).expect("source")
+        });
+        Some(Arc::new(EngineTargetSpec {
+            spec: Arc::new(hplugin::provider::TargetSpec {
+                source,
+                ..Default::default()
+            }),
+            provider: provider.to_owned(),
+        }))
+    }
+
+    /// A source file slot of `rel` listing `pkgs`, failed in `provider`.
+    fn file_slot_of(root: &Path, rel: &str, pkgs: &[&str], provider: Option<&str>) -> PathBuf {
+        let dir = write_test_file_slot(root, rel, 1);
+        let mut m = read_any_manifest(&dir).expect("manifest");
+        m.packages = pkgs.iter().map(|p| (*p).to_owned()).collect();
+        m.provider = provider.map(str::to_owned);
+        std::fs::write(dir.join(MANIFEST), serde_json::to_vec(&m).expect("json"))
+            .expect("manifest");
+        dir
+    }
+
+    /// A source file's slot lists the packages reached through it and the
+    /// provider that failed on it. That provider resolving a target of one of
+    /// them clears it (rule b: the package evaluated, its loaded files with
+    /// it), a target of another package does not, and a slot listing no
+    /// package stays. A slot from an older heph (no provider) is cleared by
+    /// any provider's target.
     #[tokio::test]
     async fn clear_takes_the_file_slots_of_the_targets_package() {
         let home = tempfile::tempdir().expect("home");
         let root = home.path().join(FAILURES_DIR);
-        let with_packages = |rel: &str, pkgs: &[&str]| {
-            let dir = write_test_file_slot(&root, rel, 1);
-            let mut m = read_any_manifest(&dir).expect("manifest");
-            m.packages = pkgs.iter().map(|p| (*p).to_owned()).collect();
-            std::fs::write(dir.join(MANIFEST), serde_json::to_vec(&m).expect("json"))
-                .expect("manifest");
-            dir
-        };
-        let d = with_packages("d/BUILD", &["d"]);
-        let defs = with_packages("lib/defs.bzl", &["e", "d"]);
-        let none = with_packages("x/BUILD", &[]);
+        let d = file_slot_of(&root, "d/BUILD", &["d"], Some("bf"));
+        let defs = file_slot_of(&root, "lib/defs.bzl", &["e", "d"], Some("bf"));
+        let none = file_slot_of(&root, "x/BUILD", &[], Some("bf"));
+        let old = file_slot_of(&root, "o/BUILD", &["o"], None);
         let slots = FailureSlots::new(home.path());
 
-        slots.clear(&addr("//other:t")).await;
+        slots
+            .clear(&addr("//other:t"), || resolved("bf", Some("other/BUILD")))
+            .await;
         assert!(d.exists() && defs.exists());
-        slots.clear(&addr("//d:t")).await;
+        slots
+            .clear(&addr("//d:t"), || resolved("bf", Some("d/BUILD")))
+            .await;
         assert!(!d.exists(), "d/BUILD evaluated again");
         assert!(!defs.exists(), "d loads lib/defs.bzl, which evaluated");
         assert!(none.exists(), "a slot naming no package is gc's");
         assert_eq!(slots.read_file("d/BUILD"), None);
+        slots
+            .clear(&addr("//o:t"), || resolved("other", None))
+            .await;
+        assert!(!old.exists(), "an older slot names no provider");
+    }
+
+    /// H-M3: another provider serving a target of `d` says nothing about the
+    /// file the first one failed on: its slot stays. The failing provider's
+    /// own target there clears it.
+    #[tokio::test]
+    async fn another_providers_target_keeps_the_file_slot() {
+        let home = tempfile::tempdir().expect("home");
+        let root = home.path().join(FAILURES_DIR);
+        let d = file_slot_of(&root, "d/BUILD", &["d"], Some("a"));
+        let slots = FailureSlots::new(home.path());
+
+        slots.clear(&addr("//d:t"), || resolved("b", None)).await;
+        assert!(
+            d.exists(),
+            "provider b resolving //d:t cleared provider a's file"
+        );
+        slots.clear(&addr("//d:t"), || None).await;
+        assert!(d.exists(), "no resolved spec clears no file slot");
+        slots
+            .clear(&addr("//d:t"), || resolved("a", Some("d/BUILD")))
+            .await;
+        assert!(!d.exists());
+    }
+
+    /// H-M3 rule a: a target declared in the file itself clears its slot,
+    /// whatever package the slot lists: a fixed `.bzl` declaring a target.
+    #[tokio::test]
+    async fn a_target_declared_in_the_file_clears_its_slot() {
+        let home = tempfile::tempdir().expect("home");
+        let root = home.path().join(FAILURES_DIR);
+        let defs = file_slot_of(&root, "lib/defs.bzl", &["e"], Some("bf"));
+        let slots = FailureSlots::new(home.path());
+
+        slots
+            .clear(&addr("//z:t"), || resolved("other", Some("lib/defs.bzl")))
+            .await;
+        assert!(!defs.exists(), "a target declared in lib/defs.bzl resolved");
+    }
+
+    /// CQ-4: a file claim registered before a clear that says the file
+    /// evaluated is found by it, though it has not landed: the clear waits
+    /// for it and removes it, and the write never lands after the clear.
+    #[tokio::test]
+    async fn clear_finds_a_file_claim_in_flight() -> anyhow::Result<()> {
+        let root = hcore::fsutil::tempdir()?;
+        let engine = Arc::new(crate::engine::Engine::new(
+            crate::engine::Config::for_tests(root.path()),
+        )?);
+        let slots = &engine.failure_slots;
+        // Listed first, and the claim's exclusion held elsewhere, so the
+        // write is in flight when the clear comes.
+        slots.clear(&addr("//nothing:t"), || None).await;
+        let busy = slots.slot_lock(&file_key("d/BUILD")).lock_owned().await;
+        let record = hcore::failure::FailureRecord::new(hcore::diagnostic::Diagnostic::new(
+            hcore::diagnostic::Stage::Eval,
+            "broken",
+        ));
+        write_claim(
+            Arc::clone(&engine),
+            PendingCounter::default(),
+            ClaimWrite {
+                culprit: hplugin::error::Culprit::File(Arc::from("d/BUILD")),
+                record: Arc::new(record),
+                fill_id: None,
+                packages: vec!["d".to_owned()],
+                provider: Some("bf".to_owned()),
+            },
+        );
+        assert!(slots.slot_busy(&file_key("d/BUILD")));
+        let d = addr("//d:t");
+        let clear = slots.clear(&d, || resolved("bf", Some("d/BUILD")));
+        drop(busy);
+        clear.await;
+        slots.writes_drained().await;
+        assert_eq!(
+            slots.read_file("d/BUILD"),
+            None,
+            "the write landed after the clear"
+        );
+        assert!(!slots.slot_busy(&file_key("d/BUILD")));
+        Ok(())
+    }
+
+    /// A file claim write for `d/BUILD`, as [`write_claim`] gets it.
+    fn d_build_claim() -> ClaimWrite {
+        ClaimWrite {
+            culprit: hplugin::error::Culprit::File(Arc::from("d/BUILD")),
+            record: Arc::new(hcore::failure::FailureRecord::new(
+                hcore::diagnostic::Diagnostic::new(hcore::diagnostic::Stage::Eval, "broken"),
+            )),
+            fill_id: None,
+            packages: vec!["d".to_owned()],
+            provider: Some("bf".to_owned()),
+        }
+    }
+
+    /// CQ IMPORTANT: a clear that runs just after a file claim put the file
+    /// into `file_slots` already sees the claim as busy. Before the fix the
+    /// count was raised after the insert, so a clear in that window took the
+    /// file, found nothing busy and removed nothing, and the write then
+    /// landed untracked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clear_right_after_a_file_claim_registers_waits_for_it() -> anyhow::Result<()> {
+        let root = hcore::fsutil::tempdir()?;
+        let engine = Arc::new(crate::engine::Engine::new(
+            crate::engine::Config::for_tests(root.path()),
+        )?);
+        let slots = &engine.failure_slots;
+        slots.clear(&addr("//nothing:t"), || None).await;
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel::<()>();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        *slots
+            .after_file_insert
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(move || {
+            // A test that went away has nothing to hold.
+            if reached_tx.send(()).is_ok() {
+                let _: Result<(), _> = go_rx.recv();
+            }
+        }));
+        let writer = tokio::task::spawn_blocking({
+            let engine = Arc::clone(&engine);
+            move || write_claim(engine, PendingCounter::default(), d_build_claim())
+        });
+        tokio::task::spawn_blocking(move || reached_rx.recv()).await??;
+        let mut clear = tokio::spawn({
+            let engine = Arc::clone(&engine);
+            async move {
+                engine
+                    .failure_slots
+                    .clear(&addr("//d:t"), || resolved("bf", Some("d/BUILD")))
+                    .await;
+            }
+        });
+        // Before the fix the clear finishes here, having removed nothing;
+        // after it, it waits for the claim, which the hook holds.
+        let finished_early =
+            tokio::time::timeout(std::time::Duration::from_millis(500), &mut clear)
+                .await
+                .is_ok();
+        go_tx.send(())?;
+        writer.await?;
+        if !finished_early {
+            clear.await?;
+        }
+        slots.writes_drained().await;
+        assert_eq!(
+            slots.read_file("d/BUILD"),
+            None,
+            "the claim landed after the clear that took its file"
+        );
+        Ok(())
+    }
+
+    /// A target claim write for `addr` with a slot of its own.
+    fn target_claim(addr: &Addr) -> ClaimWrite {
+        ClaimWrite {
+            culprit: hplugin::error::Culprit::Target(addr.clone()),
+            record: Arc::new(hcore::failure::FailureRecord::new(
+                hcore::diagnostic::Diagnostic::new(hcore::diagnostic::Stage::Parse, "broken"),
+            )),
+            fill_id: None,
+            packages: Vec::new(),
+            provider: None,
+        }
+    }
+
+    /// CQ MINOR: a clear waits for its own key's claim, not for every claim
+    /// of the engine: with another key's claim held in flight, it still
+    /// finishes once its own has landed.
+    #[tokio::test]
+    async fn a_clear_waits_only_for_its_own_keys_claim() -> anyhow::Result<()> {
+        let root = hcore::fsutil::tempdir()?;
+        let engine = Arc::new(crate::engine::Engine::new(
+            crate::engine::Config::for_tests(root.path()),
+        )?);
+        let slots = &engine.failure_slots;
+        slots.clear(&addr("//nothing:t"), || None).await;
+        let (a, b) = (addr("//p:a"), addr("//p:b"));
+        let busy_a = slots.slot_lock(&addr_key(&a)).lock_owned().await;
+        let busy_b = slots.slot_lock(&addr_key(&b)).lock_owned().await;
+        write_claim(
+            Arc::clone(&engine),
+            PendingCounter::default(),
+            target_claim(&a),
+        );
+        write_claim(
+            Arc::clone(&engine),
+            PendingCounter::default(),
+            target_claim(&b),
+        );
+        let clear = slots.clear(&a, || None);
+        drop(busy_a);
+        tokio::time::timeout(std::time::Duration::from_secs(10), clear)
+            .await
+            .map_err(anyhow::Error::from)
+            .context("the clear of //p:a waited for //p:b's claim")?;
+        assert_eq!(slots.read(&a), None, "//p:a's claim landed after its clear");
+        drop(busy_b);
+        slots.writes_drained().await;
+        assert!(slots.read(&b).is_some());
+        Ok(())
+    }
+
+    /// CQ MINOR: a clear dropped while it waits for a file claim leaves the
+    /// file in `file_slots`, so a later clear still removes the slot the
+    /// claim wrote.
+    #[tokio::test]
+    async fn a_cancelled_clear_keeps_the_file_slot() -> anyhow::Result<()> {
+        let root = hcore::fsutil::tempdir()?;
+        let engine = Arc::new(crate::engine::Engine::new(
+            crate::engine::Config::for_tests(root.path()),
+        )?);
+        let slots = &engine.failure_slots;
+        slots.clear(&addr("//nothing:t"), || None).await;
+        let d = addr("//d:t");
+        let busy = slots.slot_lock(&file_key("d/BUILD")).lock_owned().await;
+        write_claim(
+            Arc::clone(&engine),
+            PendingCounter::default(),
+            d_build_claim(),
+        );
+        let cancelled = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            slots.clear(&d, || resolved("bf", Some("d/BUILD"))),
+        )
+        .await;
+        assert!(cancelled.is_err(), "the clear did not wait for the claim");
+        drop(busy);
+        slots.writes_drained().await;
+        assert!(slots.read_file("d/BUILD").is_some(), "the claim landed");
+        slots.clear(&d, || resolved("bf", Some("d/BUILD"))).await;
+        assert_eq!(
+            slots.read_file("d/BUILD"),
+            None,
+            "the cancelled clear lost the file"
+        );
+        Ok(())
+    }
+
+    /// CQ NIT: a file claim whose write fails leaves no `file_slots` entry
+    /// behind, so `clear`'s empty fast path holds again.
+    #[tokio::test]
+    async fn a_failed_file_claim_write_forgets_its_file() -> anyhow::Result<()> {
+        let root = hcore::fsutil::tempdir()?;
+        let engine = Arc::new(crate::engine::Engine::new(
+            crate::engine::Config::for_tests(root.path()),
+        )?);
+        let slots = &engine.failure_slots;
+        slots.clear(&addr("//nothing:t"), || None).await;
+        // No slot can be built under a `failures` that is a file.
+        if let Some(parent) = slots.root().parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(slots.root(), b"not a directory")?;
+        write_claim(
+            Arc::clone(&engine),
+            PendingCounter::default(),
+            d_build_claim(),
+        );
+        slots.writes_drained().await;
+        assert!(slots.read_file("d/BUILD").is_none());
+        assert!(
+            slots.lock_file_slots().is_empty(),
+            "the failed write left its file behind"
+        );
+        Ok(())
     }
 
     /// D10: a slot with an `out/` and no log is a slot; I3: `clear` takes
@@ -2317,7 +2841,7 @@ mod tests {
         assert!(!dir.join(LOG).exists());
         assert!(!staged_tar.exists(), "the owned tar is freed once unpacked");
         assert_eq!(slots.read(&a).map(|m| m.addr), Some(a.format()));
-        slots.clear(&a).await;
+        slots.clear(&a, || None).await;
         assert!(!dir.exists(), "cleared with its out/");
         assert_eq!(slots.read(&a), None);
 

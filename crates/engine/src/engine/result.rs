@@ -2324,6 +2324,28 @@ fn first_member(e: anyhow::Error) -> anyhow::Error {
     }
 }
 
+/// Where in `culprit`'s declaring call its failure `e` points, for a record
+/// that has no location of its own: the option the error is about (a field
+/// the driver's spec parse refused, an unknown option, the `driver` no plugin
+/// registered), else the call itself for a failure to parse the spec. `None`
+/// for any other failure: a run, a link or a cache failure is not about the
+/// declaration, even when its chain happens to name an option.
+fn culprit_location(
+    rs: &RequestState,
+    culprit: &Addr,
+    e: &anyhow::Error,
+    stage: hcore::diagnostic::Stage,
+) -> Option<hplugin::provider::DeclAt> {
+    let no_driver = downcast_chain_ref::<hplugin::error::DriverNotFound>(e).is_some();
+    if stage != hcore::diagnostic::Stage::Parse && !no_driver {
+        return None;
+    }
+    let field = hplugin::htspec::error_option(e)
+        .or_else(|| no_driver.then_some(hplugin::error::DriverNotFound::FIELD));
+    // `get_def` loaded the index before raising either failure.
+    rs.loaded_decl_field_loc(culprit, field)
+}
+
 /// Records `e` against `culprit`, entered through `entry`, and returns the
 /// marker naming it, with whether this call's record won the claim.
 fn record_culprit(
@@ -2384,6 +2406,14 @@ fn record_culprit(
         };
         let mut record = crate::engine::failure_record::compact(&e, &culprit, &entry, &scrub);
         record.path = path.iter().map(Addr::format).collect();
+        if record.diagnostic.location.is_none()
+            && let Culprit::Target(c) = &culprit
+            && let Some(at) = culprit_location(rs, c, &e, record.diagnostic.stage)
+        {
+            // A location the text may no longer be at says so, in the
+            // message both renderers show, within the caps `compact` kept.
+            crate::engine::failure_record::locate(&mut record, at);
+        }
         Arc::new(record)
     });
     let claim = record
@@ -2398,6 +2428,14 @@ fn record_culprit(
             packages: match &culprit {
                 Culprit::File(_) => vec![entry.package.as_str().to_owned()],
                 Culprit::Target(_) => Vec::new(),
+            },
+            // The provider whose `get` evaluated the file (H-M3).
+            provider: match &culprit {
+                Culprit::File(_) => {
+                    hcore::hmemoizer::innermost::<crate::engine::discovery::InProvider>(&e)
+                        .map(|p| p.provider.clone())
+                }
+                Culprit::Target(_) => None,
             },
         });
     let mut failure = TargetFailure::new(entry);
@@ -4897,7 +4935,7 @@ impl Engine {
         read: ResultReadGuard,
     ) -> (Arc<LockedResolution>, Option<Arc<ResultReadGuard>>) {
         // The target resolved: its last failure is stale. Under the read.
-        self.failure_slots.clear(addr).await;
+        rs.clear_failure(&self.failure_slots, addr).await;
         let (slot, read) = GuardSlot::new(addr, hashin, Resolved::Hit(Arc::clone(&manifest)), read);
         (
             Arc::new(LockedResolution {
@@ -5307,7 +5345,7 @@ impl Engine {
         // A hit after all (the re-check, or the remote): the last failure is
         // stale. Under the write lock. An execute cleared it itself.
         if executed.is_none() {
-            self.failure_slots.clear(addr).await;
+            rs.clear_failure(&self.failure_slots, addr).await;
         }
 
         // Downgrade to an upgradable read, then take a plain read while still
@@ -7003,10 +7041,17 @@ impl Engine {
 
         let driver = match self.drivers_by_name.get(&spec.driver) {
             Some(driver) => driver,
-            None => anyhow::bail!("driver not found: {}", spec.driver),
+            None => {
+                // The failure points at the `driver` option: its index.
+                rs.load_source_index(addr).await;
+                return Err(hplugin::error::DriverNotFound {
+                    driver: spec.driver.clone(),
+                }
+                .into());
+            }
         };
 
-        let res = driver
+        let parsed = driver
             .driver
             .parse(
                 ParseRequest {
@@ -7015,8 +7060,18 @@ impl Engine {
                 },
                 rs.ctoken(),
             )
-            .await
-            .with_context(|| format!("{} parse", driver.name))?;
+            .await;
+        let res = match parsed {
+            Ok(res) => res,
+            Err(e) => {
+                // A refused spec points at the option it names: its index.
+                // A cancelled parse shows no diagnostic, so loads none.
+                if !crate::engine::discovery::is_cancellation(&rs, &e) {
+                    rs.load_source_index(addr).await;
+                }
+                return Err(e.context(format!("{} parse", driver.name)));
+            }
+        };
         let mut def = rewrite_query_inputs(res.target_def, addr, &spec.provider);
         // Expand the engine-baked `//@heph/introspect:outputs` magic input into
         // one `@heph/fs` input per declared output path of this target. Done
@@ -7209,18 +7264,21 @@ impl Engine {
                 let input_ref = &input.r#ref;
                 enclose!((self => engine, rs) async move {
                     let dep = &input_ref.r#ref;
-                    let spec = Arc::clone(&engine)
-                        .get_spec(rs.clone(), dep)
-                        .await
-                        .map_err(|e| {
-                            MissingDep::wrap_or(
+                    let spec = match Arc::clone(&engine).get_spec(rs.clone(), dep).await {
+                        Ok(spec) => spec,
+                        Err(e) => {
+                            // Boxed, as in `input_def`: an edge's future holds
+                            // a pointer for this failure-only path (FQ r2 N-1).
+                            return Err(Box::pin(rs.missing_dep_or(
                                 e,
                                 dep,
                                 declarer,
                                 || crate::engine::deferred::declared_origin(&input.origin_id),
                                 |e| hplugin::diagnostic::with_stage(e, Boundary::GetSpec, dep),
-                            )
-                        })?;
+                            ))
+                            .await);
+                        }
+                    };
 
                     // For transparent targets (groups), use the pre-computed applied_transitive
                     // which already recursively aggregates all nested deps' transitives.
@@ -7558,6 +7616,7 @@ mod failure_fate_tests {
             &input,
             &declarer,
             || origin.to_owned(),
+            |_| None,
             |e| {
                 e.context(InputDefFailed {
                     input: input.clone(),
@@ -7717,6 +7776,7 @@ mod failure_fate_tests {
             dep: a("//d:t"),
             declarer: a("//c:y"),
             origin_id: "deps".to_owned(),
+            at: None,
         });
         assert!(
             matches!(failure_fate(&a("//c:y"), &e), FailureFate::Propagate),
@@ -12715,14 +12775,14 @@ mod tests {
         assert!(!slot.join(hcore::failure_log::LOG).exists());
         let diag = hcore::failure_log::read_diagnostic(&slot).expect("diagnostic.json");
         assert!(diag.diagnostic.message.contains("def failed"), "{diag:?}");
-        engine.failure_slots.clear(&addr).await;
+        engine.failure_slots.clear(&addr, || None).await;
         assert!(!slot.exists());
 
         // An engine that has listed `failures/` (empty) and has not seen the
         // write land: the clear must still wait for it.
         let rs = engine.new_state();
         let _ = classify_failure(&rs, &addr, anyhow::anyhow!("def failed again"));
-        engine.failure_slots.clear(&addr).await;
+        engine.failure_slots.clear(&addr, || None).await;
         engine.failure_slots.writes_drained().await;
         assert!(!slot.exists(), "the write landed after the clear");
         Ok(())

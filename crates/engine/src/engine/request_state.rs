@@ -710,6 +710,13 @@ impl TookDown {
     pub const NAMED: usize = 5;
 }
 
+/// One source file's index as its provider gave it, `None` included, loaded
+/// at most once ([`RequestState::load_source_index`]).
+type SourceIndexCell = Arc<tokio::sync::OnceCell<Option<Arc<dyn hplugin::provider::SourceIndex>>>>;
+
+/// [`RequestStateData::source_indexes`]: (provider name, file) → index.
+type SourceIndexes = FxHashMap<(String, Arc<str>), SourceIndexCell>;
+
 /// The values a request's targets were handed to scrub
 /// ([`RequestStateData::scrubs`]).
 #[derive(Default)]
@@ -880,6 +887,17 @@ pub struct RequestStateData {
     /// read only on a failure. Never reaches a hash: the origin ids keep
     /// their text; this is the reverse lookup, held for the request.
     transitive_declarers: Mutex<FxHashMap<String, Addr>>,
+    /// Each source file's index, by (provider, workspace-relative file), as
+    /// the provider gave it ([`Provider::source_index`](hplugin::provider::Provider::source_index)),
+    /// `None` included: asked once per file per request, however many
+    /// diagnostics point into it. The map's lock is held only to get or
+    /// insert a file's cell, so files load in parallel. Filled only on a
+    /// failure, read only by [`RequestState::decl_field_loc`]; never reaches
+    /// a hash (I1).
+    source_indexes: Mutex<SourceIndexes>,
+    /// How many times a provider was asked for a source index this request:
+    /// one per file is the budget ([`RequestState::source_index_loads`]).
+    source_index_loads: std::sync::atomic::AtomicUsize,
     /// How many request-end passes ([`RequestState::skipped_report`]) ran:
     /// one per failed request is the budget.
     report_passes: std::sync::atomic::AtomicUsize,
@@ -1563,6 +1581,146 @@ impl RequestState {
             }
         }
         out
+    }
+
+    /// `e`, a failure resolving `dep`, which `declarer` declared: with a
+    /// [`MissingDep`](hplugin::error::MissingDep) located at the declaration
+    /// ([`decl_field_loc`](Self::decl_field_loc)) when `e` is `dep`'s
+    /// not-found, else as `otherwise` wraps it
+    /// ([`MissingDep::wrap_or`](hplugin::error::MissingDep::wrap_or)).
+    ///
+    /// The one way a `MissingDep` site locates the declaration, so none can
+    /// look it up in an index it never loaded (FQ r2 N-3).
+    pub(crate) async fn missing_dep_or(
+        &self,
+        e: anyhow::Error,
+        dep: &Addr,
+        declarer: &Addr,
+        origin_id: impl FnOnce() -> String,
+        otherwise: impl FnOnce(anyhow::Error) -> anyhow::Error,
+    ) -> anyhow::Error {
+        use hplugin::error::MissingDep;
+        if !MissingDep::names(&e, dep) {
+            return otherwise(e);
+        }
+        let origin_id = origin_id();
+        let field = crate::engine::deferred::origin_field(&origin_id);
+        let at = self.decl_field_loc(declarer, field).await;
+        MissingDep::wrap_or(e, dep, declarer, || origin_id, |_| at, otherwise)
+    }
+
+    /// Where `addr` declared option `field`, for a diagnostic about it: the
+    /// span its provider's [`SourceIndex`](hplugin::provider::SourceIndex)
+    /// finds in the declaring call, else that call's start (its spec's
+    /// [`SpecSource`](hplugin::provider::SpecSource)); `field` `None` is the
+    /// call. Marked changed when the index finds the file no longer holds
+    /// the call as evaluated. Error path only: it loads the file's index
+    /// first ([`load_source_index`](Self::load_source_index)).
+    ///
+    /// Never resolves anything: a spec not yet resolved, resolved with an
+    /// error, or whose provider reported no source has no location here.
+    pub(crate) async fn decl_field_loc(
+        &self,
+        addr: &Addr,
+        field: Option<&str>,
+    ) -> Option<hplugin::provider::DeclAt> {
+        self.load_source_index(addr).await;
+        self.loaded_decl_field_loc(addr, field)
+    }
+
+    /// [`decl_field_loc`](Self::decl_field_loc) without the load, for a
+    /// caller that cannot await: it never asks the provider, and a file
+    /// whose index the request did not load points at the call. Only the
+    /// record of a failure `get_def` raised after loading the index (a
+    /// refused parse, an unknown driver) reads it.
+    pub(crate) fn loaded_decl_field_loc(
+        &self,
+        addr: &Addr,
+        field: Option<&str>,
+    ) -> Option<hplugin::provider::DeclAt> {
+        let spec = self.resolved_spec(addr)?;
+        let source = spec.spec.source.as_ref()?;
+        let located = self
+            .source_index(&spec.provider, source.file_arc())
+            .map_or(hplugin::provider::Located::Call, |index| {
+                index.locate(source, &addr.name, field)
+            });
+        Some(hplugin::provider::DeclAt::new(source, located))
+    }
+
+    /// `provider`'s index of `file`, when [`load_source_index`]
+    /// (Self::load_source_index) loaded it.
+    fn source_index(
+        &self,
+        provider: &str,
+        file: &Arc<str>,
+    ) -> Option<Arc<dyn hplugin::provider::SourceIndex>> {
+        let indexes = self.data.source_indexes.lock();
+        indexes
+            .get(&(provider.to_owned(), Arc::clone(file)))?
+            .get()
+            .cloned()
+            .flatten()
+    }
+
+    /// Load the source index of the file `addr` was declared in, for a
+    /// diagnostic about one of its options ([`decl_field_loc`]
+    /// (Self::decl_field_loc)) that the caller is about to build. Error
+    /// path only.
+    ///
+    /// The provider is asked at most once per file per request, on the
+    /// blocking pool (it may read and parse the file): racing diagnostics
+    /// on one file wait for the one ask, and different files load in
+    /// parallel. Like `decl_field_loc`, it never resolves anything.
+    pub(crate) async fn load_source_index(&self, addr: &Addr) {
+        let Some(spec) = self.resolved_spec(addr) else {
+            return;
+        };
+        let Some(source) = spec.spec.source.as_ref() else {
+            return;
+        };
+        let cell = Arc::clone(
+            self.data
+                .source_indexes
+                .lock()
+                .entry((spec.provider.clone(), Arc::clone(source.file_arc())))
+                .or_default(),
+        );
+        cell.get_or_init(|| async {
+            let provider = Arc::clone(
+                self.data
+                    .engine
+                    .upgrade()?
+                    .providers_by_name
+                    .get(&spec.provider)?,
+            );
+            self.data.source_index_loads.fetch_add(1, Ordering::Relaxed);
+            let file = Arc::clone(source.file_arc());
+            hcore::blocking::run(move || provider.provider.source_index(&file)).await
+        })
+        .await;
+    }
+
+    /// How many source indexes providers were asked for this request
+    /// ([`decl_field_loc`](Self::decl_field_loc)): at most one per file.
+    pub fn source_index_loads(&self) -> usize {
+        self.data.source_index_loads.load(Ordering::Relaxed)
+    }
+
+    /// `addr`'s spec, when this request already resolved it. Never
+    /// resolves anything.
+    pub(crate) fn resolved_spec(&self, addr: &Addr) -> Option<Arc<EngineTargetSpec>> {
+        self.data.mem_spec.peek(&AddrKey(addr.clone()))?.ok()
+    }
+
+    /// Clear `addr`'s failure slot, and the source file slots its resolved
+    /// spec says evaluated again (`FailureSlots::clear`).
+    pub(crate) async fn clear_failure(
+        &self,
+        slots: &crate::engine::failure_slot::FailureSlots,
+        addr: &Addr,
+    ) {
+        slots.clear(addr, || self.resolved_spec(addr)).await;
     }
 
     /// Drains and returns all recorded failures in insertion order, leaving the
@@ -2542,6 +2700,8 @@ impl Engine {
             failures: Mutex::new(indexmap::IndexMap::new()),
             scrubs: Mutex::new(Scrubs::default()),
             transitive_declarers: Mutex::new(FxHashMap::default()),
+            source_indexes: Mutex::new(FxHashMap::default()),
+            source_index_loads: std::sync::atomic::AtomicUsize::new(0),
             report_passes: std::sync::atomic::AtomicUsize::new(0),
             path_passes: std::sync::atomic::AtomicUsize::new(0),
             took_down: Mutex::new(FxHashMap::default()),

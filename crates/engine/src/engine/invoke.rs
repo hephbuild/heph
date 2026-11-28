@@ -364,7 +364,9 @@ impl Engine {
         let driver = self
             .drivers_by_name
             .get(&spec.driver)
-            .with_context(|| format!("driver not found: {}", spec.driver))?
+            .ok_or_else(|| hplugin::error::DriverNotFound {
+                driver: spec.driver.clone(),
+            })?
             .clone();
         // Before anything builds or the terminal goes raw. The gate is on the
         // driver that actually spawns: a managed driver with no shell of its own
@@ -530,7 +532,7 @@ impl Engine {
 
         // This target runs again: its last failure no longer describes it.
         // Before the run, as a build's is cleared when its next run starts.
-        self.failure_slots.clear(addr).await;
+        rs.clear_failure(&self.failure_slots, addr).await;
 
         let ran = self
             .run_in_sandbox(

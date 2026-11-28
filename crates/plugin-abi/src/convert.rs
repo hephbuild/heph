@@ -35,7 +35,7 @@ use hplugin::driver::{
 };
 use hplugin::error::Exit;
 use hplugin::function::{DeclaredState, DeclaredTarget, FnArgs, FnOutcome};
-use hplugin::provider::{Approval, State, TargetSpec};
+use hplugin::provider::{Approval, SpecSource, State, TargetSpec};
 use std::collections::BTreeMap;
 use std::os::fd::AsRawFd as _;
 use std::sync::Arc;
@@ -799,6 +799,15 @@ pub fn sandbox_from_pb(s: pb::Sandbox) -> anyhow::Result<Sandbox> {
 // ---- TargetSpec ----
 
 pub fn target_spec_to_pb(t: &TargetSpec) -> pb::TargetSpec {
+    let mut spec = target_spec_to_pb_without_source(t);
+    spec.source = t.source.as_ref().map(spec_source_to_pb).into();
+    spec
+}
+
+/// [`target_spec_to_pb`] without where the target was declared: what a
+/// driver's parse request carries (I1), built without the source's file
+/// `String` it would drop.
+pub fn target_spec_to_pb_without_source(t: &TargetSpec) -> pb::TargetSpec {
     pb::TargetSpec {
         addr: addr_to_pb(&t.addr).into(),
         driver: Some(t.driver.clone()),
@@ -810,8 +819,40 @@ pub fn target_spec_to_pb(t: &TargetSpec) -> pb::TargetSpec {
     }
 }
 
+fn spec_source_to_pb(s: &SpecSource) -> pb::SpecSource {
+    let call = s.call();
+    pb::SpecSource {
+        file: Some(s.file().to_owned()),
+        start_line: Some(call.start_line),
+        start_col: Some(call.start_col),
+        end_line: Some(call.end_line),
+        end_col: Some(call.end_col),
+        ..Default::default()
+    }
+}
+
+/// Where the provider declared the target, or `None`. Lenient, since it only
+/// ever feeds a diagnostic: one whose file [`SpecSource::checked`] refuses
+/// (absolute, `..`, empty, a control character, over the cap) or whose span is
+/// missing a field or not 1-based and ordered is dropped with a `debug!`, and
+/// the spec around it kept.
+fn spec_source_from_pb(s: pb::SpecSource, addr: &Addr) -> Option<SpecSource> {
+    let call = hplugin::diagnostic::Span {
+        start_line: s.start_line.unwrap_or(0),
+        start_col: s.start_col.unwrap_or(0),
+        end_line: s.end_line.unwrap_or(0),
+        end_col: s.end_col.unwrap_or(0),
+    };
+    SpecSource::checked(Arc::from(s.file.unwrap_or_default()), call)
+        .inspect_err(|why| {
+            tracing::debug!(addr = %addr.format(), %why, "spec source dropped on decode");
+        })
+        .ok()
+}
+
 /// `addr` and `driver` are required. An absent `transitive` is the empty
-/// sandbox and an absent `approval` is no gate — both honest defaults.
+/// sandbox and an absent `approval` is no gate — both honest defaults. An
+/// absent or refused `source` is none (see [`spec_source_from_pb`]).
 pub fn target_spec_from_pb(t: pb::TargetSpec) -> anyhow::Result<TargetSpec> {
     let addr = addr_field(t.addr, "TargetSpec.addr")?;
     let spec = (|| -> anyhow::Result<TargetSpec> {
@@ -832,6 +873,10 @@ pub fn target_spec_from_pb(t: pb::TargetSpec) -> anyhow::Result<TargetSpec> {
                 .map(approval_from_pb)
                 .transpose()?
                 .unwrap_or_default(),
+            source: t
+                .source
+                .into_option()
+                .and_then(|s| spec_source_from_pb(s, &addr)),
             addr: addr.clone(),
         })
     })();
@@ -2635,6 +2680,9 @@ mod tests {
                 required: true,
                 notice: vec!["plan".to_string()],
             },
+            source: Some(
+                SpecSource::checked("a/BUILD".into(), call_span(3, 1, 5, 2)).expect("source"),
+            ),
         };
         spec.transitive.push_dep(Dep {
             r#ref: TargetAddr {
@@ -2657,6 +2705,77 @@ mod tests {
         assert_eq!(back.transitive.deps[0].id, "id1");
         assert!(matches!(back.transitive.deps[0].mode, Mode::Link));
         assert_eq!(back.approval, spec.approval);
+        assert_eq!(back.source, spec.source);
+    }
+
+    fn call_span(l: u32, c: u32, el: u32, ec: u32) -> hplugin::diagnostic::Span {
+        hplugin::diagnostic::Span {
+            start_line: l,
+            start_col: c,
+            end_line: el,
+            end_col: ec,
+        }
+    }
+
+    fn pb_spec_with_source(source: Option<pb::SpecSource>) -> pb::TargetSpec {
+        pb::TargetSpec {
+            addr: addr_to_pb(&addr("//p", "t")).into(),
+            driver: Some("exec".into()),
+            source: source.into(),
+            ..Default::default()
+        }
+    }
+
+    /// D3 skew: a 0.21.4 provider sends no `source` (field 7) and its spec
+    /// decodes exactly as before, with no location. The other way, a 0.21.4
+    /// host never reads field 7: it is an unknown field to it, and the spec
+    /// still decodes.
+    #[test]
+    fn targetspec_without_source_field_decodes() {
+        let spec = target_spec_from_pb(pb_spec_with_source(None)).expect("decode");
+        assert_eq!(spec.addr, addr("//p", "t"));
+        assert!(spec.source.is_none());
+    }
+
+    /// D3 / P17: a `source.file` that is absolute or climbs out with `..` (or
+    /// is otherwise not what a location accepts), or a span that is not
+    /// 1-based and ordered, is dropped on decode; the spec is kept.
+    #[test]
+    fn absolute_or_dotdot_spec_source_file_rejected_on_decode() {
+        let pb_source = |file: &str, l: Option<u32>| pb::SpecSource {
+            file: Some(file.into()),
+            start_line: l,
+            start_col: Some(1),
+            end_line: Some(9),
+            end_col: Some(2),
+            ..Default::default()
+        };
+        let over = format!("p/{}", "f".repeat(FILE_CAP));
+        for file in [
+            "/ws/p/BUILD",
+            "\\abs\\BUILD",
+            "../BUILD",
+            "p/../../etc/passwd",
+            "",
+            "p/\x1bBUILD",
+            over.as_str(),
+        ] {
+            let spec = target_spec_from_pb(pb_spec_with_source(Some(pb_source(file, Some(3)))))
+                .expect("kept");
+            assert!(spec.source.is_none(), "{file:?} is dropped");
+            assert_eq!(spec.driver, "exec", "{file:?}: the spec is kept");
+        }
+        for line in [None, Some(0), Some(10)] {
+            let spec = target_spec_from_pb(pb_spec_with_source(Some(pb_source("p/BUILD", line))))
+                .expect("kept");
+            assert!(spec.source.is_none(), "start line {line:?} is dropped");
+        }
+        let kept = target_spec_from_pb(pb_spec_with_source(Some(pb_source("p/BUILD", Some(3)))))
+            .expect("kept")
+            .source
+            .expect("a relative file is kept");
+        assert_eq!(kept.file(), "p/BUILD");
+        assert_eq!(kept.call(), call_span(3, 1, 9, 2));
     }
 
     /// Rule 2: a field the in-process type cannot do without fails the decode,

@@ -372,7 +372,24 @@ keys and `--jq` filters it, as on every command (`docs/JSON_OUTPUT.md`):
   `eval` for a file's slot) and a message that says so. The message and the
   hints' wording are not contract.
 - `location` is where in a source file it was raised, the file
-  workspace-relative. `truncated` says a cap cut something from the record.
+  workspace-relative. `line` and `col` are 1-based, and `col` counts chars,
+  not bytes. `truncated` says a cap cut something from the record.
+- A failure in declaring a target, at the `parse` or `link` stage, points at
+  the target's declaration:
+  - the option that caused it, when the failure names one (an unknown or
+    ill-typed option, a `deps` entry that does not exist, a `driver` that is
+    not registered);
+  - the declaring call otherwise, and for a provider that cannot locate an
+    option (a cdylib provider's targets always point at the call).
+
+  A target a macro declared points into the macro, so `file` can be a `.bzl`
+  or `.star` file rather than the BUILD file that called it. The caller is not
+  named yet. A `run` or `cache` failure has no declaration location.
+- When the file changed after it was evaluated (the call moved, it no longer
+  parses, or it was deleted), `location` is the call as evaluated, and
+  `message` ends with `(file changed since evaluation)`. A missing dependency
+  says it inside its `(…, declared at …)` part instead. The note is text only;
+  no field carries it.
 - `failed_at` is in milliseconds since the Unix epoch. `hashin` is the input
   hash of the run that failed, which may no longer be the target's. Both are
   `null` for every failure before the run (a def that does not parse, a

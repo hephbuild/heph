@@ -4,6 +4,7 @@ mod lsp;
 mod matrix;
 mod provider;
 mod run_file;
+mod source_index;
 #[cfg(test)]
 mod starlark_patch;
 mod types;

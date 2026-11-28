@@ -396,22 +396,24 @@ impl Engine {
         let mut resolved = Vec::with_capacity(refs.len());
         for input in refs {
             let addr = input.r#ref.r#ref.clone();
-            let spec = Arc::clone(self)
-                .get_spec(rs.clone(), &addr)
-                .await
-                .map_err(|e| {
-                    hplugin::error::MissingDep::wrap_or(
-                        e,
-                        &addr,
-                        consumer,
-                        || crate::engine::deferred::declared_origin(&input.origin_id),
-                        |e| {
-                            e.context(format!(
-                                "{consumer} references credential {addr}, which does not resolve"
-                            ))
-                        },
-                    )
-                })?;
+            let spec = match Arc::clone(self).get_spec(rs.clone(), &addr).await {
+                Ok(spec) => spec,
+                Err(e) => {
+                    return Err(rs
+                        .missing_dep_or(
+                            e,
+                            &addr,
+                            consumer,
+                            || crate::engine::deferred::declared_origin(&input.origin_id),
+                            |e| {
+                                e.context(format!(
+                                    "{consumer} references credential {addr}, which does not resolve"
+                                ))
+                            },
+                        )
+                        .await);
+                }
+            };
 
             if spec.driver != DRIVER_NAME {
                 anyhow::bail!(

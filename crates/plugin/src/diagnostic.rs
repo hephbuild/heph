@@ -11,8 +11,9 @@
 //! **Never hashed** (I1). None of these types implements `Hash`, so nothing
 //! about a diagnostic or a stage frame can reach a def hash, `hashin` or a
 //! cache key. Each refusal below follows a twin that compiles and differs only
-//! in the derive, and is pinned to `E0277` (the missing `Hash`), so it cannot
-//! pass for another reason.
+//! in the derive: the twin proves every path resolves, so the derive is the
+//! only thing left to fail. The `E0277` (the missing `Hash`) each refusal names
+//! documents the expected error; stable rustdoc does not check it.
 //!
 //! ```
 //! #[derive(Clone)]
@@ -21,6 +22,23 @@
 //! struct Framed(plugin::diagnostic::StageFrame);
 //! #[derive(Clone)]
 //! struct Recorded(plugin::error::FailureRecord);
+//! #[derive(Clone)]
+//! struct Located(plugin::provider::SpecSource, plugin::diagnostic::Span);
+//! # fn main() {}
+//! ```
+//!
+//! `no_hash_on_spec_source` (where a provider declared a target,
+//! [`TargetSpec::source`](crate::provider::TargetSpec::source)):
+//! ```compile_fail,E0277
+//! #[derive(Hash)]
+//! struct Located(plugin::provider::SpecSource);
+//! # fn main() {}
+//! ```
+//!
+//! `no_hash_on_span`:
+//! ```compile_fail,E0277
+//! #[derive(Hash)]
+//! struct Located(plugin::diagnostic::Span);
 //! # fn main() {}
 //! ```
 //!
@@ -56,7 +74,7 @@ use crate::error::MultiError;
 use hmodel::htaddr::Addr;
 use std::fmt;
 
-pub use hcore::diagnostic::{Diagnostic, Hint, HintKind, SourceLoc, Stage, escape_control};
+pub use hcore::diagnostic::{Diagnostic, Hint, HintKind, SourceLoc, Span, Stage, escape_control};
 
 /// The engine boundary a [`StageFrame`] was added at. Each keeps the text the
 /// string context it replaces had.

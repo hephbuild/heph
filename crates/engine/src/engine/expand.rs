@@ -2,13 +2,12 @@ use crate::engine::Engine;
 use crate::engine::deferred::declared_origin;
 use crate::engine::driver::TargetAddr;
 use crate::engine::driver::targetdef::{Input, InputMode, TargetDef};
-use crate::engine::error::{InputDefFailed, MissingDep, MultiError};
+use crate::engine::error::{InputDefFailed, MultiError};
 use crate::engine::invoke::EntrypointAsInput;
 use crate::engine::request_state::{AddrKey, RequestState};
 use crate::engine::result::ExtendedTargetDef;
 use async_recursion::async_recursion;
 use enclose::enclose;
-use futures::FutureExt as _;
 use futures::stream::{FuturesOrdered, Stream, StreamExt as _};
 use hcore::hmemoizer::{nest, unwrap_arc_err};
 use hmodel::htaddr::Addr;
@@ -516,66 +515,123 @@ impl Engine {
     /// could run something in a developer's cwd.
     ///
     /// A def that fails is marked where it fails, for the failure classifier:
-    /// a not-found of the input itself is `declarer`'s [`MissingDep`] (the
+    /// a not-found of the input itself is `declarer`'s
+    /// [`MissingDep`](crate::engine::error::MissingDep) (the
     /// target, or the group, that names it), anything else the input's own
     /// failure ([`InputDefFailed`]), never `declarer`'s.
     fn input_defs<'a>(
         self: &Arc<Self>,
-        rs: &Arc<RequestState>,
+        rs: &'a Arc<RequestState>,
         declarer: &'a Addr,
         inputs: &'a [Input],
     ) -> impl Stream<Item = anyhow::Result<(&'a Input, Arc<ExtendedTargetDef>)>> + Send + use<'a>
     {
         inputs
             .iter()
-            .map(move |input| {
-                // A dependent's merged transitive input was declared by the
-                // target it came from, not by `declarer`: keep what can look
-                // that target up (only for such an input; a failure reads it).
-                // A substring test, not `transitive_origin`: this runs for
-                // every edge, and the origin's text is only for the error.
-                let transitive = input
-                    .origin_id
-                    .contains(TRANSITIVE_PREFIX)
-                    .then(|| rs.clone());
-                Arc::clone(self)
-                    .get_def(rs.clone(), &input.r#ref.r#ref)
-                    .map(move |def| {
-                        let def = def.map_err(|e| {
-                            let dep = &input.r#ref.r#ref;
-                            let real = transitive
-                                .as_ref()
-                                .and_then(|rs| rs.transitive_declarer(&input.origin_id));
-                            let declarer = real.as_ref().unwrap_or(declarer);
-                            MissingDep::wrap_or(
-                                e,
-                                dep,
-                                declarer,
-                                || {
-                                    transitive_origin(&input.origin_id)
-                                        .unwrap_or_else(|| declared_origin(&input.origin_id))
-                                },
-                                |e| {
-                                    e.context(InputDefFailed {
-                                        input: dep.clone(),
-                                        declarer: declarer.clone(),
-                                        origin_id: input.origin_id.clone(),
-                                    })
-                                },
-                            )
-                        })?;
-                        if def.target_def.entrypoint.is_some() {
-                            return Err(EntrypointAsInput {
-                                entrypoint: input.r#ref.r#ref.clone(),
-                                origin_id: input.origin_id.clone(),
-                                consumer: None,
-                            }
-                            .into());
-                        }
-                        Ok((input, def))
-                    })
-            })
+            .map(move |input| self.input_def(rs, declarer, input))
             .collect::<FuturesOrdered<_>>()
+    }
+
+    /// One edge of [`input_defs`](Self::input_defs): `input`'s def.
+    fn input_def<'a>(
+        self: &Arc<Self>,
+        rs: &'a Arc<RequestState>,
+        declarer: &'a Addr,
+        input: &'a Input,
+    ) -> impl Future<Output = anyhow::Result<(&'a Input, Arc<ExtendedTargetDef>)>> + Send + use<'a>
+    {
+        // A dependent's merged transitive input was declared by the target
+        // it came from, not by `declarer`: a failure looks that target up. A
+        // substring test, not `transitive_origin`: this runs for every edge,
+        // and the origin's text is only for the error.
+        let transitive = input.origin_id.contains(TRANSITIVE_PREFIX);
+        let def = Arc::clone(self).get_def(Arc::clone(rs), &input.r#ref.r#ref);
+        async move {
+            let def = match def.await {
+                Ok(def) => def,
+                Err(e) => {
+                    let dep = &input.r#ref.r#ref;
+                    let real = transitive
+                        .then(|| rs.transitive_declarer(&input.origin_id))
+                        .flatten();
+                    let declarer = real.as_ref().unwrap_or(declarer);
+                    // Boxed: every in-flight edge holds a pointer for this
+                    // failure-only path, not the index load's state (FQ r2
+                    // N-1; `an_edge_future_does_not_hold_the_index_load`).
+                    return Err(Box::pin(rs.missing_dep_or(
+                        e,
+                        dep,
+                        declarer,
+                        || {
+                            transitive_origin(&input.origin_id)
+                                .unwrap_or_else(|| declared_origin(&input.origin_id))
+                        },
+                        |e| {
+                            e.context(InputDefFailed {
+                                input: dep.clone(),
+                                declarer: declarer.clone(),
+                                origin_id: input.origin_id.clone(),
+                            })
+                        },
+                    ))
+                    .await);
+                }
+            };
+            if def.target_def.entrypoint.is_some() {
+                return Err(EntrypointAsInput {
+                    entrypoint: input.r#ref.r#ref.clone(),
+                    origin_id: input.origin_id.clone(),
+                    consumer: None,
+                }
+                .into());
+            }
+            Ok((input, def))
+        }
+    }
+}
+
+#[cfg(test)]
+mod edge_future_size_tests {
+    use crate::engine::driver::TargetAddr;
+    use crate::engine::driver::targetdef::{Input, InputMode};
+    use crate::engine::{Config, Engine};
+    use std::sync::Arc;
+
+    /// An edge's future reserves a pointer for the error path's source-index
+    /// load, not the load's own state (FQ r2 N-1): every in-flight edge of
+    /// every target holds one, and the load runs only when a dep is missing.
+    #[tokio::test]
+    async fn an_edge_future_does_not_hold_the_index_load() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let engine = Arc::new(Engine::new(Config::for_tests(root.path()))?);
+        let rs = engine.new_state();
+        let declarer = hmodel::htaddr::parse_addr("//a:x")?;
+        let input = Input::standard(
+            TargetAddr {
+                r#ref: hmodel::htaddr::parse_addr("//a:y")?,
+                output: None,
+                filters: vec![],
+            },
+            InputMode::Link,
+            "deps||0".to_owned(),
+            Default::default(),
+        );
+        let edge = std::mem::size_of_val(&engine.input_def(&rs, &declarer, &input));
+        let load = std::mem::size_of_val(&rs.load_source_index(&declarer));
+        let wrap = std::mem::size_of_val(&rs.missing_dep_or(
+            anyhow::anyhow!("x"),
+            &declarer,
+            &declarer,
+            String::new,
+            |e| e,
+        ));
+        // 832 bytes inlined, 64 boxed, at the time of writing.
+        assert!(
+            edge < load && edge < wrap,
+            "an edge's future ({edge} bytes) holds the error path's \
+             (`missing_dep_or` {wrap}, its index load {load}): box it"
+        );
+        Ok(())
     }
 }
 

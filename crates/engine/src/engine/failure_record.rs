@@ -194,7 +194,12 @@ pub(crate) fn compact(
                 })
             };
             let message = own_message(e, culprit, &mut causes, &mut more_causes, end.as_deref());
-            Diagnostic::new(stage, message)
+            let mut d = Diagnostic::new(stage, message);
+            // The declaration the message names, for a renderer to point at.
+            d.location = missing_dep
+                .and_then(|m| m.at.as_ref())
+                .map(|at| at.loc.clone());
+            d
         }
     };
     if diagnostic.addr.is_none()
@@ -492,6 +497,31 @@ fn scrubbed(mut rec: FailureRecord, clean: &impl Fn(&str) -> String) -> FailureR
         opt(memory_tail);
     }
     rec
+}
+
+/// `rec`, as [`compact`] bounded it, located at `at`, the declaration a
+/// Parse-stage failure is about: the location set and, when the file
+/// changed since evaluation, ` (file changed since evaluation)` after the
+/// message, still within [`MESSAGE_CAP`](hcore::diagnostic::MESSAGE_CAP)
+/// and [`RECORD_CAP`]. The message is cut to make room, never the marker
+/// (CQ r2): a re-bound after appending could cut the marker itself.
+pub(crate) fn locate(rec: &mut FailureRecord, at: hplugin::provider::DeclAt) {
+    rec.diagnostic.location = Some(at.loc);
+    let marker = at
+        .changed
+        .then(|| format!(" ({})", hplugin::provider::DeclAt::CHANGED));
+    let extra = marker.as_ref().map_or(0, String::len);
+    let over = (rec.text_len() + extra).saturating_sub(RECORD_CAP);
+    let message = &rec.diagnostic.message;
+    let room = hcore::diagnostic::MESSAGE_CAP
+        .saturating_sub(extra)
+        .min(message.len().saturating_sub(over));
+    if message.len() > room {
+        rec.diagnostic.message = bound_text(message, room, &mut rec.diagnostic.truncated);
+    }
+    if let Some(marker) = marker {
+        rec.diagnostic.message.push_str(&marker);
+    }
 }
 
 /// `rec` within every cap, each cut marking the diagnostic `truncated`: the
@@ -1325,12 +1355,26 @@ mod tests {
                 dep: addr("//d:missing"),
                 declarer: addr("//d:t"),
                 origin_id: "deps".to_owned(),
+                at: hcore::diagnostic::SourceLoc::checked("d/defs".to_owned(), 4, 5)
+                    .ok()
+                    .map(|loc| hplugin::provider::DeclAt {
+                        loc,
+                        changed: false,
+                    }),
             }),
             Boundary::GetDef,
             &addr("//d:t"),
         );
         let rec = compact(&e, &target("//d:t"), &addr("//d:t"), &Scrub::default());
         assert_eq!(rec.diagnostic.stage, Stage::Link);
+        // The declaration the message names is the record's location.
+        let at = rec.diagnostic.location.as_ref().expect("a location");
+        assert_eq!(at.to_string(), "d/defs:4:5");
+        assert!(
+            rec.diagnostic.message.contains("declared at d/defs:4:5"),
+            "{}",
+            rec.diagnostic.message
+        );
         let rec = compact(
             &missing(),
             &target("//d:other"),

@@ -240,6 +240,20 @@ skipped in silence.
 
 ## History of breaks
 
+- **0.21.5** (additive patch) — where a target was declared.
+  `TargetSpec.source` (7) carries a `SpecSource` (targetdef.proto): a
+  workspace-relative file and the declaring call's start and end line:col.
+  Diagnostics only: it never reaches a def, a run or a hash (the in-process
+  `TargetSpec.source` is `#[serde(skip)]`, and its type has no `Hash`). The
+  host decodes it leniently: a file that is empty, absolute, contains `..` or
+  holds a control character, or a span that is incomplete, 0-based or
+  reversed, is dropped and the spec kept. Both skews degrade to diagnostics
+  without a location: an older provider sends none, a newer provider's is
+  skipped by an older host. No plugin must be rebuilt. The field travels
+  from a provider to the host only: the host clears it from the spec in a
+  parse request to a cdylib driver. In source, it is a break for an
+  out-of-tree plugin crate: a `TargetSpec { .. }` literal needs `source`
+  (or `..Default::default()`), and `MissingDep` gained `at`.
 - **0.21.4** (additive patch) — diagnostics on errors.
   `Error.diagnostic` (3), `GetError.diagnostic` (3) and `RunFailure.diagnostic`
   (6) carry a `Diagnostic` (common.proto: stage, message, location, snippet,
