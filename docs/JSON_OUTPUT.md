@@ -234,6 +234,11 @@ for. A culprit the selector did not match is still written, with
 `root_file`. Any other
 dependency the selector did not match gets no entry.
 
+A selected target can get a second record: when it ended `ran` or `cached`
+and is then blamed as a culprit (a target depending on it failed on something
+it declared), its `failed` record follows and supersedes the first. A reader
+that keys records by `addr` keeps the last one.
+
 Each record is output contract 2 (`heph version --json` reports
 `output_contract: 2`).
 

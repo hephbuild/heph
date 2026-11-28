@@ -56,6 +56,13 @@ pub enum Outcome {
     Cancelled,
 }
 
+impl Outcome {
+    /// It ended with a result: `ran` or `cached`.
+    fn is_ok(self) -> bool {
+        matches!(self, Self::Ran | Self::Cached)
+    }
+}
+
 /// Where a target's result was looked up, and what came of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, output::Shape)]
 #[serde(rename_all = "snake_case")]
@@ -220,6 +227,10 @@ struct Fold {
     seq: u64,
     /// Addresses whose entry is handed out or held.
     done: HashSet<String>,
+    /// The `done` addresses whose handed-out entry is `ran` or `cached`: a
+    /// later failing end (a culprit blamed after it built) writes a second,
+    /// `failed` record that supersedes it, once.
+    ok: HashSet<String>,
     /// Files whose record is handed out: one per file.
     files: HashSet<String>,
     /// Skipped records, written at request end.
@@ -303,6 +314,9 @@ impl Fold {
                     match self.early.remove(addr) {
                         Some(Early::Record { mut entry, .. }) => {
                             self.done.insert(addr.clone());
+                            if entry.outcome.is_ok() {
+                                self.ok.insert(addr.clone());
+                            }
                             entry.selected = true;
                             ready.push(entry);
                         }
@@ -364,8 +378,18 @@ impl Fold {
                 ..
             } => {
                 let live = self.live.remove(addr).unwrap_or_default();
+                // A record already out is final, except an ok one whose
+                // target is then blamed as a culprit: its failing end is
+                // written too (`place`), as the dashboard reopens the row.
                 if self.done.contains(addr) {
-                    return Vec::new();
+                    let blamed = error.is_some()
+                        && upstream_of.is_none()
+                        && !*cancelled
+                        && !*duplicate
+                        && self.ok.contains(addr);
+                    if !blamed {
+                        return Vec::new();
+                    }
                 }
                 // A duplicate end closes a row another end (or a file's
                 // record) already reported. One naming a file is a target of
@@ -482,15 +506,25 @@ impl Fold {
     /// set is incomplete, else hand it out as an unselected culprit or drop
     /// it.
     fn place(&mut self, addr: &str, mut entry: RunEntry) -> Vec<RunEntry> {
+        // Only a culprit's failing end gets here past an ok record (see the
+        // `ResultEnd` fold): the second record, selected as the first was.
+        if self.ok.remove(addr) {
+            entry.selected = true;
+            return vec![entry];
+        }
         if self.pending.remove(addr) {
             self.done.insert(addr.to_owned());
+            if entry.outcome.is_ok() {
+                self.ok.insert(addr.to_owned());
+            }
             entry.selected = true;
             vec![entry]
         } else if !self.matched_complete {
             // Not matched (yet): a dependency, or a selected target the walk
             // has not reported. Its first end is kept, unless a later one
-            // makes it a culprit: a target that built and was then blamed
-            // must still get its culprit record, which only `root` earns.
+            // makes it a culprit or a failure: a target that built and was
+            // then blamed must still get its culprit record, which only
+            // `root` earns, and a failing end replaces an ok one.
             self.seq += 1;
             let seq = self.seq;
             match self.early.entry(addr.to_owned()) {
@@ -498,11 +532,13 @@ impl Fold {
                     slot.insert(Early::Record { seq, entry });
                 }
                 std::collections::hash_map::Entry::Occupied(mut slot) => {
-                    let earlier_no_culprit = matches!(
+                    let replace = matches!(
                         slot.get(),
-                        Early::Record { entry: earlier, .. } if earlier.root.is_none()
+                        Early::Record { entry: earlier, .. }
+                            if (earlier.root.is_none() && entry.root.is_some())
+                                || (earlier.outcome.is_ok() && entry.outcome == Outcome::Failed)
                     );
-                    if earlier_no_culprit && entry.root.is_some() {
+                    if replace {
                         slot.insert(Early::Record { seq, entry });
                     }
                 }
@@ -1607,6 +1643,59 @@ mod tests {
         );
         assert_eq!(entries[0].root.as_deref(), Some("//p:c"));
         assert_eq!(f.held.len(), 1, "the selected target, skipped");
+    }
+
+    /// A selected target whose ok record is already written, then blamed as
+    /// a culprit (its later end failed): the failing end is a second
+    /// record, `failed`, that supersedes the first, as the dashboard reopens
+    /// the row. Any other second end (a duplicate's, a stop's) writes
+    /// nothing.
+    #[test]
+    fn selected_culprit_after_an_ok_end_is_a_second_record() {
+        let known = Known::default().target("//p:c", "c broke");
+        let mut dup = end("//p:c", Some("c broke"), None);
+        if let BuildEventKind::ResultEnd { duplicate, .. } = &mut dup {
+            *duplicate = true;
+        }
+        let (entries, _) = fold_with(
+            vec![
+                ev(0, matched(&["//p:c", "//p:top"], true)),
+                ev(1, start("//p:c")),
+                ev(2, end("//p:c", None, None)),
+                ev(3, end("//p:c", Some("c broke"), None)),
+                ev(4, dup),
+                ev(5, end("//p:c", Some("c broke"), None)),
+                ev(6, end("//p:top", Some("dependency failed"), Some("//p:c"))),
+            ],
+            &known,
+        );
+        assert_eq!(
+            addrs(&entries),
+            [
+                (Some("//p:c"), Outcome::Cached, true),
+                (Some("//p:c"), Outcome::Failed, true),
+            ],
+            "{entries:?}"
+        );
+        assert_eq!(entries[1].root.as_deref(), Some("//p:c"));
+    }
+
+    /// Before the matched set completes, a later failing end replaces an
+    /// earlier ok one in `early`, whether or not it names a culprit.
+    #[test]
+    fn early_failing_end_replaces_an_ok_one() {
+        let (entries, _) = fold(vec![
+            ev(0, matched(&[], false)),
+            ev(1, start("//p:a")),
+            ev(2, end("//p:a", None, None)),
+            ev(3, end("//p:a", Some("a broke"), None)),
+            ev(4, matched(&["//p:a"], true)),
+        ]);
+        assert_eq!(
+            addrs(&entries),
+            [(Some("//p:a"), Outcome::Failed, true)],
+            "{entries:?}"
+        );
     }
 
     /// A selected target built as a dependency before the walk reports it
