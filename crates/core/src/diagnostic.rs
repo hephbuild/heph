@@ -2,8 +2,8 @@
 //!
 //! An `anyhow` context chain answers "which code path raised this"; a
 //! [`Diagnostic`] answers what the user needs: what is wrong, at which stage,
-//! where in their source, and what to do. A producer (the BUILD-file
-//! evaluator, a spec parser, a cdylib's error decoded at the seam) raises one;
+//! where in their source, and what to do. A producer (a provider evaluating
+//! its source files, a spec parser, a cdylib's error decoded at the seam) raises one;
 //! a renderer finds it through the error walker
 //! ([`crate::hmemoizer::walk`]) and prints it alone, so none of the engine's
 //! boundary frames reach the user.
@@ -52,7 +52,8 @@ pub const FILE_CAP: usize = 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Stage {
-    /// A BUILD file (or a file it loads) evaluated.
+    /// A provider evaluated one of its source files (e.g. the buildfile
+    /// provider's BUILD file, or a file it loads).
     Eval,
     /// A provider resolved a target's spec.
     Spec,

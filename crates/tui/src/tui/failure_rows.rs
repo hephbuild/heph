@@ -162,7 +162,7 @@ pub fn path_elision<T>(path: &[T]) -> (&[T], usize, &[T]) {
 }
 
 /// The rows a culprit's box prints for how the request reached it, from its
-/// `path` (from a requested target to the culprit, inclusive; for a BUILD
+/// `path` (from a requested target to the culprit, inclusive; for a source
 /// file that did not evaluate, to the address that led into it), each
 /// ending in a newline and without indentation:
 /// - `reached by: //a:root → //b:x → //c:y`, elided as [`elide_path`] does;

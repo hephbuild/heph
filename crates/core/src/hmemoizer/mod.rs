@@ -724,7 +724,7 @@ fn push_frames<'a>(level: &'a anyhow::Error, out: &mut Vec<ErrorFrame<'a>>) {
 ///
 /// It descends into an anyhow error only where one is held by a
 /// [`SharedAnyhow`] or a [`MultiError`]. An anyhow error that rides as another
-/// error's std `source()` (a `TargetFailure`'s cause, starlark's wrapper) is
+/// error's std `source()` (a `TargetFailure`'s cause, a provider's own wrapper) is
 /// walked as plain std frames: its root object is found, but a typed
 /// *context* in it is not. Look in such an error directly (a
 /// `TargetFailure`'s `source`).

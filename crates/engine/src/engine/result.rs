@@ -2334,7 +2334,7 @@ fn record_culprit(
     entry: Addr,
 ) -> (anyhow::Error, bool) {
     // A culprit's failure — this target's own, an input whose def failed, a
-    // declarer naming a missing dep, a BUILD file that did not evaluate:
+    // declarer naming a missing dep, a source file that did not evaluate:
     // record the rich diagnostic once against the culprit (first-writer-wins)
     // and propagate a cheap marker naming it. This target, when it is not the
     // culprit, is skipped.
@@ -2365,7 +2365,7 @@ fn record_culprit(
     };
     // A culprit that is not this target has no scope of its own to announce
     // it (an input whose def failed, a declarer reached through a group or a
-    // transitive dep, a BUILD file): the claim's winner announces it, so
+    // transitive dep, a source file): the claim's winner announces it, so
     // every live view sees the failure once. This target's own failure is
     // announced by its caller (its scope's end, or `fail_unscoped`).
     let announce = (unclaimed && !matches!(&culprit, Culprit::Target(c) if c == addr)).then(|| {
@@ -2507,7 +2507,7 @@ fn classify_each(
 }
 
 /// The event that announces a culprit with no scope of its own, sent once by
-/// the claim's winner: a `FileFailed` for a BUILD file that did not evaluate
+/// the claim's winner: a `FileFailed` for a source file that did not evaluate
 /// (a path never goes in an address field), else a synthetic
 /// `ResultStart`/`ResultEnd` pair for the culprit target, or only the
 /// `ResultEnd` when the target's own scope already opened.
@@ -2562,7 +2562,7 @@ fn announce_culprit(
     }
 }
 
-/// A selection's walk failing on a BUILD file that did not evaluate (a
+/// A selection's walk failing on a source file that did not evaluate (a
 /// requested target's package probed during matcher resolution): recorded
 /// against the file (U2), through the same registry as every other culprit,
 /// so it is one failure however many requested targets the file holds, and
@@ -2577,8 +2577,9 @@ fn blame_walk_failure(rs: &RequestState, matcher: &Matcher, e: anyhow::Error) ->
     if is_stop(&e) {
         return e;
     }
-    // The package the walk was scanning: the broken file may be a `.bzl`
-    // it loads, or a parent package's BUILD, anywhere in the tree. The
+    // The package the walk was scanning: the broken file may be any file
+    // the provider read for it (e.g. one a BUILD file loads), anywhere in
+    // the tree. The
     // file's own directory only when the walk did not say (a confirm's
     // resolution, which names its target's package anyway).
     // A scanned package no named address is in was walked for a package
@@ -2742,7 +2743,7 @@ enum EndBlame {
     #[default]
     Unknown,
     /// Skipped because `of` failed: the culprit target, or the address that
-    /// led into `file`, a BUILD file that did not evaluate.
+    /// led into `file`, a source file that did not evaluate.
     Skipped { of: String, file: Option<String> },
     /// This end is the culprit's: the shortest path from a requested target,
     /// inclusive, and its record once the claim is decided
@@ -2755,7 +2756,7 @@ enum EndBlame {
     /// A culprit's own end that lost the claim (another end, a synthetic
     /// pair or a `FileFailed` announced the culprit first): it closes the
     /// row, flagged so no consumer boxes or counts it (D1.d). `file` is set
-    /// when the culprit is a BUILD file `addr` itself lives in: the end
+    /// when the culprit is a source file `addr` itself lives in: the end
     /// names it in `upstream_file`, so a consumer can tell the target was
     /// skipped because of its own file.
     Duplicate { file: Option<String> },
@@ -2887,7 +2888,7 @@ fn is_stop(e: &anyhow::Error) -> bool {
 ///   raised the error — or, when a [`FileEvalFailed`] is on the chain, that
 ///   file, entered through it;
 /// - else the error is `addr`'s own (or its file's, for a requested target
-///   in a BUILD file that did not evaluate).
+///   in a source file that did not evaluate).
 ///
 /// Only the spec and def boundaries name whose error it is: `link`, `meta`,
 /// `execute` and `run` frames are added by the target doing the work, over
@@ -3137,7 +3138,7 @@ impl Engine {
     /// a failure another caller recorded first was announced by that caller.
     ///
     /// A requested target (`is_top`) skipped because of another culprit (a
-    /// dependency's broken BUILD file, a group member's failure) gets the
+    /// dependency's broken source file, a group member's failure) gets the
     /// pair too, with the skipped end its scope would have had: every
     /// requested target ends (D5). Only the top frame announces it, so a
     /// dependency reached by many callers is not announced once per caller.
@@ -3149,7 +3150,7 @@ impl Engine {
         is_top: bool,
     ) -> anyhow::Error {
         // Announced here when it is this target's own failure. Any other
-        // culprit (an input whose def failed, a BUILD file that did not
+        // culprit (an input whose def failed, a source file that did not
         // evaluate) is announced by `classify_failure_fresh`'s winner.
         let fate = failure_fate(addr, &e);
         let cycle = top_cycle(is_top, &e);
@@ -3759,7 +3760,7 @@ impl Engine {
                 Ok(addr) => addr,
                 // The matcher walk itself failed. Stop enqueuing, signal the
                 // already-spawned targets, and fall through to the drain. A
-                // broken BUILD file is the file's failure, recorded as one.
+                // broken source file is the file's failure, recorded as one.
                 Err(e) => {
                     fatal = Some(blame_walk_failure(&rs, matcher, e));
                     rs.ctoken().cancel();
@@ -3886,7 +3887,7 @@ impl Engine {
         }
 
         // Keep-going's counterpart of the failed walk's blame: a named package
-        // whose BUILD file did not evaluate is the file's failure, not a gap.
+        // whose source file did not evaluate is the file's failure, not a gap.
         if walk_finished
             && fatal.is_none()
             && let Some(gaps) = opts.discovery.gaps()
@@ -3936,7 +3937,7 @@ impl Engine {
     /// Keep-going's counterpart of [`blame_walk_failure`] (U2, D5).
     ///
     /// A selection that names its targets by address only (`//d:t1
-    /// //d:t2`), whose walk could not probe a named package because a BUILD
+    /// //d:t2`), whose walk could not probe a named package because a source
     /// file did not evaluate, recorded that package as a gap, and nothing in
     /// it ran. Every named address there is the file's. The file is recorded
     /// once, entered through the first of them, and announced as
@@ -7271,7 +7272,7 @@ impl Engine {
     }
 
     /// For `heph query <addr>` (D5): resolve `addr`'s spec and, when it fails
-    /// because the BUILD or `.bzl` file defining it did not evaluate, record
+    /// because a source file the provider read for it did not evaluate, record
     /// that file as the request's culprit, as `run` does (its box, exit 1),
     /// and return true. Any other outcome records nothing and returns false:
     /// the walk reports it as it always did.
@@ -13107,7 +13108,7 @@ mod tests {
 
     /// STAGE-18: `announce_request`, called as a request starts, sends its
     /// `RequestConfig` before anything resolves: the entrypoint lookup `run`
-    /// makes first (a spec and a def, as slow as the BUILD file) sends no
+    /// makes first (a spec and a def, as slow as the provider) sends no
     /// event of its own, so this is what a client's clock counts from. The
     /// `result` call's own announcement is then a no-op.
     #[tokio::test]

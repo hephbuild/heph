@@ -253,8 +253,9 @@ impl std::error::Error for UpstreamFailed {}
 /// What a failure is recorded against: the one thing that is actually wrong.
 ///
 /// A target whose own spec, def or run failed, or that declared a dependency
-/// that does not exist, is a [`Culprit::Target`]. A BUILD (or `.bzl`) file
-/// that did not evaluate is a [`Culprit::File`]: none of its targets was ever
+/// that does not exist, is a [`Culprit::Target`]. A source file a provider
+/// reported as not evaluating ([`FileEvalFailed`]; e.g. the buildfile
+/// provider's BUILD file) is a [`Culprit::File`]: none of its targets was ever
 /// defined, so none of them is to blame. The file is the workspace-relative
 /// path, and it never goes into an [`Addr`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -398,13 +399,17 @@ impl MissingDep {
     }
 }
 
-/// Context: the evaluation of this file failed. `file` is workspace-relative.
+/// Context: a provider's evaluation of this source file failed (e.g. the
+/// buildfile provider's `d/BUILD`). `file` is workspace-relative, as the
+/// provider reported it.
 ///
 /// Data riding the chain, not text: its `Display` is empty, so the message
 /// reads as the file's own [`Diagnostic`](crate::diagnostic::Diagnostic)
 /// does (which already names the file, workspace-relative).
 ///
-/// A file that loads a broken file adds none of its own, so the one
+/// The provider attaches it once, for the file that is itself broken: a
+/// file that failed only through another (one it loads, say) adds none of
+/// its own, so the one
 /// `FileEvalFailed` on a chain is the innermost: the file that is actually
 /// broken.
 #[derive(Debug, Clone)]
@@ -847,8 +852,8 @@ pub struct TargetFailure {
     /// The culprit target; for a file culprit, the address that led into the
     /// file (a target the file would have defined).
     pub addr: Addr,
-    /// The workspace-relative BUILD/`.bzl` file that did not evaluate, when
-    /// the culprit is that file rather than a target ([`Culprit::File`]).
+    /// The workspace-relative source file a provider reported as not
+    /// evaluating, when the culprit is that file rather than a target ([`Culprit::File`]).
     pub file: Option<std::sync::Arc<str>>,
     /// The shortest path from a requested target to [`addr`](Self::addr),
     /// inclusive (`[addr]` when it was itself requested), read off the

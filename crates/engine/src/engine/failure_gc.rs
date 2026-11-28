@@ -21,15 +21,16 @@
 //! the slot is skipped. Under the lock the manifest is read again, and a slot a
 //! run refilled since the scan is kept.
 //!
-//! A BUILD file's slot (its manifest names `file:<path>`, keyed by
+//! A source file's slot (its manifest names `file:<path>`, keyed by
 //! [`file_key`]) is live while that file exists under the workspace root, and
-//! aged out like any other. Nothing clears it when the file next evaluates. It
-//! has no execute lock: it is removed after its manifest is read again, kept
+//! aged out like any other. A run clears it when a target of a package its
+//! manifest lists resolves ([`FailureSlots::clear`]). It has no execute lock: it is removed after its manifest is read again, kept
 //! when a fill replaced it since the scan.
 //!
 //! Never fatal: every error is a `warn!` and a count in [`FailureGcStats`].
 //!
 //! [`failure_slot`]: crate::engine::failure_slot
+//! [`FailureSlots::clear`]: crate::engine::failure_slot::FailureSlots::clear
 
 use crate::engine::Engine;
 use crate::engine::error::TargetNotFoundError;
@@ -78,7 +79,8 @@ struct Slot {
 /// Whose failure a slot keeps.
 enum SlotOf {
     Target(Addr),
-    /// A BUILD file that did not evaluate, at this workspace-relative path.
+    /// A source file a provider reported as not evaluating, at this
+    /// workspace-relative path.
     File(String),
 }
 
@@ -643,7 +645,7 @@ mod tests {
         assert_eq!(stats.errored, 0, "zero age never resolves: {stats:?}");
     }
 
-    /// A BUILD file's slot is not litter: it stays while the file exists,
+    /// A source file's slot is not litter: it stays while the file exists,
     /// however long gc's litter age is passed.
     #[tokio::test]
     async fn gc_keeps_file_slot_while_file_exists() {
@@ -667,7 +669,7 @@ mod tests {
         );
     }
 
-    /// Once its file is gone, a BUILD file's slot is removed; an aged one
+    /// Once its file is gone, a source file's slot is removed; an aged one
     /// goes whether or not the file exists.
     #[tokio::test]
     async fn gc_removes_file_slot_once_file_is_gone() {

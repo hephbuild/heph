@@ -366,9 +366,9 @@ pub enum BuildEventKind {
         /// targets reporting the same underlying failure.
         #[serde(default)]
         upstream_of: Option<String>,
-        /// The workspace-relative BUILD/`.bzl` file that did not evaluate,
-        /// when it is why this target failed. A path never goes in an
-        /// address field. Two shapes carry it:
+        /// The workspace-relative source file a provider reported as not
+        /// evaluating (e.g. `d/BUILD`), when it is why this target failed. A
+        /// path never goes in an address field. Two shapes carry it:
         /// - beside `upstream_of`, which stays the address that led into the
         ///   file: a target the file took down;
         /// - on a `duplicate` end with no `upstream_of`: a target in that
@@ -823,7 +823,8 @@ pub enum BuildEventKind {
         #[serde(default)]
         addr: Option<String>,
     },
-    /// A BUILD or `.bzl` file that did not evaluate, announced once per
+    /// A source file a provider reported as not evaluating (e.g. the
+    /// buildfile provider's `d/BUILD`), announced once per
     /// file however many targets reached it: the file's own failure box. A
     /// file has no target scope, so it rides this kind rather than a
     /// `ResultEnd` (a path never goes in an address field, where

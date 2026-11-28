@@ -134,8 +134,9 @@ impl PartialOrd for Completed {
 pub(crate) struct RootFailure {
     /// The culprit target; for a file culprit, the address that led into it.
     pub addr: String,
-    /// The workspace-relative BUILD/`.bzl` file that did not evaluate, when
-    /// the culprit is that file rather than a target: what a reader is shown.
+    /// The workspace-relative source file a provider reported as not
+    /// evaluating (e.g. `d/BUILD`), when the culprit is that file rather
+    /// than a target: what a reader is shown.
     pub file: Option<String>,
     pub message: String,
     /// The subprocess's exit status, when the failure was a subprocess.
@@ -630,7 +631,7 @@ impl Tally {
             // everything after it.
             BuildEventKind::Unknown => {}
 
-            // A BUILD file that did not evaluate: one root however many
+            // A source file that did not evaluate: one root however many
             // targets reached it, keyed by the address that led into it,
             // which is what the targets it took down name as `upstream_of`.
             BuildEventKind::FileFailed {
@@ -1164,7 +1165,7 @@ mod tests {
         );
     }
 
-    /// A broken BUILD file is one root however many requested targets live in
+    /// A broken source file is one root however many requested targets live in
     /// it: its `FileFailed` is the root, keyed by the address that led into
     /// it, the targets it took down count against that root, and a
     /// non-announcing end closes its row without a second root. That end

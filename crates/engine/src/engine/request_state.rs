@@ -848,7 +848,7 @@ pub struct RequestStateData {
     /// shows the slots its runs freed.
     sandbox_removals: crate::engine::sandbox_cleaner::PendingCounter,
     /// Per-request registry of culprits, keyed by what is to blame (a target,
-    /// or a BUILD file that did not evaluate). Populated by the `result_addr`
+    /// or a provider's source file that did not evaluate). Populated by the `result_addr`
     /// classifier (first-writer-wins dedup) and drained once at the end of
     /// execution for rendering. Shared via `Arc<RequestStateData>`, so
     /// `with_parent` / `with_skip_provider` children record into the same map.
@@ -1496,7 +1496,7 @@ impl RequestState {
 
     /// Records a culprit's rich diagnostic. First-writer-wins: if `culprit`
     /// already has an entry (e.g. shared via the memoizer to multiple
-    /// waiters, or a broken BUILD file reached through several of its
+    /// waiters, or a broken source file reached through several of its
     /// targets), the existing one is kept. Whether this call was the one
     /// that recorded it: the claim to announce the failure.
     pub fn record_failure(&self, culprit: impl Into<Culprit>, failure: Arc<TargetFailure>) -> bool {

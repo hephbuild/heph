@@ -231,7 +231,7 @@ impl Gaps {
 
     /// Withdraw every skip of `scope` at `stage`, whichever provider recorded
     /// it: the scope turned out to be accounted for. A keep-going run whose
-    /// selection names only addresses blames the BUILD file a named package
+    /// selection names only addresses blames the source file a named package
     /// could not be probed through (U2), and every target the selection could
     /// have found there then has its record.
     pub fn withdraw(&self, stage: Stage, scope: &str) {
@@ -424,8 +424,9 @@ impl std::fmt::Display for InProvider {
 impl std::error::Error for InProvider {}
 
 /// Context: a package walk was scanning `package` when a file failed to
-/// evaluate. Not necessarily the broken file's package: a `.bzl` it loads,
-/// or a parent package it probes, can live anywhere. What a failed
+/// evaluate. Not necessarily the broken file's package: a file the provider
+/// read for it (e.g. one a BUILD file loads, or a parent package's) can live
+/// anywhere. What a failed
 /// selection's record is entered through (a requested target of this
 /// package), so the walk need not guess it from the file's directory.
 ///
