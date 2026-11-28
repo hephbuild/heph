@@ -622,6 +622,7 @@ impl DepDag {
             root: seen.iter().map(|&n| root[n as usize]).collect(),
             more,
             index,
+            bitset_words: bits.len(),
         }
     }
 }
@@ -642,6 +643,9 @@ pub struct SkippedReport {
     /// The asked-about skipped targets that reach a culprit, keyed by
     /// pointer (the `addrs` above keep each interned address alive).
     index: FxHashMap<AddrPtrKey, u32>,
+    /// The `u64` words the pass's culprit bitsets took: freed when the
+    /// pass returned, kept as a number for the cost test.
+    bitset_words: usize,
 }
 
 /// One skipped target's entry in a [`SkippedReport`].
@@ -684,6 +688,12 @@ impl SkippedReport {
 
     pub fn is_empty(&self) -> bool {
         self.index.is_empty()
+    }
+
+    /// How many `u64` words the pass's culprit bitsets took at their peak:
+    /// `ceil(culprits / 64)` for each node that reaches a culprit.
+    pub fn bitset_words(&self) -> usize {
+        self.bitset_words
     }
 }
 
@@ -3607,6 +3617,53 @@ mod tests {
                 record(&r, "s"),
                 ("//pkg:c00".into(), names_of(&["s", "c00"]), 69)
             );
+        }
+
+        /// FQ-3: 2000 culprits under an 18k chain. `more` stays exact across
+        /// all 32 words of each bitset, and the bitsets cost what the pass
+        /// says: 32 words per node that reaches a culprit, 5.1 MB here, held
+        /// only while the pass runs. It grows as nodes × culprits / 64 (63 MB
+        /// at 100k × 5k), the price of an exact count: JSON_OUTPUT.md gives
+        /// `more` as how many other culprits a target reaches, not a bound.
+        #[test]
+        fn more_is_exact_and_bitsets_bounded_at_2000_culprits() {
+            const CHAIN: usize = 18_000;
+            const CULPRITS: usize = 2_000;
+            let mut d = DepDag::new();
+            let chain: Vec<Addr> = (0..CHAIN).map(|i| addr(&format!("s{i:05}"))).collect();
+            let culprits: Vec<Addr> = (0..CULPRITS).map(|k| addr(&format!("c{k:04}"))).collect();
+            for w in chain.windows(2) {
+                if let [from, to] = w {
+                    d.add_dep(from, to).expect("acyclic");
+                }
+            }
+            // `s_i` fails directly through `c_(i mod 2000)`: below `s_i` the
+            // chain reaches the culprits of every later residue.
+            for (i, s) in chain.iter().enumerate() {
+                d.add_dep(s, &culprits[i % CULPRITS]).expect("acyclic");
+            }
+            let r = d.skipped_report(
+                culprits.iter().map(|c| (Culprit::from(c.clone()), c)),
+                &chain,
+            );
+            assert_eq!(r.len(), CHAIN);
+            let reached = CHAIN + CULPRITS;
+            let words_per_node = CULPRITS.div_ceil(64);
+            assert_eq!(words_per_node, 32);
+            assert_eq!(r.bitset_words(), reached * words_per_node);
+            assert!(
+                r.bitset_words() * 8 <= 6 * 1024 * 1024,
+                "{} bytes",
+                r.bitset_words() * 8
+            );
+            let more = |i: usize| r.get(&chain[i]).expect("a record").more;
+            assert_eq!(more(0), CULPRITS - 1, "the top reaches all of them");
+            assert_eq!(more(16_000), CULPRITS - 1, "the last 2000 still do");
+            assert_eq!(more(17_000), 999, "residues 1000..2000");
+            assert_eq!(more(17_937), 62, "inside one word");
+            assert_eq!(more(CHAIN - 1), 0);
+            let last = r.get(&chain[CHAIN - 1]).expect("a record");
+            assert_eq!(names(&last.path), ["s17999", "c1999"]);
         }
 
         #[test]
