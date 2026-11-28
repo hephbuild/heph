@@ -1083,10 +1083,12 @@ dependencies = [
  "serde",
  "serde_json",
  "stacker",
+ "strsim 0.11.1",
  "tar",
  "tempfile",
  "tokio",
  "tracing",
+ "unicode-normalization",
  "wax",
  "xxhash-rust",
 ]
