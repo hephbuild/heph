@@ -512,12 +512,24 @@ fn rendered_messages_have_no_absolute_workspace_paths() {
 }
 
 /// F2: nothing reaches a box through `Debug` (`Int(3)`, `Some(..)`, a
-/// struct's braces): a record with every fact set draws only words.
+/// struct's braces): a record with every fact set draws only words, and the
+/// values in its messages stay in the JSON notation they were written in.
 #[test]
-fn rendered_values_are_starlark_literals() {
+fn rendered_values_are_json_notation() {
+    use hcore::htvalue::Value;
     let ws = tempfile::tempdir().expect("ws");
+    let value = Value::Map(
+        [
+            ("X".to_owned(), Value::Bool(true)),
+            ("Y".to_owned(), Value::Null()),
+        ]
+        .into(),
+    );
     let full = FailureRecord {
-        causes: vec!["expected 3, got [\"X\"]".into()],
+        causes: vec![format!(
+            "expected 3, got {}",
+            Value::List(vec![Value::String("X".into())]).render()
+        )],
         more_causes: 2,
         exit: Some(ExitData {
             code: None,
@@ -533,14 +545,25 @@ fn rendered_values_are_starlark_literals() {
         }),
         ..target(
             "//p:t",
-            Diagnostic::new(Stage::Run, "value {\"X\": 1} is not a list")
-                .with_location(loc("p/BUILD", 4, 5))
-                .with_hint(Hint::new(HintKind::DeclareTool, "declare the tool")),
+            Diagnostic::new(
+                Stage::Run,
+                format!("value {} is not a list", value.render()),
+            )
+            .with_location(loc("p/BUILD", 4, 5))
+            .with_hint(Hint::new(HintKind::DeclareTool, "declare the tool")),
         )
     };
+    for mode in MODES {
+        let b = render_box(&full, &ctx(ws.path(), mode));
+        assert!(
+            b.contains(r#"value {"X": true, "Y": null} is not a list"#),
+            "{b}"
+        );
+        assert!(b.contains(r#"got ["X"]"#), "{b}");
+    }
     for b in every_box(ws.path(), &[full], &WorkspaceRel::default()) {
         for debug in [
-            "Int(", "String(", "Error {", "Some(", "None", "Exit", "Stage::", " { ",
+            "Int(", "String(", "Error {", "Some(", "None", "True", "Exit", "Stage::", " { ",
         ] {
             assert!(!b.contains(debug), "{debug}: {b}");
         }
