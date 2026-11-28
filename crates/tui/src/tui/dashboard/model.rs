@@ -1189,6 +1189,57 @@ mod tests {
         );
     }
 
+    /// A culprit blamed after its scope ended ok, as the engine sends it
+    /// since CQ-M2: the ok end, then the failing end, with no second start.
+    /// Its Done row reopens as a failed root.
+    #[test]
+    fn culprit_end_after_ok_without_a_second_start_reopens_row_as_failed() {
+        let redact = Redact::default();
+        let mut m = Model::default();
+        let end = |error: Option<&str>| BuildEventKind::ResultEnd {
+            duplicate: false,
+            upstream_file: None,
+            path: Vec::new(),
+            left_behind: None,
+            cancelled: false,
+            addr: "//a:c".into(),
+            error: error.map(str::to_owned),
+            upstream_of: None,
+            exit_status: None,
+            exit_code: None,
+            log_tail: None,
+            timed_out: None,
+        };
+        let events = [
+            BuildEventKind::ResultStart {
+                addr: "//a:c".into(),
+            },
+            end(None),
+            end(Some("c broke")),
+        ];
+        for (i, kind) in events.into_iter().enumerate() {
+            m.apply(
+                &BuildEvent {
+                    at_unix_ms: 1_000 + i as u64,
+                    kind,
+                },
+                &redact,
+            );
+            if i == 1 {
+                assert_eq!(m.ok_end("//a:c"), Some(true), "ended ok first");
+                let tabs = m.counts(CountScope::All);
+                assert_eq!((tabs.done, tabs.failed), (1, 0));
+            }
+        }
+        assert_eq!(m.in_flight_count(), 0);
+        let tabs = m.counts(CountScope::All);
+        assert_eq!((tabs.done, tabs.failed), (0, 1));
+        assert_eq!(
+            m.failures().map(|id| m.addr(id)).collect::<Vec<_>>(),
+            ["//a:c"]
+        );
+    }
+
     /// xorshift64*: the churn's seeded randomness.
     struct Rng(u64);
     impl Rng {
