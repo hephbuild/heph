@@ -60,6 +60,9 @@ pub const BOX_CAP: usize = 50;
 /// How many culprits the totals line names before `+N more` (D6.1c).
 pub const TOTALS_NAMED: usize = 5;
 
+/// The widest a culprit's name gets on the totals line, in columns.
+pub const TOTALS_NAME_MAX: usize = 120;
+
 /// The largest source file an excerpt is read from. A hand-written source
 /// file is far smaller; past this, the location is named without an excerpt.
 const SOURCE_READ_CAP: u64 = 4 * 1024 * 1024;
@@ -310,8 +313,9 @@ pub fn render_box(rec: &FailureRecord, ctx: &RenderCtx) -> String {
 
 /// The report's boxes: the first [`BOX_CAP`] failures in full, a blank line
 /// between two, then one line for each further failure and
-/// `N more: heph inspect failure --json`. Failures only: a stop is not one,
-/// and the caller leaves it out.
+/// `N more: heph inspect failure --json <addr>` (the command takes the
+/// address each line names). Failures only: a stop is not one, and the
+/// caller leaves it out.
 pub fn render_report<'a>(
     recs: impl IntoIterator<Item = &'a FailureRecord>,
     ctx: &RenderCtx,
@@ -335,7 +339,7 @@ pub fn render_report<'a>(
     }
     if more > 0 {
         // Writing to a `String` cannot fail.
-        writeln!(out, "{more} more: heph inspect failure --json").unwrap_or_default();
+        writeln!(out, "{more} more: heph inspect failure --json <addr>").unwrap_or_default();
     }
     out
 }
@@ -396,20 +400,25 @@ pub fn streamed_exec_line(rec: &FailureRecord, color: bool) -> String {
 }
 
 /// The non-TUI run's last line (D6.1c): `2 failed: //c:y, d/BUILD ·
-/// 3 skipped`, naming at most [`TOTALS_NAMED`] culprits, then `+N more`.
+/// 3 skipped`, naming at most [`TOTALS_NAMED`] culprits, each cut to
+/// [`TOTALS_NAME_MAX`] columns, then `+N more` and the command that reads
+/// one of the rest (PV-3). So the line is bounded whatever the run's size.
 /// Empty when nothing failed or was skipped. No newline.
 pub fn totals_line<S: AsRef<str>>(failed: &[S], skipped: usize) -> String {
     let mut parts = Vec::new();
     if !failed.is_empty() {
-        let named: Vec<Cow<'_, str>> = failed
+        let named: Vec<String> = failed
             .iter()
             .take(TOTALS_NAMED)
-            .map(|f| clean_inline(f.as_ref()))
+            .map(|f| cut_right(&clean_inline(f.as_ref()), TOTALS_NAME_MAX).into_owned())
             .collect();
         let more = failed.len().saturating_sub(TOTALS_NAMED);
         let mut names = named.join(", ");
         if more > 0 {
-            names.push_str(&format!(" +{more} more"));
+            names.push_str(&format!(
+                " +{} more (heph inspect failure --json <addr>)",
+                hcore::units::thousands(more)
+            ));
         }
         parts.push(format!(
             "{} failed: {names}",

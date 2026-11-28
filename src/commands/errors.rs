@@ -60,9 +60,10 @@ fn render_failures<'a>(
 ///   412 targets could not be loaded (provider go)
 ///       //svc/api:build   go list: exit status 1
 ///       ... 411 more
-///   Targets that matched were still processed; the skipped ones were not, and
-///   may also have matched. Fix the cause and re-run, or pass --fail-fast to
-///   stop at the first one with its full error.
+///   Targets that matched were still processed; 412 targets could not be
+///   checked against the selector, so they may also have matched.
+///   Fix the cause and re-run, or pass --fail-fast to stop at the first one
+///   with its full error.
 /// ```
 ///
 /// The stage is said in words (`could not be loaded`), not by its key
@@ -142,16 +143,72 @@ fn render_incomplete(
     if after_failures {
         out.push_str("  Target failures above may be the cause.\n");
     }
-    out.push_str(if report.nothing_matched {
-        "  No target matched, so nothing ran.\n"
+    if report.nothing_matched {
+        out.push_str("  No target matched, so nothing ran.\n");
     } else {
-        "  Targets that matched were still processed; the skipped ones were not, and may also \
-         have matched.\n"
-    });
+        out.push_str(&still_processed(report));
+    }
     out.push_str(
         "  Fix the cause and re-run, or pass --fail-fast to stop at the first one with its full \
          error.\n",
     );
+    out
+}
+
+/// The block's sentence on what the skips cost a run that matched something
+/// (PV-5), said per kind with no double negative: `Targets that matched
+/// were still processed; 1 package could not be listed, so its targets are
+/// not in this selection.` A package that could not be read or listed lost
+/// its targets, a failed package listing lost its packages, and a target
+/// that could not be loaded or resolved may have matched.
+fn still_processed(report: &crate::engine::discovery::GapReport) -> String {
+    use crate::engine::discovery::Stage;
+    let count = |stages: &[Stage]| -> usize {
+        report
+            .groups
+            .iter()
+            .filter(|g| stages.contains(&g.stage))
+            .map(|g| g.count)
+            .sum()
+    };
+    let one = |n: usize, single: &str, plural: &str| {
+        format!(
+            "{} {}",
+            hcore::units::thousands(n),
+            if n == 1 { single } else { plural }
+        )
+    };
+    let mut parts = Vec::new();
+    match count(&[Stage::Probe, Stage::List]) {
+        0 => {}
+        n => parts.push(format!(
+            "{} could not be listed, so {} targets are not in this selection",
+            one(n, "package", "packages"),
+            if n == 1 { "its" } else { "their" }
+        )),
+    }
+    match count(&[Stage::Packages]) {
+        0 => {}
+        n => parts.push(format!(
+            "{} failed, so the packages under {} are not in this selection",
+            one(n, "package listing", "package listings"),
+            if n == 1 { "it" } else { "them" }
+        )),
+    }
+    match count(&[Stage::Spec, Stage::Def]) {
+        0 => {}
+        n => parts.push(format!(
+            "{} could not be checked against the selector, so {} may also have matched",
+            one(n, "target", "targets"),
+            if n == 1 { "it" } else { "they" }
+        )),
+    }
+    let mut out = "  Targets that matched were still processed".to_owned();
+    for part in &parts {
+        out.push_str("; ");
+        out.push_str(part);
+    }
+    out.push_str(".\n");
     out
 }
 
@@ -1147,6 +1204,34 @@ mod tests {
         );
     }
 
+    /// PV-7: a failure its one line told after its streamed output gets no
+    /// box at exit either: not from the deferred registry, not as a lone
+    /// `TargetFailure`. One that failed after its streamed run still does.
+    #[test]
+    fn render_anyhow_skips_a_failure_told_streamed() {
+        let mut told = rec("//p:told", "exit status 1");
+        told.streamed = true;
+        told.failed_in = FailedIn::Exec;
+        assert!(told.told_streamed());
+        let mut after = rec("//p:after", "storing outputs");
+        after.streamed = true;
+        after.failed_in = FailedIn::AfterRun;
+        let e = FailedTargets::deferred(vec![
+            failure("//p:told", told.clone()),
+            failure("//p:after", after),
+        ])
+        .into_error();
+        assert_eq!(
+            render_anyhow_to_string(&e, false).as_deref(),
+            Some("✗ //p:after\n  storing outputs\n")
+        );
+        let lone = anyhow::Error::new(
+            TargetFailure::new(crate::htaddr::parse_addr("//p:told").expect("addr"))
+                .with_record(Arc::new(told)),
+        );
+        assert_eq!(render_anyhow_to_string(&lone, false).as_deref(), Some(""));
+    }
+
     /// U3: a culprit three deep names how the request reached it, under its
     /// cause; one that was itself requested gets no row.
     #[test]
@@ -1432,8 +1517,9 @@ mod tests {
              \x20     //svc/api:t3   go list: exit status 1\n\
              \x20     //svc/api:t4   go list: exit status 1\n\
              \x20     ... 2 more\n\
-             \x20 Targets that matched were still processed; the skipped ones were not, and may \
-             also have matched.\n\
+             \x20 Targets that matched were still processed; 1 package could not be listed, so \
+             its targets are not in this selection; 7 targets could not be checked against the \
+             selector, so they may also have matched.\n\
              \x20 Fix the cause and re-run, or pass --fail-fast to stop at the first one with its \
              full error.\n"
         );
@@ -1468,6 +1554,15 @@ mod tests {
                 "  a provider could not list packages under //vendor: permission denied",
                 "  provider go could not list packages: go env: not found",
             ]
+        );
+        // PV-5: what the failed listings cost, with no double negative.
+        assert!(
+            render_incomplete(&only_listings, false, false).contains(
+                "\n  Targets that matched were still processed; 2 package listings failed, so \
+                 the packages under them are not in this selection.\n"
+            ),
+            "{}",
+            render_incomplete(&only_listings, false, false)
         );
         gaps.record(
             Stage::Spec,
