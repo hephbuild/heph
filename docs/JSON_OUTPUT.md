@@ -401,8 +401,8 @@ has the example).
 | `addr` | the target's address; null on a source file's record |
 | `file` | the workspace-relative file that did not evaluate; null on a target's record |
 | `slot` | the failure slot's directory, absolute |
-| `stage` | `eval`, `spec`, `parse`, `link`, `run`, `cache`, `config` or `cli`; never null |
-| `message` | what went wrong, on one line; never null. Its wording is not contract |
+| `stage` | `eval`, `spec`, `parse`, `link`, `run`, `cache`, `config` or `cli`; never null. Synthetic on a slot from an older heph, which kept no record: `run` when the target ran, else `eval` |
+| `message` | what went wrong, on one line; never null. Its wording is not contract. Synthetic on a slot from an older heph: `no diagnostic kept (the slot is from an older heph)` |
 | `location` | `{file, line, col}` in a source file; null when it names no place |
 | `hints` | `[{kind, text}]`; a hint's wording is not contract |
 | `truncated` | a cap cut something from the record |
