@@ -1475,6 +1475,15 @@ impl RequestState {
         self.with_final_paths(failures)
     }
 
+    /// [`failures`](Self::failures) without the path pass: each failure's
+    /// [`path`](TargetFailure::path) is the one read when it was recorded.
+    /// For a reader that never looks at the paths, such as the culprits
+    /// handed to [`skipped_report`](Self::skipped_report), which walks the
+    /// graph itself.
+    pub fn failures_unpathed(&self) -> Vec<Arc<TargetFailure>> {
+        self.data.failures.lock().values().cloned().collect()
+    }
+
     /// `failures`, each [`path`](TargetFailure::path) recomputed on the
     /// graph as it is now. A failure's path was read off the graph when it
     /// was recorded, while the scheduler was still adding edges, so it
