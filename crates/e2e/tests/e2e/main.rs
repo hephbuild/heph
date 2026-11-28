@@ -32,6 +32,7 @@ mod codegen_index_read;
 mod codegen_index_write;
 mod codegen_keep_import;
 mod core_resource;
+mod decl_site_hashin;
 mod deps;
 mod devenv_runner;
 mod discovery;
