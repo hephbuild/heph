@@ -317,6 +317,11 @@ pub(crate) struct Fill<'a> {
     /// invocation, which is never logged (R22): its slot holds `out/` only,
     /// whatever its driver attached.
     pub keep_log: bool,
+    /// What the run's record is scrubbed of. A material run's memory tail
+    /// is scrubbed of it *before* it is cut to the record's cap (H-M1): a
+    /// cut first could leave a secret's suffix at the tail's head, where no
+    /// later scrub recognises it.
+    pub scrub: crate::engine::failure_record::Scrub,
 }
 
 /// The slots of one home, as one engine sees them.
@@ -582,8 +587,13 @@ impl FailureSlots {
             fill_id: Some(new_fill_id()),
             packages: Vec::new(),
         };
-        let (root, lines, material, roots) =
-            (self.root.clone(), fill.lines, fill.material, fill.roots);
+        let (root, lines, material, roots, scrub) = (
+            self.root.clone(),
+            fill.lines,
+            fill.material,
+            fill.roots,
+            fill.scrub,
+        );
         let addr = fill.addr.clone();
         let filled = hcore::blocking::run(move || {
             let source = source.and_then(|source| match source {
@@ -598,7 +608,9 @@ impl FailureSlots {
             });
             let out = out.and_then(|tar| staged_out_tar(&addr, tar, &roots));
             let tail_of = |source: &LogSource| match memory_tail(source, lines) {
-                Ok(t) => {
+                Ok(mut t) => {
+                    // Scrubbed whole, then cut (H-M1).
+                    t.text = scrub.apply(&t.text);
                     let (tail, cut) = capped_tail(t);
                     Some(FailureLog::in_memory(tail, cut))
                 }
@@ -1078,10 +1090,10 @@ fn resolve_in_roots(path: &Path, roots: &[PathBuf]) -> io::Result<Option<PathBuf
 
 /// `tail` within [`RECORD_CAP`](hcore::failure::RECORD_CAP) (E2): a log
 /// kept only in memory is held on the error chain as long as the failure
-/// is, so it gets the record's cap, not [`TAIL_MAX_BYTES`]. Whole lines are
-/// dropped from the front, so no line is cut (a secret in it stays whole for
-/// the record's scrub) unless the last one alone is over the cap; then its
-/// end is kept, at a char boundary. True when it cut.
+/// is, so it gets the record's cap, not [`TAIL_MAX_BYTES`]. The caller has
+/// already scrubbed it ([`Fill::scrub`]). Whole lines are dropped from the
+/// front, so no line is cut unless the last one alone is over the cap; then
+/// its end is kept, at a char boundary. True when it cut.
 ///
 /// [`TAIL_MAX_BYTES`]: hcore::failure_log::TAIL_MAX_BYTES
 fn capped_tail(mut tail: LogTail) -> (LogTail, bool) {
@@ -1787,6 +1799,7 @@ mod tests {
                 material: false,
                 fixes: None,
                 keep_log: true,
+                scrub: Default::default(),
             })
             .await;
         slot.log.map(|l| l.tail().expect("tail").text)
@@ -1865,6 +1878,7 @@ mod tests {
                     material: false,
                     fixes: None,
                     keep_log: true,
+                    scrub: Default::default(),
                 })
                 .await;
             let m = slots.read(&a).expect("a slot");
@@ -1902,12 +1916,59 @@ mod tests {
                 material: true,
                 fixes: None,
                 keep_log: true,
+                scrub: Default::default(),
             })
             .await;
         let log = slot.log.expect("a tail");
         assert!(log.path().is_none());
         assert_eq!(log.tail().expect("tail").text, "producer said");
         assert!(!slots.root().exists(), "no slot, not even the directory");
+    }
+
+    /// H-M1: a material run's memory tail is scrubbed before it is cut to
+    /// the record's cap. One line over the cap, cut inside a secret: cut
+    /// first, the secret's suffix would head the tail, where no scrub knows
+    /// it.
+    #[tokio::test]
+    async fn memory_tail_scrubbed_before_the_cut() {
+        let secret = "MEMTAIL-SECRET-0123456789-abcdef";
+        let suffix = secret.get(secret.len() / 2..).expect("suffix");
+        let line = format!(
+            "{}{secret}{}",
+            "a".repeat(100),
+            "b".repeat(hcore::failure::RECORD_CAP - suffix.len())
+        );
+        let home = tempfile::tempdir().expect("home");
+        let sandbox = tempfile::tempdir().expect("sandbox");
+        let slots = FailureSlots::new(home.path());
+        let a = addr("//auth:fetch");
+        let err = with_failure_artifacts(
+            anyhow::anyhow!("boom"),
+            vec![raw_log(format!("{line}\n").as_bytes())],
+        );
+        let fill = |scrub| Fill {
+            addr: &a,
+            hashin: "h",
+            roots: vec![sandbox.path().to_path_buf()],
+            err: &err,
+            lines: 10,
+            material: true,
+            fixes: None,
+            keep_log: true,
+            scrub,
+        };
+        // The fixture has teeth: unscrubbed, the cut leaves the suffix.
+        let raw = slots.fill(fill(Default::default())).await;
+        let raw = raw.log.expect("a tail").tail().expect("tail").text.clone();
+        assert!(raw.starts_with(suffix), "{:?}", raw.get(..40));
+
+        let scrub = crate::engine::failure_record::Scrub::new([secret.to_owned()]);
+        let slot = slots.fill(fill(scrub)).await;
+        let log = slot.log.expect("a tail");
+        assert!(log.memory_cut(), "the tail was cut");
+        let text = &log.tail().expect("tail").text;
+        assert!(text.len() <= hcore::failure::RECORD_CAP);
+        assert!(!text.contains(suffix), "{:?}", text.get(..40));
     }
 
     #[tokio::test]
@@ -1932,6 +1993,7 @@ mod tests {
                 material: false,
                 fixes: None,
                 keep_log: true,
+                scrub: Default::default(),
             })
             .await;
         let log = slot.log.clone().expect("the tail, in memory");
@@ -2000,6 +2062,7 @@ mod tests {
                     material,
                     fixes: None,
                     keep_log: true,
+                    scrub: Default::default(),
                 },
                 None,
                 ops,
@@ -2028,6 +2091,7 @@ mod tests {
                 lines: 10,
                 material: false,
                 keep_log: true,
+                scrub: Default::default(),
                 fixes: Some(FailureFixes::Written {
                     root: root.clone(),
                     paths: paths.clone(),
@@ -2060,6 +2124,7 @@ mod tests {
                 lines: 10,
                 material: false,
                 keep_log: true,
+                scrub: Default::default(),
                 fixes: Some(FailureFixes::NotWritten(FixesNotWritten::Frozen)),
             })
             .await;
@@ -2264,6 +2329,7 @@ mod tests {
                     lines: 10,
                     material: true,
                     keep_log: true,
+                    scrub: Default::default(),
                     fixes: Some(FailureFixes::Written {
                         root: sandbox.path().to_path_buf(),
                         paths: paths.clone(),

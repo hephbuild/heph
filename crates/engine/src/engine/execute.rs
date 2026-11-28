@@ -407,6 +407,7 @@ impl Engine {
                                 material: outputs_are_material,
                                 fixes: write_back.fixes,
                                 keep_log: true,
+                                scrub: rs.scrub_for(&[addr]),
                             };
                             // A run with a live log keeps it, through the
                             // descriptor; its guard unlinks it once the slot

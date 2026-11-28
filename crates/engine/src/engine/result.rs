@@ -12516,6 +12516,7 @@ mod tests {
                 material: false,
                 fixes: None,
                 keep_log: true,
+                scrub: Default::default(),
             })
             .await
             .with_streamed(true);
@@ -12595,6 +12596,7 @@ mod tests {
                 material: false,
                 fixes: None,
                 keep_log: true,
+                scrub: Default::default(),
             })
             .await;
         e.context(slot)

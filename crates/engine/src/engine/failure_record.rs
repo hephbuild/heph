@@ -65,6 +65,11 @@ impl Scrub {
     fn needles(&self) -> Option<Arc<Needles>> {
         Needles::new(&self.0)
     }
+
+    /// `s` with every value replaced.
+    pub(crate) fn apply(&self, s: &str) -> String {
+        scrub_text(self.needles().as_ref(), s)
+    }
 }
 
 impl fmt::Debug for Scrub {
@@ -315,32 +320,83 @@ fn own_message(e: &anyhow::Error, causes: &mut Vec<String>) -> String {
 }
 
 /// Every text `rec` holds, scrubbed. Runs before any cap ([`bound`]).
+///
+/// Every struct is destructured whole, so a new field does not compile
+/// until it is either scrubbed here or named as holding no secret.
 fn scrubbed(mut rec: FailureRecord, clean: &impl Fn(&str) -> String) -> FailureRecord {
     let opt = |s: &mut Option<String>| {
         if let Some(s) = s {
             *s = clean(s);
         }
     };
-    let d = &mut rec.diagnostic;
-    d.message = clean(&d.message);
-    opt(&mut d.addr);
-    opt(&mut d.snippet);
-    opt(&mut d.plugin);
-    if let Some(loc) = &mut d.location {
-        loc.file = clean(&loc.file);
+    let FailureRecord {
+        // Addresses and workspace paths the engine resolved, and counts.
+        addr: _,
+        file: _,
+        entry: _,
+        path: _,
+        took_down: _,
+        more_causes: _,
+        failed_in: _,
+        timed_out: _,
+        cancelled: _,
+        surface_top: _,
+        streamed: _,
+        // Engine-made paths (the slot's log, `out/`, the sandbox) and the
+        // write-back's workspace paths.
+        left_behind: _,
+        diagnostic,
+        causes,
+        frozen_diff,
+        exit,
+        log,
+    } = &mut rec;
+    let Diagnostic {
+        stage: _,
+        truncated: _,
+        addr,
+        message,
+        location,
+        snippet,
+        hints,
+        plugin,
+    } = diagnostic;
+    *message = clean(message);
+    opt(addr);
+    opt(snippet);
+    opt(plugin);
+    if let Some(hcore::diagnostic::SourceLoc {
+        file,
+        line: _,
+        col: _,
+    }) = location
+    {
+        *file = clean(file);
     }
-    for hint in &mut d.hints {
-        hint.text = clean(&hint.text);
+    for hcore::diagnostic::Hint { kind: _, text } in hints {
+        *text = clean(text);
     }
-    for cause in &mut rec.causes {
+    for cause in causes {
         *cause = clean(cause);
     }
-    opt(&mut rec.frozen_diff);
-    if let Some(exit) = &mut rec.exit {
-        exit.status = clean(&exit.status);
+    opt(frozen_diff);
+    if let Some(ExitData {
+        code: _,
+        signal: _,
+        status,
+    }) = exit
+    {
+        *status = clean(status);
     }
-    if let Some(log) = &mut rec.log {
-        opt(&mut log.memory_tail);
+    if let Some(LogRef {
+        // The slot's path and fill id: engine-made.
+        path: _,
+        fill_id: _,
+        lines: _,
+        memory_tail,
+    }) = log
+    {
+        opt(memory_tail);
     }
     rec
 }
@@ -788,6 +844,55 @@ mod tests {
         assert!(rec.diagnostic.message.contains("[redacted]"));
         assert!(rec.causes.first().is_some_and(|c| c.contains("[redacted]")));
         assert!(rec.diagnostic.truncated);
+    }
+
+    /// FQ-3: a secret planted in every text field a record holds survives
+    /// nowhere in it once compacted.
+    #[test]
+    fn scrub_reaches_every_text_field() {
+        let secret = "PLANTED-SECRET-0123456789";
+        let s = |what: &str| format!("{what} {secret} {what}");
+        let mut d = Diagnostic::new(Stage::Run, s("message"));
+        d.addr = Some(s("addr"));
+        d.snippet = Some(s("snippet"));
+        d.plugin = Some(s("plugin"));
+        d.location = Some(hcore::diagnostic::SourceLoc {
+            file: s("file"),
+            line: 1,
+            col: 1,
+        });
+        d = d.with_hint(Hint::new(HintKind::Other, s("hint")));
+        let mut inner = FailureRecord::new(d);
+        inner.causes = vec![s("cause")];
+        inner.frozen_diff = Some(s("diff"));
+        inner.exit = Some(ExitData {
+            code: None,
+            signal: None,
+            status: s("status"),
+        });
+        inner.log = Some(LogRef {
+            path: None,
+            fill_id: None,
+            lines: 1,
+            memory_tail: Some(s("tail")),
+        });
+        // The fixture has teeth: every field holds the secret going in.
+        let planted = format!("{inner:?}").matches(secret).count();
+        assert_eq!(planted, 10, "{inner:?}");
+
+        let tf = TargetFailure::new(addr("//p:t")).with_record(Arc::new(inner));
+        let rec = compact(
+            &anyhow::Error::new(tf),
+            &target("//p:t"),
+            &addr("//p:t"),
+            &Scrub::new([secret.to_owned()]),
+            None,
+        );
+        // `Debug` prints every field, `memory_tail` (never serialized)
+        // included.
+        let all = format!("{rec:?}");
+        assert!(!all.contains(secret), "{all}");
+        assert_eq!(all.matches("[redacted]").count(), planted, "{all}");
     }
 
     #[test]
