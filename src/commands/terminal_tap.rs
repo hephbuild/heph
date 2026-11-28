@@ -268,8 +268,10 @@ mod tests {
 
     /// A failed process's record, as the engine hands it to the wrapper.
     fn exec_failure(addr: &str) -> crate::engine::RunEnd {
+        // The message a plain exit is recorded with: its status, as the
+        // header says it (`failure_record::compact`).
         let mut rec = hcore::failure::FailureRecord::new(
-            hcore::diagnostic::Diagnostic::new(hcore::diagnostic::Stage::Run, "process failed")
+            hcore::diagnostic::Diagnostic::new(hcore::diagnostic::Stage::Run, "exit status 1")
                 .with_addr(addr),
         );
         rec.addr = Some(addr.to_owned());
