@@ -526,7 +526,10 @@ impl FailureSlots {
             });
             let out = out.and_then(|tar| staged_out_tar(&addr, tar, &roots));
             let tail_of = |source: &LogSource| match memory_tail(source, lines) {
-                Ok(t) => Some(FailureLog::in_memory(capped_tail(t))),
+                Ok(t) => {
+                    let (tail, cut) = capped_tail(t);
+                    Some(FailureLog::in_memory(tail, cut))
+                }
                 Err(e) => {
                     tracing::warn!(addr = %addr, error = %e, "reading the failure log's tail");
                     None
@@ -998,13 +1001,13 @@ fn resolve_in_roots(path: &Path, roots: &[PathBuf]) -> io::Result<Option<PathBuf
 /// is, so it gets the record's cap, not [`TAIL_MAX_BYTES`]. Whole lines are
 /// dropped from the front, so no line is cut (a secret in it stays whole for
 /// the record's scrub) unless the last one alone is over the cap; then its
-/// end is kept, at a char boundary.
+/// end is kept, at a char boundary. True when it cut.
 ///
 /// [`TAIL_MAX_BYTES`]: hcore::failure_log::TAIL_MAX_BYTES
-fn capped_tail(mut tail: LogTail) -> LogTail {
+fn capped_tail(mut tail: LogTail) -> (LogTail, bool) {
     let cap = hcore::failure::RECORD_CAP;
     if tail.text.len() <= cap {
-        return tail;
+        return (tail, false);
     }
     let len = tail.text.len();
     let over = len - cap;
@@ -1031,7 +1034,7 @@ fn capped_tail(mut tail: LogTail) -> LogTail {
         .map_or(0, |head| head.matches('\n').count());
     tail.text.drain(..start);
     tail.start_line += dropped;
-    tail
+    (tail, true)
 }
 
 /// The tail of `source`, read into memory.

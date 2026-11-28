@@ -8,6 +8,8 @@
     reason = "shared test harness; each test binary uses a different subset"
 )]
 
+pub mod failure_load;
+
 use anyhow::{Context as _, Result};
 use heph::engine::{Config, Engine};
 use heph::pluginbuildfile;

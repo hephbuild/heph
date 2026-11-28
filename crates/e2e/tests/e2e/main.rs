@@ -10,7 +10,9 @@
 //! under `tests/` because they call
 //! `std::env::set_var`, and libtest runs a binary's tests as threads of one
 //! process: a variable one test sets would be visible to every other test in
-//! here while it is set. The root crate's `every_test_file_is_compiled` checks
+//! here while it is set. `failure_memory.rs` stays separate because it
+//! re-executes its own binary, one process per reading of `ru_maxrss` (a
+//! process high-water mark). The root crate's `every_test_file_is_compiled` checks
 //! that each file under this directory is declared below and that no new
 //! top-level test file appears without a decision either way.
 
@@ -39,6 +41,7 @@ mod execrunner;
 mod failure_events;
 mod failure_out;
 mod failure_report;
+mod failure_resources;
 mod failure_slot;
 mod force;
 mod fs_glob;
