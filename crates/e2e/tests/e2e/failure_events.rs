@@ -169,10 +169,11 @@ async fn a_def_that_does_not_resolve_is_announced() -> anyhow::Result<()> {
 }
 
 /// A dependent that failed only because its dependency did names that root,
-/// though its error reaches the end as `meta: …` around the memoizer's shared
-/// copy of the marker. Read off the chain, the end stopped at that copy and
-/// every view showed the dependent as a failure of its own — one the
-/// end-of-run report, which records only roots, never listed.
+/// though its error reaches the end wrapped in a `meta` stage frame around
+/// the memoizer's shared copy of the marker. Read off the chain, the end
+/// stopped at that copy and every view showed the dependent as a failure of
+/// its own — one the end-of-run report, which records only roots, never
+/// listed. The end's message leaves the stage frame out and names the root.
 #[tokio::test]
 async fn a_meta_failure_names_its_root() -> anyhow::Result<()> {
     let ws = workspace(vec![
@@ -181,7 +182,8 @@ async fn a_meta_failure_names_its_root() -> anyhow::Result<()> {
     ])?;
     let seen = single(&ws, "//a:top").await;
     let (error, root) = failed_end(&seen.events, "//a:top");
-    assert!(error.starts_with("meta"), "the case this pins: {error}");
+    assert!(!error.starts_with("meta"), "no stage frame: {error}");
+    assert!(error.contains("//a:root"), "names its root: {error}");
     assert_eq!(root.as_deref(), Some("//a:root"));
     let (_, root) = failed_end(&seen.events, "//a:root");
     assert_eq!(root, None);
