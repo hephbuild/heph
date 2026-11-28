@@ -532,7 +532,12 @@ impl Engine {
                 // A dependent's merged transitive input was declared by the
                 // target it came from, not by `declarer`: keep what can look
                 // that target up (only for such an input; a failure reads it).
-                let transitive = transitive_origin(&input.origin_id).map(|_| rs.clone());
+                // A substring test, not `transitive_origin`: this runs for
+                // every edge, and the origin's text is only for the error.
+                let transitive = input
+                    .origin_id
+                    .contains(TRANSITIVE_PREFIX)
+                    .then(|| rs.clone());
                 Arc::clone(self)
                     .get_def(rs.clone(), &input.r#ref.r#ref)
                     .map(move |def| {
