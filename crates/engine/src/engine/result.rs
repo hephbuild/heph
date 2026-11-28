@@ -2384,10 +2384,17 @@ fn blame_walk_failure(rs: &RequestState, matcher: &Matcher, e: anyhow::Error) ->
     if is_stop(&e) {
         return e;
     }
-    let pkg = std::path::Path::new(&*file.file)
-        .parent()
-        .and_then(std::path::Path::to_str)
-        .unwrap_or("");
+    // The package the walk was scanning: the broken file may be a `.bzl`
+    // it loads, or a parent package's BUILD, anywhere in the tree. The
+    // file's own directory only when the walk did not say (a confirm's
+    // resolution, which names its target's package anyway).
+    let pkg = match downcast_chain_ref::<crate::engine::discovery::WalkedPackage>(&e) {
+        Some(w) => w.package.as_str(),
+        None => std::path::Path::new(&*file.file)
+            .parent()
+            .and_then(std::path::Path::to_str)
+            .unwrap_or(""),
+    };
     let Some(entry) = walk_entry(matcher, pkg) else {
         return e;
     };

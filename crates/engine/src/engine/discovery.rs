@@ -14,6 +14,7 @@
 use crate::engine::error::CancelledError;
 use crate::engine::request_state::RequestState;
 use hcore::hmemoizer::downcast_chain_ref;
+use hmodel::htpkg::PkgBuf;
 use parking_lot::Mutex;
 use rustc_hash::FxHashSet;
 use std::collections::BTreeMap;
@@ -404,6 +405,39 @@ impl std::fmt::Display for InProvider {
 }
 
 impl std::error::Error for InProvider {}
+
+/// Context: a package walk was scanning `package` when a file failed to
+/// evaluate. Not necessarily the broken file's package: a `.bzl` it loads,
+/// or a parent package it probes, can live anywhere. What a failed
+/// selection's record is entered through (a requested target of this
+/// package), so the walk need not guess it from the file's directory.
+///
+/// Data riding the chain, like [`FileEvalFailed`](crate::engine::error::FileEvalFailed):
+/// its `Display` is empty and it is [`nest`](hcore::hmemoizer::nest)ed, so
+/// the error reads as before.
+#[derive(Debug)]
+pub(crate) struct WalkedPackage {
+    pub package: PkgBuf,
+}
+
+impl std::fmt::Display for WalkedPackage {
+    fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Ok(())
+    }
+}
+
+impl std::error::Error for WalkedPackage {}
+
+/// `e`, from scanning `package`, carrying [`WalkedPackage`] when a file
+/// failed to evaluate under it; any other error unchanged.
+pub(crate) fn walked_package(e: anyhow::Error, package: &PkgBuf) -> anyhow::Error {
+    if downcast_chain_ref::<crate::engine::error::FileEvalFailed>(&e).is_none() {
+        return e;
+    }
+    hcore::hmemoizer::nest(e.context(WalkedPackage {
+        package: package.clone(),
+    }))
+}
 
 /// The provider an error names through [`InProvider`], or `""`.
 pub(crate) fn provider_of(err: &anyhow::Error) -> &str {
