@@ -264,3 +264,100 @@ pub async fn emit_scope_with<T, F: Future<Output = ()>>(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::hook::Hook;
+    use crate::engine::{Config, Engine};
+
+    /// Each `ResultStart`/`ResultEnd` a hook saw, as `(start?, error)`.
+    #[derive(Default)]
+    struct Rec {
+        seen: parking_lot::Mutex<Vec<(bool, Option<String>)>>,
+    }
+
+    impl Hook for Rec {
+        fn name(&self) -> String {
+            "rec".into()
+        }
+        fn on_event(&self, ev: &BuildEvent) {
+            match &ev.kind {
+                BuildEventKind::ResultStart { .. } => self.seen.lock().push((true, None)),
+                BuildEventKind::ResultEnd { error, .. } => {
+                    self.seen.lock().push((false, error.clone()));
+                }
+                _ => {}
+            }
+        }
+        fn on_close(&self) {}
+    }
+
+    fn end(error: Option<ErrorDetail>) -> BuildEventKind {
+        BuildEventKind::ResultEnd {
+            duplicate: false,
+            left_behind: None,
+            cancelled: false,
+            addr: "//a:b".into(),
+            error: error.map(ErrorDetail::into_message),
+            upstream_of: None,
+            upstream_file: None,
+            path: Vec::new(),
+            exit_status: None,
+            exit_code: None,
+            log_tail: None,
+            timed_out: None,
+        }
+    }
+
+    /// A scope dropped while `on_error`'s future is pending still pairs its
+    /// Start with one End, and that End is the failure the body returned:
+    /// the detail is taken before the await, so the cancel loses only what
+    /// the await would have added.
+    #[tokio::test]
+    async fn emit_scope_with_cancelled_during_on_error_still_ends() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let _rt = crate::engine::test_rt_enter();
+        let mut e = Engine::new(Config {
+            parallelism: None,
+            ..Config::for_tests(dir.path())
+        })?;
+        let rec = Arc::new(Rec::default());
+        e.register_hook(Arc::clone(&rec) as Arc<dyn Hook>)?;
+        let engine = Arc::new(e);
+        let state = engine.new_state_with_events(false, None);
+
+        let awaiting = tokio::sync::Notify::new();
+        let scope = emit_scope_with(
+            &state,
+            BuildEventKind::ResultStart {
+                addr: "//a:b".into(),
+            },
+            end,
+            |e| {
+                let more = async {
+                    awaiting.notify_one();
+                    std::future::pending::<()>().await;
+                };
+                (e, Some(more))
+            },
+            async { Err::<(), _>(anyhow::anyhow!("boom")) },
+        );
+        let cancelled = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::select! {
+                _ = scope => false,
+                () = awaiting.notified() => true,
+            }
+        })
+        .await?;
+        assert!(cancelled, "the scope ended before on_error's await");
+        // `scope` was dropped when the select returned: the cancel.
+
+        assert_eq!(
+            rec.seen.lock().clone(),
+            [(true, None), (false, Some("boom".to_string()))],
+            "one Start, one End carrying the body's failure"
+        );
+        Ok(())
+    }
+}
