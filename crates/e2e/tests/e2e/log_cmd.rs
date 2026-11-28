@@ -290,3 +290,47 @@ async fn log_cmd_current_is_meta() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// STAGE-09: a culprit that failed before its process ran has no log, and
+/// running it again would not produce one. `heph log` says it never ran and
+/// points at `inspect failure`, for a target in a broken BUILD file (the
+/// file's slot) and for one its driver refused (its own slot).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn log_before_run_says_it_never_ran() -> anyhow::Result<()> {
+    let ws = crate::common::Workspace::new();
+    ws.write_build_file("d", "target(name = \"t\"\nbroken(\n");
+    ws.write_build_file(
+        "p",
+        r#"target(name = "t", driver = "bash", run = "true", timeout = "not-a-duration")"#,
+    );
+    let cases = [
+        ("//d:t", "while its BUILD file was evaluated"),
+        ("//p:t", "while its driver parsed its definition"),
+    ];
+    for (addr, _) in cases {
+        let rs = ws.engine.new_state();
+        let res = Arc::clone(&ws.engine)
+            .result_addr(
+                rs,
+                &parse_addr(addr)?,
+                heph::engine::OutputMatcher::All,
+                &heph::engine::ResultOptions::default(),
+            )
+            .await;
+        assert!(res.is_err(), "{addr} must fail");
+    }
+    ws.engine.failure_slots().writes_drained().await;
+    for (addr, stage) in cases {
+        let (shown, out, err) = log(&ws.engine, addr, false).await?;
+        assert!(matches!(shown, Shown::Nothing), "{addr}");
+        assert_eq!(out, "", "{addr}");
+        assert!(
+            err.contains(&format!(
+                "{addr} failed {stage}; it never ran. See `heph inspect failure {addr}`"
+            )),
+            "{addr}: {err}"
+        );
+        assert!(!err.contains("To produce one"), "{addr}: {err}");
+    }
+    Ok(())
+}
