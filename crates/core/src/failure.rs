@@ -90,6 +90,19 @@ pub struct FailureRecord {
     /// The run's output reached a terminal while it ran.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub streamed: bool,
+    /// The targets that failed only because this one did: known once the
+    /// request ends, so filled when it hands its failures out, never on the
+    /// wire as the failure happens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub took_down: Option<TookDownData>,
+}
+
+/// The targets one culprit took down: the first few by name, in the order
+/// they failed, and how many in all.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TookDownData {
+    pub named: Vec<String>,
+    pub total: u64,
 }
 
 impl FailureRecord {
@@ -112,6 +125,7 @@ impl FailureRecord {
             left_behind: None,
             log: None,
             streamed: false,
+            took_down: None,
         }
     }
 
@@ -244,6 +258,11 @@ mod tests {
             surface_top: true,
             left_behind: Some(LeftBehindData {
                 sandbox: Some("x (kept)".into()),
+                kept: vec![crate::events::KeptGroup {
+                    name: "report/".into(),
+                    files: 3,
+                }],
+                kept_more: 2,
                 ..LeftBehindData::default()
             }),
             log: Some(LogRef {
@@ -253,6 +272,10 @@ mod tests {
                 memory_tail: None,
             }),
             streamed: true,
+            took_down: Some(TookDownData {
+                named: vec!["//p:up".into()],
+                total: 4,
+            }),
             ..FailureRecord::new(
                 Diagnostic::new(Stage::Parse, "bad")
                     .with_location(SourceLoc::checked("p/BUILD".into(), 4, 5).expect("loc"))

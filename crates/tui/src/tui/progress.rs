@@ -4748,6 +4748,7 @@ mod tests {
                 outputs: Some("/h/failures/a_b/out".into()),
                 fixes: None,
                 log_readable: Some(true),
+                ..Default::default()
             })),
         };
         assert_eq!(

@@ -576,6 +576,49 @@ fn no_log_line_for_failure_before_run() {
     assert!(render_box(&ran, &RenderCtx::default()).contains("  log: none kept\n"));
 }
 
+/// The rows the report had before the renderers merged (D5): what the
+/// culprit took down, and the kept `failure_out` groups, in both modes.
+#[test]
+fn box_shows_took_down_and_kept_groups_in_both_modes() {
+    let group = |name: &str, files| hcore::events::KeptGroup {
+        name: name.into(),
+        files,
+    };
+    let rec = FailureRecord {
+        failed_in: FailedIn::Exec,
+        took_down: Some(hcore::events::TookDownData {
+            named: vec!["//p:a".into(), "//p:b".into()],
+            total: 9,
+        }),
+        left_behind: Some(LeftBehindData {
+            outputs: Some("/h/failures/k/out".into()),
+            kept: vec![group("a.txt", 1), group("one/", 1), group("report/", 3)],
+            kept_more: 2,
+            ..LeftBehindData::default()
+        }),
+        ..target("//p:t", Diagnostic::new(Stage::Run, "boom"))
+    };
+    let draw = |mode| {
+        render_box(
+            &rec,
+            &RenderCtx {
+                mode,
+                ..RenderCtx::default()
+            },
+        )
+    };
+    assert_eq!(
+        draw(RenderMode::Report),
+        "✗ //p:t\n  boom\n  took down: //p:a, //p:b +7 more\n\
+         \x20 outputs: a.txt, one/ (1 file), report/ (3 files), +2 more · heph inspect failure //p:t\n"
+    );
+    assert_eq!(
+        draw(RenderMode::Line),
+        "✗ //p:t\n  boom\n  took down: //p:a, //p:b +7 more\n\
+         \x20 outputs: a.txt, one/ (1 file), report/ (3 files), +2 more · /h/failures/k/out\n"
+    );
+}
+
 /// Report mode names no path into heph's home; line mode names the slot's.
 #[test]
 fn report_mode_names_commands_not_slot_paths() {

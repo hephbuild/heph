@@ -98,7 +98,7 @@ use crate::capacity::Unit;
 /// The compact failure record that rides failing events (see
 /// [`crate::failure`]).
 pub use crate::failure::{
-    CAUSE_CAP, CAUSES_CAP, ExitData, FailedIn, FailureRecord, LogRef, RECORD_CAP,
+    CAUSE_CAP, CAUSES_CAP, ExitData, FailedIn, FailureRecord, LogRef, RECORD_CAP, TookDownData,
 };
 
 /// An amount of a pool, as a person reads it, by the pool's unit: `cpu` in
@@ -959,6 +959,31 @@ pub struct LeftBehindData {
     /// then goes by whether `log_path` is set.
     #[serde(default)]
     pub log_readable: Option<bool>,
+    /// What `outputs` holds at the target's package, grouped by first path
+    /// component (`report/` and its file count, or a top-level file alone),
+    /// sorted by name: the first [`KEPT_GROUPS_CAP`]. Counted when the slot
+    /// is filled, so no renderer walks it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kept: Vec<KeptGroup>,
+    /// How many groups past `kept` were left out (`+N more`).
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub kept_more: u32,
+}
+
+fn is_zero_u32(n: &u32) -> bool {
+    *n == 0
+}
+
+/// How many [`KeptGroup`]s a [`LeftBehindData`] names.
+pub const KEPT_GROUPS_CAP: usize = 5;
+
+/// One group of a failed run's kept `failure_out` files.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KeptGroup {
+    /// A directory (ending in `/`) or a top-level file.
+    pub name: String,
+    /// How many files are under it; 1 for a file.
+    pub files: u64,
 }
 
 /// What a failed `in_place` run's write-back did, on [`LeftBehindData`].
