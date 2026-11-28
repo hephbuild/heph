@@ -709,11 +709,22 @@ fn spec_source(extra: &Extra, span: &starlark::codemap::FileSpan) -> Option<Spec
         match &*last {
             Some((abs, rel)) if abs == span.filename() => Arc::clone(rel),
             _ => {
-                let rel: Arc<str> = Path::new(span.filename())
+                // The span's file is a `str`, so the relative path is UTF-8
+                // whenever the prefix strips.
+                let Some(rel) = Path::new(span.filename())
                     .strip_prefix(extra.root)
-                    .ok()?
-                    .to_str()?
-                    .into();
+                    .ok()
+                    .and_then(Path::to_str)
+                else {
+                    tracing::debug!(
+                        file = span.filename(),
+                        root = %extra.root.display(),
+                        "no declaration site: the file is not under the workspace root \
+                         (outside it, or a root that is not UTF-8)"
+                    );
+                    return None;
+                };
+                let rel: Arc<str> = rel.into();
                 *last = Some((span.filename().to_owned(), Arc::clone(&rel)));
                 rel
             }
@@ -730,6 +741,7 @@ fn spec_source(extra: &Extra, span: &starlark::codemap::FileSpan) -> Option<Spec
             end_col: one_based(rs.end.column),
         },
     )
+    .inspect_err(|why| tracing::debug!(file = span.filename(), %why, "no declaration site"))
     .ok()
 }
 

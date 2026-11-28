@@ -144,6 +144,36 @@ async fn missing_dep_carries_kwarg_location() {
     assert_eq!(triple(loc(&f)), at("c/BUILD", &src, "deps"), "{}", text(&f));
 }
 
+/// A missing dep a target inherits through another's `transitive` blames
+/// the declarer, names it as `transitive.deps` and points at its
+/// `transitive` option, never at a `deps` the declarer does not have.
+#[tokio::test]
+async fn missing_transitive_dep_names_transitive() {
+    let src = format!(
+        "# y\n{}\n{}\n",
+        t("y", r#"transitive = {"deps": ["//d:missing"]}"#),
+        t("z", r#"deps = [":y"]"#),
+    );
+    let ws = Workspace::new();
+    ws.write_build_file("c", &src);
+    ws.write_build_file("d", D_PRESENT);
+    let rs = ws.engine.new_state_with_events(false, None);
+    let failures = fail_in(&ws, &rs, &["//c:z"]).await;
+    let f = failures
+        .iter()
+        .find(|f| f.culprit().to_string() == "//c:y")
+        .unwrap_or_else(|| {
+            panic!(
+                "//c:y is blamed: {:?}",
+                failures.iter().map(|f| text(f)).collect::<Vec<_>>()
+            )
+        });
+    let msg = text(f);
+    assert!(msg.contains("(`transitive.deps`, declared at"), "{msg}");
+    assert!(!msg.contains("`deps`"), "{msg}");
+    assert_eq!(triple(loc(f)), at("c/BUILD", &src, "transitive"), "{msg}");
+}
+
 #[tokio::test]
 async fn bad_deps_string_carries_location() {
     let (ws, src) = ws_with(r#"deps = ["::not an addr"]"#);
@@ -311,8 +341,9 @@ async fn a_matrix_cell_in_an_unchanged_file_is_not_called_changed() {
     );
 }
 
-/// Three failures in one file, each located at its own option: the
-/// provider is asked for the file's index once.
+/// Three failures in one file and two in another, each located at its own
+/// option: the provider is asked for each file's index once, and a second
+/// file is a second load, not a hit on the first one's.
 #[tokio::test]
 async fn one_reparse_per_file_per_report() {
     let src = format!(
@@ -321,21 +352,35 @@ async fn one_reparse_per_file_per_report() {
         t("b", "bogus = 1"),
         t("c", r#"tools = ["//d:missing"]"#),
     );
+    let other = format!(
+        "{}\n{}\n",
+        t("a", "bogus = 1"),
+        t("b", r#"deps = ["//d:missing"]"#),
+    );
     let ws = Workspace::new();
     ws.write_build_file("c", &src);
+    ws.write_build_file("e", &other);
     ws.write_build_file("d", D_PRESENT);
     let rs = ws.engine.new_state_with_events(false, None);
-    let mut failures = fail_in(&ws, &rs, &["//c:a", "//c:b", "//c:c"]).await;
+    let mut failures = fail_in(&ws, &rs, &["//c:a", "//c:b", "//c:c", "//e:a", "//e:b"]).await;
     failures.sort_by_key(|f| f.culprit().to_string());
     let got: Vec<_> = failures.iter().map(|f| triple(loc(f))).collect();
-    let lines: Vec<&str> = src.lines().collect();
-    let want: Vec<_> = [("deps", 0), ("bogus", 1), ("tools", 2)]
-        .iter()
-        .map(|(needle, i)| {
-            let (file, _, col) = at("c/BUILD", lines[*i], needle);
-            (file, u32::try_from(i + 1).unwrap_or_default(), col)
-        })
-        .collect();
+    let want_in = |file: &str, src: &str, needles: &[(&str, usize)]| {
+        let lines: Vec<&str> = src.lines().collect();
+        needles
+            .iter()
+            .map(|(needle, i)| {
+                let (file, _, col) = at(file, lines[*i], needle);
+                (file, u32::try_from(i + 1).unwrap_or_default(), col)
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut want = want_in("c/BUILD", &src, &[("deps", 0), ("bogus", 1), ("tools", 2)]);
+    want.extend(want_in("e/BUILD", &other, &[("bogus", 0), ("deps", 1)]));
     assert_eq!(got, want);
-    assert_eq!(rs.source_index_loads(), 1, "one parse of c/BUILD");
+    assert_eq!(
+        rs.source_index_loads(),
+        2,
+        "one parse of c/BUILD, one of e/BUILD"
+    );
 }

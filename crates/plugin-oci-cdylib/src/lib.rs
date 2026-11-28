@@ -21,7 +21,7 @@
 use hplugin_oci::pluginoci;
 use plugin_sdk::stabby::abi::{DynFunctionRegistry, NamedRunner, PluginComponents};
 use plugin_sdk::stabby::{
-    create_config_from_bytes, make_dyn_provider, make_dyn_runner, named_managed_driver,
+    create_config_from_bytes, make_dyn_provider, make_dyn_runner, named_boxed_managed_driver,
 };
 use std::sync::Arc;
 
@@ -70,32 +70,8 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
 
     // Each driver is exported under the local name its `config()` reports.
     let mut drivers = stabby::vec::Vec::new();
-    for driver in [
-        // Assembles target outputs into an image. No daemon, no execution.
-        named_managed_driver(pluginoci::image::Driver::new())?,
-        named_managed_driver(pluginoci::layer::Driver::new())?,
-        // Groups per-platform images into one multi-platform image.
-        named_managed_driver(pluginoci::index::Driver::new())?,
-        // Builds a Dockerfile + context into a cacheable image archive.
-        named_managed_driver(pluginoci::docker_build::Driver::new())?,
-        // Pulls a base image into a cacheable archive (or OCI layout).
-        named_managed_driver(pluginoci::pull::Driver::new())?,
-        // Actions — uncached, they mutate a registry or the local daemon.
-        named_managed_driver(pluginoci::push::Driver::new())?,
-        named_managed_driver(pluginoci::load::Driver::new())?,
-        named_managed_driver(pluginoci::tag::Driver::new())?,
-        // A check on a registry's current state, so uncached as well.
-        named_managed_driver(pluginoci::exists::Driver::new())?,
-        // Asks buildx which platform it would build by default. Depended on,
-        // never named by a user.
-        named_managed_driver(pluginoci::platform::Driver::new())?,
-        // Describes a container other targets run inside. Emits a `runner.json`
-        // naming the builtin `session` runner: the container is held open for
-        // the build and targets run in it over the agent protocol, so this
-        // plugin needs no runner implementation of its own.
-        named_managed_driver(pluginoci::runner::Driver::from_host_home(home))?,
-    ] {
-        drivers.push(driver);
+    for driver in pluginoci::managed_drivers(home) {
+        drivers.push(named_boxed_managed_driver(driver)?);
     }
 
     let provider: Arc<dyn hplugin::provider::Provider> =

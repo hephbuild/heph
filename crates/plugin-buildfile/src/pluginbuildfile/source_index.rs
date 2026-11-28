@@ -291,4 +291,43 @@ target(
             );
         }
     }
+
+    /// Columns count chars, not bytes: a multibyte char or a tab is one
+    /// column, both before an option and before the call itself (the key
+    /// the call is looked up by). CRLF line ends move nothing.
+    #[test]
+    fn columns_count_chars() {
+        let start = |l: Located| {
+            let s = field(l);
+            (s.start_line, s.start_col, s.end_line, s.end_col)
+        };
+        // `é` is two bytes: `driver` is at char 20, byte 21.
+        let multibyte = "target(name = \"é\", driver = \"bash\")\n";
+        assert_eq!(
+            start(located(multibyte, (1, 1), "é", "driver")),
+            (1, 20, 1, 35)
+        );
+        // The call itself starts at char 10, byte 11.
+        let before_call = "X = \"é\"; target(name = \"t\", driver = \"bash\")\n";
+        assert_eq!(
+            start(located(before_call, (1, 10), "t", "driver")).1,
+            29,
+            "found by its char column"
+        );
+        assert_eq!(
+            located(before_call, (1, 11), "t", "driver"),
+            Located::Changed,
+            "a byte column names no call"
+        );
+        // Starlark refuses a tab outside a string, so the one tab a file
+        // that evaluated can hold before an option is inside one.
+        let tab = "target(name = \"\t\", driver = \"bash\")\n";
+        assert_eq!(start(located(tab, (1, 1), "\t", "driver")).1, 20);
+        let crlf = SRC.replace('\n', "\r\n");
+        assert_eq!(
+            start(located(&crlf, (2, 1), "b", "deps")),
+            (4, 5, 4, 19),
+            "as with LF ends"
+        );
+    }
 }

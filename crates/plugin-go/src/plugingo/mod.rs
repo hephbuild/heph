@@ -48,3 +48,31 @@ pub use provider::{Config, Provider};
 pub use toolchain::{DEFAULT_GO_VERSION, GoToolchainDriver, HOST, checksum_key};
 
 pub mod runner;
+
+/// Every driver the go plugin exports, each under the local name its
+/// `config()` reports. `runner` is the environment every Go *tool* runs in
+/// ([`runner::read_runner_option`]); it is not the generated test targets'.
+/// The cdylib exports exactly this list, and in-process tests that stand the
+/// plugin up take it from here rather than from a copy.
+pub fn managed_drivers(
+    runner: Option<String>,
+) -> Vec<Box<dyn hdriver_support::driver_managed::ManagedDriver>> {
+    vec![
+        Box::new(GoGolistDriver::new().with_default_runner(runner.clone())),
+        // Hermetic Go toolchain: downloads + extracts the pinned SDK that
+        // backs every Go build/list/test target.
+        Box::new(GoToolchainDriver),
+        Box::new(GoCompileDriver::new().with_default_runner(runner.clone())),
+        Box::new(GoDownloadDriver::new().with_default_runner(runner.clone())),
+        Box::new(GoTestmainDriver),
+        // Per-package go/analysis (vet) with serialized facts, nogo-style.
+        Box::new(GoLintDriver::new().with_default_runner(runner.clone())),
+        // Gate: fails the build when a package's lint report has findings.
+        Box::new(GoLintGateDriver::new()),
+        // Fix: applies the report's suggested fixes back into source (codegen).
+        Box::new(GoLintFixDriver::new()),
+        // Formatters (gofmt/gofumpt/goimports) via heph-govet's -format mode.
+        Box::new(GoFormatDriver::fix().with_default_runner(runner.clone())),
+        Box::new(GoFormatDriver::check().with_default_runner(runner)),
+    ]
+}

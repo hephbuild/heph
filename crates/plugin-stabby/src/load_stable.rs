@@ -1908,7 +1908,10 @@ mod tests {
         };
         let first = at(3);
         let wire = first.target_spec.as_option().expect("target_spec");
-        assert!(!wire.source.is_set(), "source left out of the parse request");
+        assert!(
+            !wire.source.is_set(),
+            "source left out of the parse request"
+        );
         assert_eq!(wire.driver.as_deref(), Some("exec"));
         assert_eq!(first.driver.as_deref(), Some("exec"));
         assert_eq!(

@@ -40,6 +40,41 @@ pub mod registry;
 pub mod runner;
 pub mod tag;
 
+/// Every driver the oci plugin exports, each under the local name its
+/// `config()` reports. `home` is the host's heph home, or why it is not
+/// usable ([`runner::home_from_host`]). The cdylib exports exactly this list,
+/// and in-process tests that stand the plugin up take it from here rather
+/// than from a copy.
+pub fn managed_drivers(
+    home: Result<PathBuf, String>,
+) -> Vec<Box<dyn hdriver_support::driver_managed::ManagedDriver>> {
+    vec![
+        // Assembles target outputs into an image. No daemon, no execution.
+        Box::new(image::Driver::new()),
+        Box::new(layer::Driver::new()),
+        // Groups per-platform images into one multi-platform image.
+        Box::new(index::Driver::new()),
+        // Builds a Dockerfile + context into a cacheable image archive.
+        Box::new(docker_build::Driver::new()),
+        // Pulls a base image into a cacheable archive (or OCI layout).
+        Box::new(pull::Driver::new()),
+        // Actions — uncached, they mutate a registry or the local daemon.
+        Box::new(push::Driver::new()),
+        Box::new(load::Driver::new()),
+        Box::new(tag::Driver::new()),
+        // A check on a registry's current state, so uncached as well.
+        Box::new(exists::Driver::new()),
+        // Asks buildx which platform it would build by default. Depended on,
+        // never named by a user.
+        Box::new(platform::Driver::new()),
+        // Describes a container other targets run inside. Emits a
+        // `runner.json` naming the builtin `session` runner: the container is
+        // held open for the build and targets run in it over the agent
+        // protocol, so this plugin needs no runner implementation of its own.
+        Box::new(runner::Driver::from_host_home(home)),
+    ]
+}
+
 /// Refuse, at parse, a `${…}` in a registry reference that nothing would
 /// substitute, for a driver whose `ref` takes only `${read://…}`.
 ///

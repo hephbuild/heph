@@ -339,6 +339,23 @@ pub fn named_managed_driver<D: ManagedDriver + 'static>(
     })
 }
 
+/// [`named_managed_driver`] for a driver already boxed, as a plugin's shared
+/// driver list hands them out (one list for its cdylib and its in-process
+/// tests).
+pub fn named_boxed_managed_driver(
+    driver: Box<dyn ManagedDriver>,
+) -> Result<hplugin_stabby::abi::NamedDriver> {
+    let driver: Arc<dyn ManagedDriver> = Arc::from(driver);
+    let name = driver
+        .config(DriverConfigRequest {})
+        .context("config of a boxed driver")?
+        .name;
+    Ok(hplugin_stabby::abi::NamedDriver {
+        name: name.as_str().into(),
+        driver: make_dyn_managed_driver(driver),
+    })
+}
+
 /// In-flight calls keyed by `request_id`, so [`StableCancel::cancel`] can trip the
 /// token a running call handed the provider/driver. A cancel that races ahead of
 /// its call (arrives before the call registers) is parked in `precancelled` and

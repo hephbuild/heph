@@ -9,14 +9,10 @@
 //! Plugin-specific settings are read from the environment; only the workspace
 //! root crosses in [`plugin_sdk::stabby::CreateConfig`].
 
-use hdriver_support::driver_managed::ManagedDriver;
-use hplugin_go::plugingo::{
-    GoCompileDriver, GoDownloadDriver, GoFormatDriver, GoGolistDriver, GoLintDriver,
-    GoLintFixDriver, GoLintGateDriver, GoTestmainDriver, GoToolchainDriver, Provider,
-};
-use plugin_sdk::stabby::abi::{DynFunctionRegistry, NamedDriver, PluginComponents};
+use hplugin_go::plugingo::{self, Provider};
+use plugin_sdk::stabby::abi::{DynFunctionRegistry, PluginComponents};
 use plugin_sdk::stabby::{
-    create_config_from_bytes, make_dyn_managed_driver, make_dyn_provider, make_plugin_functions,
+    create_config_from_bytes, make_dyn_provider, make_plugin_functions, named_boxed_managed_driver,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -96,68 +92,9 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
     // mounts it. So there is no writable root to hand in here — which is the
     // point, since the plugin also stops owning the eviction, the locking and
     // the visibility it never had.
-    let golist: Arc<dyn ManagedDriver> =
-        Arc::new(GoGolistDriver::new().with_default_runner(go_runner.clone()));
-    drivers.push(NamedDriver {
-        name: "golist".into(),
-        driver: make_dyn_managed_driver(golist),
-    });
-    // Hermetic Go toolchain: downloads + extracts the pinned SDK that backs
-    // every Go build/list/test target.
-    let toolchain: Arc<dyn ManagedDriver> = Arc::new(GoToolchainDriver);
-    drivers.push(NamedDriver {
-        name: "toolchain".into(),
-        driver: make_dyn_managed_driver(toolchain),
-    });
-    let compile: Arc<dyn ManagedDriver> =
-        Arc::new(GoCompileDriver::new().with_default_runner(go_runner.clone()));
-    drivers.push(NamedDriver {
-        name: "compile".into(),
-        driver: make_dyn_managed_driver(compile),
-    });
-    let download: Arc<dyn ManagedDriver> =
-        Arc::new(GoDownloadDriver::new().with_default_runner(go_runner.clone()));
-    drivers.push(NamedDriver {
-        name: "download".into(),
-        driver: make_dyn_managed_driver(download),
-    });
-    let testmain: Arc<dyn ManagedDriver> = Arc::new(GoTestmainDriver);
-    drivers.push(NamedDriver {
-        name: "testmain".into(),
-        driver: make_dyn_managed_driver(testmain),
-    });
-    // Per-package go/analysis (vet) with serialized facts, nogo-style.
-    let lint: Arc<dyn ManagedDriver> =
-        Arc::new(GoLintDriver::new().with_default_runner(go_runner.clone()));
-    drivers.push(NamedDriver {
-        name: "lint".into(),
-        driver: make_dyn_managed_driver(lint),
-    });
-    // Gate: fails the build when a package's lint report has findings.
-    let lint_gate: Arc<dyn ManagedDriver> = Arc::new(GoLintGateDriver::new());
-    drivers.push(NamedDriver {
-        name: "lint_gate".into(),
-        driver: make_dyn_managed_driver(lint_gate),
-    });
-    // Fix: applies the report's suggested fixes back into source (codegen).
-    let lint_fix: Arc<dyn ManagedDriver> = Arc::new(GoLintFixDriver::new());
-    drivers.push(NamedDriver {
-        name: "lint_fix".into(),
-        driver: make_dyn_managed_driver(lint_fix),
-    });
-    // Formatters (gofmt/gofumpt/goimports) via heph-govet's -format mode.
-    let format: Arc<dyn ManagedDriver> =
-        Arc::new(GoFormatDriver::fix().with_default_runner(go_runner.clone()));
-    drivers.push(NamedDriver {
-        name: "format".into(),
-        driver: make_dyn_managed_driver(format),
-    });
-    let format_check: Arc<dyn ManagedDriver> =
-        Arc::new(GoFormatDriver::check().with_default_runner(go_runner));
-    drivers.push(NamedDriver {
-        name: "format_check".into(),
-        driver: make_dyn_managed_driver(format_check),
-    });
+    for driver in plugingo::managed_drivers(go_runner) {
+        drivers.push(named_boxed_managed_driver(driver)?);
+    }
 
     Ok(PluginComponents {
         provider: stabby::option::Option::Some(make_dyn_provider(provider)),
