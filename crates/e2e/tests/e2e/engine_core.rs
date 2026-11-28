@@ -335,10 +335,17 @@ async fn a_live_request_holds_no_lock_on_results_it_no_longer_uses() -> anyhow::
     Ok(())
 }
 
-/// Whether `e`'s chain names a revision that changed under a lapsed read.
-fn is_revision_changed(e: &anyhow::Error) -> bool {
-    e.chain()
-        .any(|c| c.is::<heph::engine::error::RevisionChangedError>())
+/// Whether `e` is a revision that changed under a lapsed read: on its chain,
+/// or as the typed fact of the failure the request recorded (whose chain is
+/// not kept), and said once, without the address repeated.
+fn is_revision_changed(e: &anyhow::Error, addr: &heph::htaddr::Addr) -> bool {
+    let typed = e.chain().any(|c| {
+        c.is::<heph::engine::error::RevisionChangedError>()
+            || c.downcast_ref::<heph::engine::error::TargetFailure>()
+                .is_some_and(|tf| tf.revision_changed.is_some())
+    });
+    let addr = addr.format();
+    typed && !format!("{e:#}").contains(&format!("{addr}: {addr}:"))
 }
 
 /// Resolve `addr`'s outputs in `rs`, as a request coming back to a target it
@@ -398,7 +405,7 @@ async fn a_revision_cleaned_while_unused_is_not_served_from_the_request() -> any
         ),
         Err(e) => e,
     };
-    assert!(is_revision_changed(&err), "got: {err:#}");
+    assert!(is_revision_changed(&err, &addr), "got: {err:#}");
     Ok(())
 }
 
@@ -466,7 +473,7 @@ async fn a_revision_rebuilt_differently_while_unused_is_not_served() -> anyhow::
         ),
         Err(e) => e,
     };
-    assert!(is_revision_changed(&err), "got: {err:#}");
+    assert!(is_revision_changed(&err, &addr), "got: {err:#}");
     Ok(())
 }
 

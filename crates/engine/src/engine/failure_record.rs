@@ -23,7 +23,7 @@ use hmodel::htaddr::Addr;
 use hplugin::diagnostic::{Diagnostic, Stage, StageFrame, cause_frames, find_diagnostic};
 use hplugin::error::{
     Culprit, FailureLog, FrozenCheckError, MissingDep, ProcessFailed, RemoteProcessFailed,
-    TargetFailure,
+    RevisionChangedError, TargetFailure,
 };
 use std::fmt;
 use std::sync::Arc;
@@ -180,7 +180,7 @@ pub(crate) fn compact(
                     Culprit::Target(_) => Stage::Run,
                 })
             };
-            Diagnostic::new(stage, own_message(e, &mut causes, end.as_deref()))
+            Diagnostic::new(stage, own_message(e, culprit, &mut causes, end.as_deref()))
         }
     };
     if let Some(stage) = stage_override {
@@ -316,7 +316,15 @@ pub(crate) fn exec_failure(addr: &Addr, e: &anyhow::Error, scrub: &Scrub) -> Opt
 /// the engine's timeout) is said as `end`, once, and every other frame is
 /// kept: what a driver or a wrapper said about the failure (a write-back
 /// refused, the remedy a driver layers over the exit) stays beside it.
-fn own_message(e: &anyhow::Error, causes: &mut Vec<String>, end: Option<&str>) -> String {
+///
+/// A frame that names `culprit` as its own subject, typed ([`RevisionChangedError`]),
+/// is said without it: the record names the culprit already.
+fn own_message(
+    e: &anyhow::Error,
+    culprit: &Culprit,
+    causes: &mut Vec<String>,
+    end: Option<&str>,
+) -> String {
     let frames: Vec<(String, bool)> = hcore::hmemoizer::frames(e)
         .into_iter()
         .filter(|f| !hplugin::diagnostic::is_internal_frame(f))
@@ -328,6 +336,10 @@ fn own_message(e: &anyhow::Error, causes: &mut Vec<String>, end: Option<&str>) -
             let text = if let Some(multi) = f.downcast_ref::<MultiError>() {
                 causes.extend(multi.0.iter().map(|m| cause_frames(m).join(": ")));
                 format!("{} errors", multi.0.len())
+            } else if let Some(changed) = f.downcast_ref::<RevisionChangedError>()
+                && culprit.target() == Some(&changed.addr)
+            {
+                changed.what()
             } else {
                 f.error().to_string()
             };
@@ -746,6 +758,19 @@ mod tests {
         );
         assert!(!rec.message_is_status(), "{rec:?}");
         assert_eq!(rec.exit.and_then(|x| x.code), Some(1));
+
+        // A revision of the culprit's own that changed is said without its
+        // address, which the record names already; another target's keeps it.
+        let changed = |of: &str| {
+            anyhow::Error::new(RevisionChangedError {
+                addr: addr(of),
+                hashin: "abc".into(),
+            })
+        };
+        let own = of(&changed("//p:t")).diagnostic.message;
+        assert!(own.starts_with("its cached output (revision abc)"), "{own}");
+        let other = of(&changed("//q:u")).diagnostic.message;
+        assert!(other.starts_with("//q:u: its cached output"), "{other}");
 
         // A timeout's own frame is reworded the same way; its context stays.
         let timeout = anyhow::Error::new(crate::engine::run_timeout::TimedOutError {

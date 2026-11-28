@@ -88,15 +88,21 @@ pub struct RevisionChangedError {
     pub hashin: String,
 }
 
-impl fmt::Display for RevisionChangedError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{}: its cached output (revision {}) changed or was removed by another heph \
-             process while this build was using it; re-run",
-            self.addr.format(),
+impl RevisionChangedError {
+    /// What happened, without the address: the message of a failure whose
+    /// record already names [`addr`](Self::addr).
+    pub fn what(&self) -> String {
+        format!(
+            "its cached output (revision {}) changed or was removed by another heph process \
+             while this build was using it; re-run",
             self.hashin
         )
+    }
+}
+
+impl fmt::Display for RevisionChangedError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.addr.format(), self.what())
     }
 }
 
@@ -885,6 +891,11 @@ pub struct TargetFailure {
     /// [`TargetFailure::new`] and never set says only which target failed,
     /// so no unscrubbed text can reach it.
     pub record: std::sync::Arc<FailureRecord>,
+    /// The failure was a revision this request resolved changing under it
+    /// ([`RevisionChangedError`]): a re-run resolves afresh. Kept typed
+    /// because the chain it was read from is not (D7b); it holds an address
+    /// and a hash, no text a scrub would have to see.
+    pub revision_changed: Option<RevisionChangedError>,
     /// [`record`](Self::record) was set by [`with_record`](Self::with_record):
     /// the failure's own compacted record, not the placeholder `new` makes.
     compacted: bool,
@@ -992,8 +1003,16 @@ impl TargetFailure {
             log_readable: None,
             streamed: false,
             record: std::sync::Arc::new(record),
+            revision_changed: None,
             compacted: false,
         }
+    }
+
+    /// The same failure, saying whether it was a revision changing under
+    /// the request.
+    pub fn with_revision_changed(mut self, changed: Option<RevisionChangedError>) -> Self {
+        self.revision_changed = changed;
+        self
     }
 
     /// The same failure with its compacted record.
