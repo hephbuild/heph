@@ -979,7 +979,9 @@ async fn d1b_attribution_output_group() -> anyhow::Result<()> {
 // ---------------------------------------------------------------------------
 
 /// D1.c: a `CycleError` under an `InputDefFailed` is still a cycle,
-/// propagated as itself, never recorded as a target's failure.
+/// propagated through the cycle's frames as itself: no target in it is
+/// blamed for an input's def. It is reported once (D8, GRAPH-07), as the
+/// requested target's own failure.
 #[tokio::test]
 async fn cycle_under_input_def_is_a_cycle_not_a_failure() -> anyhow::Result<()> {
     let ws = build_ws(&[
@@ -988,12 +990,15 @@ async fn cycle_under_input_def_is_a_cycle_not_a_failure() -> anyhow::Result<()> 
         ("c", &t("y", r#"deps = ["//b:x"]"#)),
     ]);
     let r = run(&ws.engine, "//a:root").await;
-    let err = r.err.as_ref().expect("failed");
+    let [f] = r.failures.as_slice() else {
+        panic!("one record:\n{}", r.describe());
+    };
+    assert_eq!(f.culprit().to_string(), "//a:root", "{}", r.describe());
     assert!(
-        downcast_chain_ref::<CycleError>(err).is_some(),
-        "a cycle: {err:#}"
+        downcast_chain_ref::<CycleError>(&f.source).is_some(),
+        "a cycle: {:#}",
+        f.source
     );
-    assert!(r.failures.is_empty(), "nothing recorded:\n{}", r.describe());
     Ok(())
 }
 

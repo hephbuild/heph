@@ -1095,3 +1095,55 @@ async fn long_chain_elided_in_text_full_in_json() {
     );
     assert!(!run.boxes.contains("//a:n250"), "elided: {}", run.boxes);
 }
+
+/// GRAPH-07: a target that depends on itself is a failure, never a green
+/// run. Its end carries the cycle as its own error (not a stop, not
+/// collateral), the TUI's fold counts it as one root, and the text run
+/// prints one box for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn self_cycle_counts_as_failed() {
+    let root = tempfile::tempdir().expect("root tempdir");
+    write_pkg(root.path(), "c", &bash("me", r#", deps = [":me"]"#));
+    let engine = build_engine_with_remote(root.path(), None);
+
+    let run = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        run_json(&engine, &addr("//c:me"), &["--json"], None),
+    )
+    .await
+    .expect("a self-cycle is detected, not a hang");
+    assert!(run.res.is_err(), "a cycle fails the run");
+    let ends: Vec<_> = run
+        .events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            BuildEventKind::ResultEnd {
+                addr,
+                error,
+                cancelled,
+                upstream_of,
+                duplicate,
+                ..
+            } if addr == "//c:me" => {
+                Some((error.is_some(), *cancelled, upstream_of.clone(), *duplicate))
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        ends.contains(&(true, false, None, false)),
+        "an own failure's end: {ends:?}"
+    );
+    let mut fold = heph::tui::progress::BuildState::new();
+    for ev in &run.events {
+        fold.apply(ev);
+    }
+    assert!(fold.unsuccessful(), "never drawn green");
+    assert_eq!(
+        fold.failure_split(),
+        (1, 0),
+        "one root, nothing it took down"
+    );
+    assert_eq!(run.box_count(), 1, "{}", run.boxes);
+    assert!(run.boxes.contains("//c:me"), "{}", run.boxes);
+}
