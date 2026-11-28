@@ -217,10 +217,20 @@ pub(crate) struct RunStop {
 
 impl RunStop {
     /// Taken on the execute's own task, where its memo cell is visible.
-    pub(crate) fn new(request: &StdCancellationToken) -> Self {
+    ///
+    /// Async because taking the cell's token first moves the rest of the
+    /// execute off its caller's stack ([`abandoned_token`]): a run may hold
+    /// its thread (exec's output park on macOS), and reached inline on the
+    /// caller's stack it would hold the caller too, so the caller would never
+    /// hear a sibling fail, never abandon this execute, and the stop would
+    /// never come. Every await before the run can resolve on its first poll
+    /// (`lease.prepare()`'s job finishing before its handle is polled).
+    ///
+    /// [`abandoned_token`]: hcore::hmemoizer::abandoned_token
+    pub(crate) async fn new(request: &StdCancellationToken) -> Self {
         Self {
             request: request.clone(),
-            abandoned: hcore::hmemoizer::abandoned_token(),
+            abandoned: hcore::hmemoizer::abandoned_token().await,
         }
     }
 }
@@ -917,7 +927,7 @@ mod tests {
     #[tokio::test]
     async fn outside_a_memoized_body_the_stop_is_the_requests_token() {
         let request = StdCancellationToken::new();
-        let stop = RunStop::new(&request);
+        let stop = RunStop::new(&request).await;
         assert!(stop.abandoned.is_none());
         let held = stop.clone_arc();
         assert!(!stop.is_cancelled() && !stop_requested(&request));
@@ -941,7 +951,7 @@ mod tests {
         let caller = tokio::spawn(enclose::enclose!((request) async move {
             memo.once("k".to_string(), move || async move {
                 tokio::task::yield_now().await;
-                let stop = RunStop::new(&request);
+                let stop = RunStop::new(&request).await;
                 let _sent = tx.send(stop.clone_arc());
                 futures::future::pending::<()>().await;
                 Ok(())
@@ -976,7 +986,7 @@ mod tests {
         let caller = tokio::spawn(enclose::enclose!((request) async move {
             memo.once("k".to_string(), move || async move {
                 tokio::task::yield_now().await;
-                let stop = RunStop::new(&request);
+                let stop = RunStop::new(&request).await;
                 let _sent = started_tx.send(());
                 let start = std::time::Instant::now();
                 while !stop.is_cancelled() && start.elapsed() < Duration::from_secs(10) {
