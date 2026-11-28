@@ -36,13 +36,27 @@ pub const TAB_STOP: usize = 8;
 pub const ELLIPSIS: &str = "…";
 
 /// Whether `c` is a control character a terminal could act on: C0 (but tab
-/// and newline), DEL, or C1; or a bidi embedding, override or isolate,
-/// which would make the terminal draw the text after it reordered (U+202E
-/// shows `exe.txt` for `txt.exe`).
+/// and newline), DEL, or C1; or a Unicode format character that changes how
+/// the text around it is drawn without being seen itself (U26): a bidi
+/// embedding, override or isolate, which would make the terminal draw the
+/// text after it reordered (U+202E shows `exe.txt` for `txt.exe`), a
+/// direction mark (U+200E, U+200F, U+061C, as session replay escapes), the line and
+/// paragraph separators (U+2028, U+2029), and the zero-width no-break space
+/// (U+FEFF).
 fn is_control(c: char) -> bool {
     matches!(
         c,
-        '\0'..='\x08' | '\x0b'..='\x1f' | '\x7f'..='\u{9f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+        '\0'..='\x08'
+            | '\x0b'..='\x1f'
+            | '\x7f'..='\u{9f}'
+            | '\u{61c}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{feff}'
     )
 }
 
@@ -894,6 +908,66 @@ mod tests {
             if !tty {
                 assert!(!got.contains('\x1b'), "{name}: {got:?}");
             }
+        }
+    }
+
+    /// U26: every Unicode format character a log tail can carry to reorder or
+    /// hide text is shown escaped like a control byte, on a terminal or not:
+    /// alone, between ASCII, doubled, at either end of a line, as the first
+    /// character of a tail cut by lines, and next to a kept SGR. The
+    /// sanitizer strips the same set.
+    #[test]
+    fn log_tail_escapes_unicode_format_characters() {
+        let format_chars = [
+            '\u{61c}', '\u{200e}', '\u{200f}', '\u{2028}', '\u{2029}', '\u{202a}', '\u{202b}',
+            '\u{202c}', '\u{202d}', '\u{202e}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}',
+            '\u{feff}',
+        ];
+        for c in format_chars {
+            let e = format!("\\u{{{:x}}}", u32::from(c));
+            let cases: [(&str, String, String); 5] = [
+                ("alone", c.to_string(), e.clone()),
+                (
+                    "between ascii",
+                    format!("txt{c}exe.sh\n"),
+                    format!("txt{e}exe.sh\n"),
+                ),
+                ("doubled", format!("{c}{c}x"), format!("{e}{e}x")),
+                (
+                    "line ends",
+                    format!("{c}a\nb{c}\n"),
+                    format!("{e}a\nb{e}\n"),
+                ),
+                (
+                    "beside an sgr",
+                    format!("\x1b[31m{c}r"),
+                    format!("\x1b[31m{e}r{SGR_RESET}"),
+                ),
+            ];
+            for (name, input, want) in &cases {
+                for tty in [true, false] {
+                    let got = escape_log_tail(input, tty);
+                    if tty {
+                        assert_eq!(&got, want, "{c:?} {name}");
+                    }
+                    assert!(!got.contains(c), "{c:?} {name} tty {tty}: {got:?}");
+                    assert!(
+                        !has_control(&sanitize_log(got.as_bytes())),
+                        "{c:?} {name} tty {tty}"
+                    );
+                }
+            }
+            // A tail cut by lines, its first shown line opening with `c`.
+            let log = format!("earlier\n{c}first shown\nlast\n");
+            let rows = crate::tui::failure_rows::tail_rows("//p:t", &log, 1, false, true, 2);
+            assert_eq!(rows.first_line, 2, "{c:?}");
+            assert_eq!(
+                escape_log_tail(rows.shown, true),
+                format!("{e}first shown\nlast\n"),
+                "{c:?} at the tail's cut"
+            );
+            // The sanitizer drops it, as every other control.
+            assert_eq!(sanitize_log(format!("a{c}b").as_bytes()), "ab", "{c:?}");
         }
     }
 

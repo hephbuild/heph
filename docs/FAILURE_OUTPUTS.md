@@ -132,7 +132,13 @@ not exist — gets the failure box at the end instead, with the same rows:
   log: none kept
 ```
 
-A box also frames the log's tail, when there is one. Either way the last row
+A box also frames the log's tail, when there is one. Control bytes in the
+tail, and the Unicode format characters that reorder or hide text (bidi
+controls and marks, `U+2028`, `U+2029`, `U+FEFF`), are shown escaped
+(`\u{202e}`), never obeyed. A target whose output already reached the
+terminal gets `(output not shown here: N lines · heph log <addr>)` in place
+of its tail, unless heph cannot open its log; then the tail is shown.
+Either way the last row
 is the
 command that prints the log without naming where it lives, printed whenever
 heph can open a log for the target — on disk or not, a remote hit's log it

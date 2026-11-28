@@ -1133,6 +1133,8 @@ pub fn left_behind(
         // Counted when the slot is filled, and carried by its record.
         kept: Vec::new(),
         kept_more: 0,
+        // The slot's, which only the engine knows.
+        log_fill_id: None,
     }
 }
 

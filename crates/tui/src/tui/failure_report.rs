@@ -851,7 +851,8 @@ impl<'a> BoxWriter<'a> {
     }
 
     /// The log `log` names, or why it is not shown: replaced by a newer
-    /// failed run, cleared, or unreadable. A streamed log is the pointer.
+    /// failed run, cleared, or unreadable. A streamed log is the pointer, when
+    /// `heph log` can open it.
     fn log(&mut self, rec: &FailureRecord, log: &LogRef) {
         let addr = log_addr(rec);
         let readable = rec
@@ -882,8 +883,9 @@ impl<'a> BoxWriter<'a> {
                 return;
             }
         };
-        if rec.streamed {
-            // The user saw it: no line of it, only how long it is.
+        if rec.streamed && readable {
+            // The user saw it: no line of it, only how long it is. A log
+            // `heph log` cannot open gets its tail instead (U26).
             let total = match counted {
                 0 => failure_log::count_lines(&open.file)
                     .ok()

@@ -980,6 +980,12 @@ pub struct LeftBehindData {
     /// How many groups past `kept` were left out (`+N more`).
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub kept_more: u32,
+    /// The fill id of the slot `log_path` is in, as this failure filled it:
+    /// what a reader of an end with no record checks the slot against, so a
+    /// newer run's log is never read as this one's (U26). `None` from an
+    /// older host, and in a record, whose `log` carries its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_fill_id: Option<String>,
 }
 
 fn is_zero_u32(n: &u32) -> bool {

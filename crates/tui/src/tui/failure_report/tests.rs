@@ -742,6 +742,32 @@ fn log_rows_follow_the_slot() {
         "✗ //p:t\n  boom\n     ╭─[log · 10 lines]\n     │ … 8 earlier lines\n   9 │ i\n  \
          10 │ j\n     ╰────\n"
     );
+
+    // U26: a streamed target whose log `heph log` cannot open shows its
+    // tail, not a pointer with no command: the memory tail of a log kept
+    // nowhere, and a slot's log the engine says cannot be read.
+    let streamed_memory = with(
+        LogRef {
+            lines: 10,
+            memory_tail: Some("i\nj".into()),
+            ..LogRef::default()
+        },
+        true,
+    );
+    assert_eq!(draw(&streamed_memory), draw(&memory));
+    let mut streamed_unreadable = with(
+        slot(&ws.path().join("u"), Some("f1"), Some("f1"), "x\ny\n"),
+        true,
+    );
+    streamed_unreadable.left_behind = Some(LeftBehindData {
+        log_readable: Some(false),
+        ..LeftBehindData::default()
+    });
+    let drawn = draw(&streamed_unreadable);
+    assert!(
+        drawn.contains("  1 │ x\n  2 │ y\n") && !drawn.contains("output not shown here"),
+        "{drawn}"
+    );
 }
 
 /// A log line's controls are escaped, never sent; heph's home is redacted
