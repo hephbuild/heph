@@ -91,8 +91,11 @@ impl ErrorDetail {
             cancelled: hplugin::error::is_cancelled(e),
             kept: slot.is_some(),
             streamed: crate::engine::failure_slot::RunStreamed::on(e),
-            left_behind: slot.map(|s| {
-                hplugin::error::left_behind(
+            left_behind: slot.map(|s| hcore::events::LeftBehindData {
+                // So a reader of an end with no record reads this fill of
+                // the slot, never a newer run's (U26).
+                log_fill_id: s.fill_id.clone(),
+                ..hplugin::error::left_behind(
                     s.log.as_ref(),
                     s.sandbox.as_ref(),
                     s.out.as_deref(),

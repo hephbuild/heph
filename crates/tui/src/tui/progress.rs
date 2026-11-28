@@ -2784,18 +2784,22 @@ fn live_failure_block(
 
 /// The tail of the slot log an end with no record names, read once when its
 /// block prints ([`hcore::failure_log::read_tail`]): at most `lines` lines,
-/// none when the end names no log or the slot holds none now. The end names
-/// no fill, so a newer run's log reads as whatever the slot holds.
+/// none when the end names no log, the slot holds none now, or a newer run
+/// filled it since: the slot is read with the end's fill id (U26), so a
+/// newer run's log is never shown as this one's. An older host's end names
+/// no fill, and its slot reads as whatever it holds.
 fn slot_tail(
     left_behind: Option<&hcore::events::LeftBehindData>,
     lines: usize,
 ) -> Option<hcore::events::LogTailData> {
-    let path = left_behind?.log_path.clone()?;
+    let left = left_behind?;
+    let path = left.log_path.clone()?;
     if lines == 0 {
         return None;
     }
     let log = hcore::events::LogRef {
         path: Some(path),
+        fill_id: left.log_fill_id.clone(),
         ..Default::default()
     };
     let tail = hcore::failure_log::read_tail(&log, lines, hcore::failure_log::TAIL_MAX_BYTES)?;
@@ -5028,11 +5032,15 @@ mod tests {
             t.streamed = true;
             t.start_line = 96;
         }
-        // Without word that the log can be read, the pointer names no command.
+        // U26: without word that the log can be read there is no command to
+        // point at, so the tail is shown.
         assert_eq!(
             ci_live_log(3, std::slice::from_ref(&end)),
             "ERROR ✗ //a:b · exit status: 1\
-             \n  │ (output not shown here: 100 lines)\n",
+             \n  │ … 97 earlier lines\
+             \n  │ three\
+             \n  │ four\
+             \n  │ five\n",
         );
         if let BuildEventKind::ResultEnd { left_behind, .. } = &mut end {
             *left_behind = Some(Box::new(hcore::events::LeftBehindData {
@@ -5045,6 +5053,54 @@ mod tests {
             "ERROR ✗ //a:b · exit status: 1\
              \n  │ (output not shown here: 100 lines · heph log //a:b)\
              \n  log: heph log //a:b\n",
+        );
+    }
+
+    /// U26: an end with no record and no tail reads the slot it names with
+    /// the end's fill id, so a newer run's log in that slot is never shown as
+    /// this failure's; an older host's end names no fill and reads whatever
+    /// the slot holds.
+    #[test]
+    fn ci_view_no_record_fallback_reads_the_slot_with_the_ends_fill() {
+        let ws = tempfile::tempdir().expect("ws");
+        let slot = ws.path().join("a_b");
+        std::fs::create_dir_all(&slot).expect("slot dir");
+        let fill = |id: &str, log: &str| {
+            std::fs::write(
+                slot.join(hcore::failure_log::MANIFEST),
+                format!(r#"{{"version":1,"fill_id":"{id}"}}"#),
+            )
+            .expect("manifest");
+            std::fs::write(slot.join(hcore::failure_log::LOG), log).expect("log");
+        };
+        let end_of = |fill_id: Option<&str>| {
+            let mut end = failed_end("//a:b", None, false, None);
+            if let BuildEventKind::ResultEnd { left_behind, .. } = &mut end {
+                *left_behind = Some(Box::new(hcore::events::LeftBehindData {
+                    log_path: Some(slot.join(hcore::failure_log::LOG).display().to_string()),
+                    log_fill_id: fill_id.map(str::to_owned),
+                    ..Default::default()
+                }));
+            }
+            end
+        };
+
+        fill("f1", "this-runs-line\n");
+        let own = ci_live_log(3, &[end_of(Some("f1"))]);
+        assert!(own.contains("  │ this-runs-line\n"), "{own}");
+
+        fill("f2", "a-newer-runs-line\n");
+        let replaced = ci_live_log(3, &[end_of(Some("f1"))]);
+        assert!(
+            !replaced.contains("a-newer-runs-line"),
+            "a newer run's log was shown as this failure's\n{replaced}"
+        );
+        assert!(replaced.starts_with("ERROR ✗ //a:b"), "{replaced}");
+
+        let older_host = ci_live_log(3, &[end_of(None)]);
+        assert!(
+            older_host.contains("  │ a-newer-runs-line\n"),
+            "{older_host}"
         );
     }
 

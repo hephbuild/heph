@@ -229,11 +229,12 @@ pub fn log_line_count(text: &str, start_line: usize) -> usize {
 /// tail's own (no total is carried; the tail's start says the rest).
 /// - N = 0: `(no output)`, streamed or not.
 /// - `streamed` (its output reached a terminal while it ran, so the user saw
-///   it there): the pointer `(output not shown here: N lines · heph log //t)`
-///   and no line of the tail (U5). The command only when `readable` (`heph
-///   log` can open the log): a pointer must not name a command with nothing
-///   to show.
-/// - Otherwise the tail's last `max_lines` lines, after an
+///   it there) and `readable` (`heph log` can open the log): the pointer
+///   `(output not shown here: N lines · heph log //t)` and no line of the
+///   tail (U5).
+/// - Otherwise, a streamed tail whose log cannot be opened included (U26: a
+///   pointer with no command to follow would leave nothing to read), the
+///   tail's last `max_lines` lines, after an
 ///   `… N earlier lines` row when the log has lines before them. The row
 ///   names no command: the box's own `log:` / `full log:` row does, and
 ///   says when there is none.
@@ -264,16 +265,12 @@ pub fn tail_rows<'a>(
             first_line: first,
         };
     }
-    if streamed {
-        let note = if readable {
-            format!(
-                "(output not shown here: {} · heph log {})",
-                lines(total, "line"),
-                shell_quote(addr)
-            )
-        } else {
-            format!("(output not shown here: {})", lines(total, "line"))
-        };
+    if streamed && readable {
+        let note = format!(
+            "(output not shown here: {} · heph log {})",
+            lines(total, "line"),
+            shell_quote(addr)
+        );
         return TailRows {
             note: Some(note),
             shown: "",
@@ -491,13 +488,13 @@ mod tests {
         let rows =
             |text, start, streamed, max| tail_rows("//p:t", text, start, streamed, true, max);
 
-        assert_eq!(
-            tail_rows("//p:t", "a\nb\n", 999, true, false, 1000)
-                .note
-                .as_deref(),
-            Some("(output not shown here: 1,000 lines)"),
-            "no log to read: the pointer names no command"
-        );
+        // U26: no log to read, so no pointer: the streamed tail is shown.
+        let r = tail_rows("//p:t", "a\nb\n", 999, true, false, 1000);
+        assert_eq!(r.note.as_deref(), Some("… 998 earlier lines"));
+        assert_eq!((r.shown, r.first_line), ("a\nb\n", 999));
+        let r = tail_rows("//p:t", "a\nb\nc\n", 1, true, false, 2);
+        assert_eq!(r.note.as_deref(), Some("… 1 earlier line"));
+        assert_eq!(r.shown, "b\nc\n", "the streamed tail, cut to max_lines");
         let r = tail_rows("//p:t", "a\nb\n", 41, false, false, 1000);
         assert_eq!(r.note.as_deref(), Some("… 40 earlier lines"));
         assert_eq!(r.shown, "a\nb\n", "an unreadable log's tail is still shown");
