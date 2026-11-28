@@ -68,21 +68,47 @@ fn render_failures<'a>(
 /// The stage is said in words (`could not be loaded`), not by its key
 /// (`spec`): the key is the machine contract and travels on the
 /// `SelectionIncomplete` event.
+///
+/// A provider whose package listing failed is its own sentence (STAGE-05),
+/// `provider go could not list packages: <cause>`, and is not counted in the
+/// header: it lost every package of that provider, not one scope the walk
+/// skipped. With nothing else skipped the header has no count.
 fn render_incomplete(
     report: &crate::engine::discovery::GapReport,
     after_failures: bool,
     color: bool,
 ) -> String {
+    use crate::engine::discovery::Stage;
     let bang = if color {
         format!("{}", "!".yellow())
     } else {
         "!".to_string()
     };
-    let mut out = format!(
-        "{bang} selection incomplete: {} skipped while matching `{}`\n",
-        report.skipped, report.selector
-    );
+    let mut out = format!("{bang} {}\n", incomplete_headline(report));
     for group in &report.groups {
+        if group.stage == Stage::Packages {
+            let who = if group.provider.is_empty() {
+                "a provider".to_owned()
+            } else {
+                format!("provider {}", group.provider)
+            };
+            for example in &group.examples {
+                let under = if example.scope == "all packages" {
+                    String::new()
+                } else {
+                    format!(" under {}", example.scope)
+                };
+                out.push_str(&format!(
+                    "  {who} could not list packages{under}: {}\n",
+                    example.cause
+                ));
+            }
+            let more = group.count.saturating_sub(group.examples.len());
+            if more > 0 {
+                out.push_str(&format!("      ... {more} more\n"));
+            }
+            continue;
+        }
         let provider = if group.provider.is_empty() {
             String::new()
         } else {
@@ -127,6 +153,26 @@ fn render_incomplete(
          error.\n",
     );
     out
+}
+
+/// The block's first line, and [`IncompleteSelection`]'s text: `selection
+/// incomplete: 3 skipped while matching `//...``, the count leaving out
+/// failed package listings (STAGE-05), and gone when nothing else was
+/// skipped.
+fn incomplete_headline(report: &crate::engine::discovery::GapReport) -> String {
+    let listings: usize = report
+        .groups
+        .iter()
+        .filter(|g| g.stage == crate::engine::discovery::Stage::Packages)
+        .map(|g| g.count)
+        .sum();
+    match report.skipped.saturating_sub(listings) {
+        0 => format!("selection incomplete while matching `{}`", report.selector),
+        n => format!(
+            "selection incomplete: {n} skipped while matching `{}`",
+            report.selector
+        ),
+    }
 }
 
 /// What a keep-going walk skipped, read once at the end of a command. `None`
@@ -202,11 +248,7 @@ impl IncompleteSelection {
 
 impl std::fmt::Display for IncompleteSelection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "selection incomplete: {} skipped while matching `{}`",
-            self.report.skipped, self.report.selector
-        )
+        f.write_str(&incomplete_headline(&self.report))
     }
 }
 
@@ -1393,6 +1435,53 @@ mod tests {
              also have matched.\n\
              \x20 Fix the cause and re-run, or pass --fail-fast to stop at the first one with its \
              full error.\n"
+        );
+    }
+
+    /// STAGE-05: a failed package listing is a sentence of its own, named
+    /// for its provider, and the header counts only the other skips.
+    #[test]
+    fn package_listing_failure_is_its_own_sentence_and_not_counted() {
+        use crate::engine::discovery::Stage;
+        let gaps = crate::engine::Gaps::new("//...");
+        gaps.record(
+            Stage::Packages,
+            "go",
+            "all packages".to_string(),
+            &anyhow::anyhow!("go env: not found"),
+        );
+        gaps.record(
+            Stage::Packages,
+            "",
+            "//vendor".to_string(),
+            &anyhow::anyhow!("permission denied"),
+        );
+        let only_listings = gaps.report();
+        assert_eq!(
+            render_incomplete(&only_listings, false, false)
+                .lines()
+                .take(3)
+                .collect::<Vec<_>>(),
+            [
+                "! selection incomplete while matching `//...`",
+                "  a provider could not list packages under //vendor: permission denied",
+                "  provider go could not list packages: go env: not found",
+            ]
+        );
+        gaps.record(
+            Stage::Spec,
+            "go",
+            "//svc:t".to_string(),
+            &anyhow::anyhow!("go list: exit status 1"),
+        );
+        let err = IncompleteSelection {
+            report: gaps.report(),
+            cause: None,
+            rendered: false,
+        };
+        assert_eq!(
+            err.to_string(),
+            "selection incomplete: 1 skipped while matching `//...`"
         );
     }
 

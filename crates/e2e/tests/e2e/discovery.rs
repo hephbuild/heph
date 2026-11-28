@@ -323,3 +323,33 @@ async fn list_error_with_zero_matched_says_nothing_ran() -> anyhow::Result<()> {
     assert!(!block.contains("No target matched"), "{block}");
     Ok(())
 }
+
+/// STAGE-05: a provider whose package listing failed gets a sentence of its
+/// own, with its cause, and is not counted among the skips: with nothing
+/// else skipped, the header has no count.
+#[tokio::test]
+async fn list_packages_error_is_its_own_sentence() -> anyhow::Result<()> {
+    let ws = workspace_with(
+        vec![bash("//g:ok", "echo ok > $OUT", &[], &[])],
+        Faults {
+            fail_list_packages: true,
+            ..Default::default()
+        },
+    )?;
+    let (_, block) = run_incomplete(&ws, Matcher::PackagePrefix(PkgBuf::from("")), "//...").await?;
+    assert!(
+        block.starts_with("! selection incomplete while matching `//...`\n"),
+        "{block}"
+    );
+    assert!(
+        block.contains(
+            "\n  provider faulty could not list packages: walking the workspace: permission \
+             denied\n"
+        ),
+        "{block}"
+    );
+    for gone in ["1 skipped", "package listing", "all packages"] {
+        assert!(!block.contains(gone), "{gone:?}: {block}");
+    }
+    Ok(())
+}
