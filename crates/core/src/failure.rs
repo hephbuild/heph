@@ -271,7 +271,12 @@ pub struct LogRef {
     pub lines: u64,
     /// The scrubbed tail, for a target whose log may not be kept on disk (its
     /// outputs are credential material): within [`RECORD_CAP`], the end kept.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ///
+    /// In-process only, never serialized (E2): a record rides `ResultEnd`
+    /// and `FileFailed` into `events.ndjson`, the session store and hook
+    /// plugins, and a material run's tail must reach none of them. Nothing
+    /// on disk needs it: a material run's claim writes no `diagnostic.json`.
+    #[serde(skip)]
     pub memory_tail: Option<String>,
 }
 
@@ -353,6 +358,28 @@ mod tests {
         assert!(json.contains(r#""failed_in":"exec""#), "{json}");
         let back: FailureRecord = serde_json::from_str(&json).expect("decode");
         assert_eq!(back, full);
+    }
+
+    /// A credential-material run's in-memory tail never rides the wire: the
+    /// record on `ResultEnd`/`FileFailed` reaches `events.ndjson`, the
+    /// session store and hook plugins (E2, D7b). A wire copy that names one
+    /// decodes without it. In-process renderers read it off the record.
+    #[test]
+    fn memory_tail_never_serialized() {
+        let rec = FailureRecord {
+            log: Some(LogRef {
+                memory_tail: Some("MATERIAL-TAIL".into()),
+                ..LogRef::default()
+            }),
+            ..FailureRecord::new(Diagnostic::new(Stage::Run, "boom"))
+        };
+        let json = serde_json::to_string(&rec).expect("encode");
+        assert!(!json.contains("MATERIAL-TAIL"), "{json}");
+        assert!(!json.contains("memory_tail"), "{json}");
+        let back: LogRef =
+            serde_json::from_str(r#"{"lines":1,"memory_tail":"MATERIAL-TAIL"}"#).expect("decode");
+        assert_eq!(back.memory_tail, None);
+        assert_eq!(back.lines, 1);
     }
 
     /// A newer peer's hint kind is `Other`. A location that climbs out of the
