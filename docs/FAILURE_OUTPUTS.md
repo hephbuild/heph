@@ -104,14 +104,17 @@ unlinked. A plugin built before log streaming returns a log file instead: the
 engine imports it, scrubbed the same way, provided it is a regular file inside
 the run's sandbox, and the returned file wins over anything streamed.
 
-A non-interactive run (CI, a pipe) prints a root failure's block the moment
+A non-interactive run (CI, a pipe) prints a root failure's box the moment
 it fails, with the last `--log-lines` lines of its log, then where each part
-is:
+is. It is the failure record's box, the one the end of the run would draw,
+written to stderr as one write so no other line lands inside it:
 
 ```
-ERROR ✗ //web:e2e · exit status: 1
-  │ …
-  │ 3 failed, 41 passed
+✗ //web:e2e · exit status 1
+    ╭─[log · 43 lines]
+    │ … 42 earlier lines
+ 43 │ 3 failed, 41 passed
+    ╰────
   full log: /ws/.heph/failures/web_e2e-…/log.txt
   outputs: /ws/.heph/failures/web_e2e-…/out
   log: heph log //web:e2e
