@@ -592,6 +592,70 @@ target(name = "t", driver = "auth.credential", sources = ["//auth:fetch"],
     Ok(())
 }
 
+/// E2 / fq M4: a credential producer's failure keeps its log's tail in
+/// memory, never on disk, within the 8 KiB record cap — its end kept, whole
+/// lines — and the record says it was cut (`truncated`). I8's per-failure
+/// bound holds for it too.
+#[tokio::test]
+async fn credential_target_tail_from_memory() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    // 400 lines of 64 bytes: ~25 KiB, over the record cap, under the tail's.
+    ws.write_build_file(
+        "auth",
+        r#"
+target(name = "fetch", driver = "bash", out = {"credential": "cred.json"}, cache = False,
+       run = ["for ((i = 1; i <= 400; i++)); do printf 'producer-line-%04d-%045d\n' $i 0; done", "exit 4"])
+target(name = "t", driver = "auth.credential", sources = ["//auth:fetch"],
+       present = {"env": {"T": "${token}"}})
+"#,
+    );
+    ws.write_build_file(
+        "app",
+        r#"target(name = "a", driver = "bash", out = "o.txt", cache = False,
+       credentials = ["//auth:t"], run = ["printf '%s' \"$T\" > o.txt"])"#,
+    );
+    let f = failures(&ws.engine, "//app:a", &ResultOptions::default()).await?;
+    assert!(!slot_exists(&ws.engine, "//auth:fetch"), "no log on disk");
+    let tails: Vec<_> = f
+        .iter()
+        .filter_map(|f| {
+            let log = f.record.log.as_ref()?;
+            Some((f, log, log.memory_tail.as_deref()?))
+        })
+        .collect();
+    let [(failure, log, tail)] = tails.as_slice() else {
+        panic!(
+            "one record with an in-memory tail: {:#?}",
+            f.iter().map(|f| &f.record).collect::<Vec<_>>()
+        );
+    };
+    assert_eq!(log.path, None, "the tail is the only copy: {log:?}");
+    assert!(
+        tail.len() <= hcore::failure::RECORD_CAP,
+        "{} bytes, over the record cap",
+        tail.len()
+    );
+    assert!(
+        tail.ends_with(&format!("producer-line-0400-{:045}", 0)),
+        "the end is kept: {tail}"
+    );
+    assert!(
+        tail.starts_with("producer-line-"),
+        "whole lines: {}",
+        tail.get(..80).unwrap_or(tail)
+    );
+    assert!(!tail.contains("producer-line-0001-"), "the head is cut");
+    assert!(
+        failure.record.diagnostic.truncated,
+        "the record says it was cut"
+    );
+    assert!(failure.record.text_len() <= hcore::failure::RECORD_CAP);
+    // What a renderer reads is that tail, from memory.
+    let read = crate::common::failure_tail(failure).expect("the tail");
+    assert_eq!(read.text.lines().last(), tail.lines().last());
+    Ok(())
+}
+
 #[tokio::test]
 async fn dep_failure_shows_dep_log() -> anyhow::Result<()> {
     let ws = Workspace::new();

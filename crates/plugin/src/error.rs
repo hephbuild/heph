@@ -1167,6 +1167,8 @@ pub use hcore::failure_log::{
 pub struct FailureLog {
     path: Option<std::path::PathBuf>,
     memory: Option<LogTail>,
+    /// The in-memory tail was cut to fit the record cap.
+    memory_cut: bool,
     lines: usize,
 }
 
@@ -1176,15 +1178,18 @@ impl FailureLog {
         Self {
             path: Some(path),
             memory: None,
+            memory_cut: false,
             lines,
         }
     }
 
-    /// A tail with no file behind it.
-    pub fn in_memory(tail: LogTail) -> Self {
+    /// A tail with no file behind it; `cut` when it was cut to fit the
+    /// record cap, which the record then says (`truncated`, E2).
+    pub fn in_memory(tail: LogTail, cut: bool) -> Self {
         Self {
             path: None,
             memory: Some(tail),
+            memory_cut: cut,
             lines: 0,
         }
     }
@@ -1195,8 +1200,14 @@ impl FailureLog {
         Self {
             path: self.path.clone(),
             memory: None,
+            memory_cut: false,
             lines: self.lines,
         }
+    }
+
+    /// Whether the in-memory tail was cut to fit the record cap.
+    pub fn memory_cut(&self) -> bool {
+        self.memory_cut
     }
 
     /// Where the full log is, when there is one on disk.

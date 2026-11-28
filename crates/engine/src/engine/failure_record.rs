@@ -22,7 +22,7 @@ use hdriver_support::redact::{Needles, Redactor};
 use hmodel::htaddr::Addr;
 use hplugin::diagnostic::{Diagnostic, Stage, StageFrame, cause_frames, find_diagnostic};
 use hplugin::error::{
-    Culprit, FrozenCheckError, ProcessFailed, RemoteProcessFailed, TargetFailure,
+    Culprit, FailureLog, FrozenCheckError, ProcessFailed, RemoteProcessFailed, TargetFailure,
 };
 use std::fmt;
 use std::sync::Arc;
@@ -214,6 +214,11 @@ pub(crate) fn compact(
             lines: slot.log_lines,
             memory_tail: log.memory_tail().map(|t| t.text.clone()),
         });
+        // The slot already cut the in-memory tail to the record cap (E2):
+        // `bound` sees it within the cap, so the cut is said here.
+        if slot.log.as_ref().is_some_and(FailureLog::memory_cut) {
+            rec.diagnostic.truncated = true;
+        }
     }
 
     bound(scrubbed(rec, &clean))
