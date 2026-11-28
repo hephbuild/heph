@@ -1398,8 +1398,14 @@ impl FailureWriteBackRan {
         }
     }
 
-    /// `root` is the workspace root the fixes were written under.
-    fn report(&self, addr: &Addr, root: &std::path::Path) -> WriteBackOnFailure {
+    /// `root` is the workspace root the fixes were written under; `scrub`
+    /// is what the `warn` of a failed write is scrubbed of (P21).
+    fn report(
+        &self,
+        addr: &Addr,
+        root: &std::path::Path,
+        scrub: &crate::engine::failure_record::Scrub,
+    ) -> WriteBackOnFailure {
         use hplugin::error::{FailureFixes, FixesNotWritten};
         match self {
             Self::Written(written) => {
@@ -1422,7 +1428,7 @@ impl FailureWriteBackRan {
                 error: Some(format!("{e:#}")),
             },
             Self::Failed(e) => {
-                tracing::warn!(addr = %addr, error = %format!("{e:#}"), "in_place write-back on failure");
+                log_write_back_failed(addr, e, scrub);
                 WriteBackOnFailure {
                     fixes: None,
                     error: Some(format!("in_place fixes not written: {e:#}")),
@@ -1430,6 +1436,21 @@ impl FailureWriteBackRan {
             }
         }
     }
+}
+
+/// A failed run's write-back failed: the scrubbed line at `warn`, the raw
+/// chain at `debug` only (P21).
+fn log_write_back_failed(
+    addr: &Addr,
+    e: &anyhow::Error,
+    scrub: &crate::engine::failure_record::Scrub,
+) {
+    tracing::warn!(
+        addr = %addr,
+        error = %crate::engine::failure_record::log_line(e, scrub),
+        "in_place write-back on failure"
+    );
+    tracing::debug!(addr = %addr, error = %format!("{e:#}"), "in_place write-back on failure (raw)");
 }
 
 /// An `@heph/fs` input's per-path hashouts in the form a dependent's `hashin`
@@ -5721,7 +5742,7 @@ impl Engine {
             .await;
         if let Err(e) = entered {
             let e = unwrap_arc_err(e);
-            tracing::warn!(addr = %def.target.addr, error = %format!("{e:#}"), "in_place write-back on failure");
+            log_write_back_failed(&def.target.addr, &e, &rs.scrub_for(&[&def.target.addr]));
             return WriteBackOnFailure {
                 fixes: None,
                 error: Some(format!("in_place fixes not written: {e:#}")),
@@ -5730,7 +5751,11 @@ impl Engine {
         match ran.get() {
             // A passing frame of this addr already wrote the tree this request.
             None => WriteBackOnFailure::default(),
-            Some(ran) => ran.report(&def.target.addr, self.root()),
+            Some(ran) => ran.report(
+                &def.target.addr,
+                self.root(),
+                &rs.scrub_for(&[&def.target.addr]),
+            ),
         }
     }
 
@@ -14602,6 +14627,14 @@ mod tests {
     /// returned string. A `#[tokio::test]` runtime is current-thread, so every
     /// engine task is polled, and logs, on this thread.
     async fn capture_info_logs<F: std::future::Future>(fut: F) -> (F::Output, String) {
+        capture_logs(tracing_subscriber::filter::LevelFilter::INFO, fut).await
+    }
+
+    /// [`capture_info_logs`], at `level`.
+    async fn capture_logs<F: std::future::Future>(
+        level: tracing_subscriber::filter::LevelFilter,
+        fut: F,
+    ) -> (F::Output, String) {
         use tracing_subscriber::util::SubscriberInitExt as _;
 
         #[derive(Clone, Default)]
@@ -14629,7 +14662,7 @@ mod tests {
             let _guard = tracing_subscriber::fmt()
                 .with_writer(move || writer.clone())
                 .with_ansi(false)
-                .with_max_level(tracing_subscriber::filter::LevelFilter::INFO)
+                .with_max_level(level)
                 .set_default();
             fut.await
         };
@@ -18667,7 +18700,7 @@ mod tests {
             anyhow::Error::new(MovedSourceError("it changed while it ran".to_string()))
                 .context("guarding"),
         )
-        .report(&def.target.addr, root.path());
+        .report(&def.target.addr, root.path(), &Default::default());
         assert_eq!(
             moved.fixes,
             Some(hplugin::error::FailureFixes::NotWritten(
@@ -18679,6 +18712,61 @@ mod tests {
                 .error
                 .is_some_and(|e| e.contains("changed while it ran")),
             "the guard's own sentence"
+        );
+        Ok(())
+    }
+
+    /// I7 / P21: a failed write-back's `warn` line is the scrubbed one-line
+    /// message; the raw chain, secret included, is logged at `debug` only.
+    /// The secret is handed to the request as the target's scrub, as a
+    /// credential's value is, and planted in the write's error.
+    #[tokio::test]
+    async fn warn_log_of_failure_is_scrubbed() -> anyhow::Result<()> {
+        const SECRET: &str = "plantedS3cr3tT0kenValue";
+        let (root, engine, def, _err) = failed_in_place_run()?;
+        let rs = engine.new_state();
+        rs.add_scrub(&def.target.addr, [SECRET.to_string()]);
+        let failed = FailureWriteBackRan::Failed(
+            anyhow::anyhow!("the server answered: Authorization: Bearer {SECRET}")
+                .context("listing the inputs of //pkg:fix"),
+        );
+        let (got, log) = capture_logs(tracing_subscriber::filter::LevelFilter::DEBUG, async {
+            failed.report(
+                &def.target.addr,
+                root.path(),
+                &rs.scrub_for(&[&def.target.addr]),
+            )
+        })
+        .await;
+        assert!(got.error.is_some(), "the write-back failed: {got:?}");
+
+        let lines = |level: &str| -> Vec<&str> {
+            log.lines()
+                .filter(|l| l.contains(level) && l.contains("in_place write-back on failure"))
+                .collect()
+        };
+        let warns = lines(" WARN ");
+        let [warn] = warns.as_slice() else {
+            panic!("one warn line:\n{log}");
+        };
+        assert!(!warn.contains(SECRET), "the warn line is scrubbed: {warn}");
+        assert!(
+            warn.contains("[redacted]"),
+            "the warn line says what it scrubbed: {warn}"
+        );
+        assert!(
+            warn.contains("listing the inputs of"),
+            "the warn line keeps the message: {warn}"
+        );
+        assert!(
+            log.lines()
+                .filter(|l| l.contains(SECRET))
+                .all(|l| l.contains("DEBUG")),
+            "the secret appears at debug only:\n{log}"
+        );
+        assert!(
+            lines("DEBUG").iter().any(|l| l.contains(SECRET)),
+            "the raw chain is logged at debug:\n{log}"
         );
         Ok(())
     }
