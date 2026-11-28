@@ -247,8 +247,6 @@ fn sighup_exits_130() {
 /// 130. TERM is still a cancel then (heph only keeps the ignore it was given).
 #[test]
 fn sighup_ignored_when_inherited_ignored() {
-    use std::os::unix::process::CommandExt as _;
-
     let dist = Dist::locate();
     let ws = Workspace::new().expect("workspace");
     ws.write(
@@ -256,7 +254,34 @@ fn sighup_ignored_when_inherited_ignored() {
         "target(name = \"nap\", driver = \"bash\", run = \"sleep 3\", cache = False)\n",
     )
     .expect("write BUILD");
-    let mut run = Bg::spawn_with(&ws, &dist, &["run", "//pkg:nap"], |cmd| {
+    let mut run = spawn_hup_ignored(&ws, &dist, "//pkg:nap");
+    run.wait_executing("//pkg:nap");
+    common::signal(run.pid(), libc::SIGHUP);
+    let status = run.wait();
+    assert_eq!(status.code(), Some(0), "{}", run.stderr());
+}
+
+/// Under an inherited SIGHUP ignore (`nohup`), SIGTERM is still a cancel:
+/// the HUP sent first changes nothing, the TERM after it stops the build
+/// and exits 130.
+#[test]
+fn sigterm_cancels_when_sighup_inherited_ignored() {
+    let dist = Dist::locate();
+    let ws = Workspace::new().expect("workspace");
+    ws.write("pkg/BUILD", CANCEL_BUILD).expect("write BUILD");
+    let mut run = spawn_hup_ignored(&ws, &dist, "//pkg:slow");
+    run.wait_executing("//pkg:slow");
+    common::signal(run.pid(), libc::SIGHUP);
+    common::signal(run.pid(), libc::SIGTERM);
+    let status = run.wait();
+    assert_eq!(status.code(), Some(130), "{}", run.stderr());
+}
+
+/// `heph run <addr>` started with SIGHUP ignored, as `nohup` starts it.
+fn spawn_hup_ignored(ws: &Workspace, dist: &Dist, addr: &str) -> Bg {
+    use std::os::unix::process::CommandExt as _;
+
+    Bg::spawn_with(ws, dist, &["run", addr], |cmd| {
         let ignore_hup = || {
             // SAFETY: setting a signal's disposition to `SIG_IGN`.
             unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
@@ -265,9 +290,5 @@ fn sighup_ignored_when_inherited_ignored() {
         // SAFETY: the closure only calls `signal(2)`, which is
         // async-signal-safe, between fork and exec.
         unsafe { cmd.pre_exec(ignore_hup) };
-    });
-    run.wait_executing("//pkg:nap");
-    common::signal(run.pid(), libc::SIGHUP);
-    let status = run.wait();
-    assert_eq!(status.code(), Some(0), "{}", run.stderr());
+    })
 }
