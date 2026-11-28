@@ -10,6 +10,7 @@ use std::sync::Arc;
 use crossterm::style::Stylize;
 
 use crate::engine::error::{CancelledError, FrozenCheckError, LogTail, TargetFailure};
+use crate::engine::request_state::FailFastStopped;
 use crate::hmemoizer::{chain_frames, downcast_chain_ref};
 use crate::tui::color::stderr_color_enabled as color_enabled;
 use crate::tui::failure_report::render_log_box;
@@ -471,6 +472,7 @@ pub(crate) trait FinalizeRequest {
     fn was_cancelled(&self, addr: &str) -> bool;
     fn heph_home(&self) -> Option<std::path::PathBuf>;
     fn workspace_root(&self) -> Option<std::path::PathBuf>;
+    fn fail_fast_stopped(&self) -> Option<FailFastStopped>;
 }
 
 impl FinalizeRequest for Arc<crate::engine::request_state::RequestState> {
@@ -495,6 +497,9 @@ impl FinalizeRequest for Arc<crate::engine::request_state::RequestState> {
     }
     fn workspace_root(&self) -> Option<std::path::PathBuf> {
         crate::engine::request_state::RequestState::workspace_root(self)
+    }
+    fn fail_fast_stopped(&self) -> Option<FailFastStopped> {
+        crate::engine::request_state::RequestState::fail_fast_stopped(self)
     }
 }
 
@@ -603,7 +608,8 @@ async fn take_failure_outcome(
             home.as_deref(),
             rs.log_tail_lines(),
         )
-        .with_workspace(rs.workspace_root().as_deref());
+        .with_workspace(rs.workspace_root().as_deref())
+        .with_stopped(rs.fail_fast_stopped());
         Err(FailedTargets::deferred(failures)
             .with_incomplete(incomplete)
             .with_report(report)
@@ -622,10 +628,10 @@ async fn take_failure_outcome(
             incomplete,
             &printed_live,
             ctx.session(),
-            rs.workspace_root()
-                .as_deref()
-                .map(WorkspaceRel::workspace)
-                .unwrap_or_default(),
+            BoxRequest {
+                root: rs.workspace_root(),
+                stopped: rs.fail_fast_stopped(),
+            },
         )
         .into_error())
     }
@@ -672,6 +678,31 @@ pub struct FailedTargets {
     report: Option<ReportContext>,
     /// The workspace the boxes' cause lines name paths relative to.
     rel: WorkspaceRel,
+    /// What `--fail-fast` stopped, listed after the boxes.
+    stopped: Option<FailFastStopped>,
+}
+
+/// What the CI box reads from its request beyond the failures, read where
+/// the failures are collected.
+#[derive(Debug, Default)]
+pub struct BoxRequest {
+    /// The workspace: what heph's text names paths relative to.
+    pub root: Option<std::path::PathBuf>,
+    /// What `--fail-fast` stopped once a target failed.
+    pub stopped: Option<FailFastStopped>,
+}
+
+/// The `stopped by --fail-fast` lines (RUN-24), after a blank line, when
+/// fail-fast stopped anything.
+fn push_stopped(out: &mut String, stopped: Option<&FailFastStopped>) {
+    if let Some(s) = stopped {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&crate::tui::failure_report::fail_fast_lines(
+            &s.running, s.queued,
+        ));
+    }
 }
 
 impl FailedTargets {
@@ -683,6 +714,7 @@ impl FailedTargets {
             rendered: false,
             report: None,
             rel: WorkspaceRel::default(),
+            stopped: None,
         }
     }
 
@@ -724,6 +756,9 @@ impl FailedTargets {
                 &self.rel,
             ),
         };
+        if self.report.is_none() {
+            push_stopped(&mut out, self.stopped.as_ref());
+        }
         if let Some(report) = &self.incomplete {
             if !out.is_empty() {
                 out.push('\n');
@@ -756,26 +791,32 @@ impl FailedTargets {
             printed_live,
             out,
             color,
-            WorkspaceRel::default(),
+            BoxRequest::default(),
         )
     }
 
-    /// [`FailedTargets::reported`], the cause lines naming paths under the
-    /// workspace `rel` holds relative to it (D2).
+    /// [`FailedTargets::reported`], with what `req` read from the request:
+    /// the cause lines name paths under its workspace relative to it (D2),
+    /// and the boxes are followed by what `--fail-fast` stopped.
     pub fn reported_in(
         failures: Vec<Arc<TargetFailure>>,
         incomplete: Option<crate::engine::discovery::GapReport>,
         printed_live: &HashSet<String>,
         out: &mut dyn io::Write,
         color: bool,
-        rel: WorkspaceRel,
+        req: BoxRequest,
     ) -> Self {
         let this = Self {
             failures,
             incomplete,
             rendered: true,
             report: None,
-            rel,
+            rel: req
+                .root
+                .as_deref()
+                .map(WorkspaceRel::workspace)
+                .unwrap_or_default(),
+            stopped: req.stopped,
         };
         // A failed write to the terminal is not actionable, and the exit code still
         // has to carry the failure out.
@@ -791,7 +832,7 @@ impl FailedTargets {
         incomplete: Option<crate::engine::discovery::GapReport>,
         printed_live: &HashSet<String>,
         session: &SessionSlot,
-        rel: WorkspaceRel,
+        req: BoxRequest,
     ) -> Self {
         let mut out = Vec::new();
         let this = Self::reported_in(
@@ -800,7 +841,7 @@ impl FailedTargets {
             printed_live,
             &mut out,
             color_enabled(),
-            rel,
+            req,
         );
         // Every failure printed live leaves nothing to print.
         if !out.is_empty() {
@@ -1286,6 +1327,9 @@ mod tests {
             None
         }
         fn workspace_root(&self) -> Option<std::path::PathBuf> {
+            None
+        }
+        fn fail_fast_stopped(&self) -> Option<FailFastStopped> {
             None
         }
     }

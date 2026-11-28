@@ -183,6 +183,8 @@ impl Engine {
             *log_not_streamed = !driver.driver.streams_log();
         }
         let mut reservation = Some(reservation);
+        // What a `--fail-fast` stop finds running, until the run ends.
+        let _open = rs.open_execute(&addr_str);
         let res = crate::engine::event::emit_scope(
             &rs,
             start,

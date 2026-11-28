@@ -883,6 +883,9 @@ pub struct RequestStateData {
     /// ([`RequestState::end_is_cancelled`]), by formatted addr: roots and
     /// what they took down. The report leaves them out.
     cancelled: Mutex<FxHashSet<String>>,
+    /// What `--fail-fast` stopped, for the report's `stopped by --fail-fast`
+    /// lines. Written only under `--fail-fast`.
+    fail_fast_log: Mutex<FailFastLog>,
     /// Decision maker for `approval`-gated targets. `None` in non-interactive
     /// contexts that never set one (gc, tests) — a target requiring approval then
     /// fails with a clear error. Shared via `Arc<RequestStateData>`, so child
@@ -1319,6 +1322,48 @@ pub struct RequestState {
 fn once(flag: &std::sync::atomic::AtomicBool) -> bool {
     use std::sync::atomic::Ordering::Relaxed;
     !flag.load(Relaxed) && !flag.swap(true, Relaxed)
+}
+
+/// What `--fail-fast` stopped, as the request saw it ([`RequestState::fail_fast_stopped`]).
+#[derive(Debug, Default)]
+struct FailFastLog {
+    /// The executes open now, by formatted addr.
+    open: FxHashSet<String>,
+    /// `open` when the first failure stopped the request; `None` until then.
+    running_at_stop: Option<FxHashSet<String>>,
+    /// Every target whose end was a stop of its own (no `upstream_of`), in
+    /// end order.
+    stopped_roots: indexmap::IndexSet<String>,
+}
+
+/// An execute [`RequestState::fail_fast_stopped`] may find running: open
+/// until dropped.
+pub struct OpenExecute {
+    data: Arc<RequestStateData>,
+    addr: String,
+}
+
+impl std::fmt::Debug for OpenExecute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenExecute")
+            .field("addr", &self.addr)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for OpenExecute {
+    fn drop(&mut self) {
+        self.data.fail_fast_log.lock().open.remove(&self.addr);
+    }
+}
+
+/// What `--fail-fast` stopped once a target failed (D5, RUN-24).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FailFastStopped {
+    /// The targets that were running, by formatted addr, sorted.
+    pub running: Vec<String>,
+    /// How many stopped targets had not started.
+    pub queued: usize,
 }
 
 impl RequestState {
@@ -1782,12 +1827,65 @@ impl RequestState {
         if cancelled {
             set.insert(addr.to_owned());
         }
+        drop(set);
+        if cancelled && d.upstream_of.is_none() && self.fail_fast() {
+            self.data
+                .fail_fast_log
+                .lock()
+                .stopped_roots
+                .insert(addr.to_owned());
+        }
         cancelled
     }
 
     /// Whether `addr`'s failure was a stop ([`end_is_cancelled`](Self::end_is_cancelled)).
     pub fn was_cancelled(&self, addr: &str) -> bool {
         self.data.cancelled.lock().contains(addr)
+    }
+
+    /// Stop the request because a target failed under `--fail-fast`: note
+    /// which executes were running (the report's `(was running)` lines),
+    /// then cancel the token, which signals them.
+    pub fn stop_for_fail_fast(&self) {
+        {
+            let mut log = self.data.fail_fast_log.lock();
+            if log.running_at_stop.is_none() {
+                log.running_at_stop = Some(log.open.clone());
+            }
+        }
+        self.ctoken().cancel();
+    }
+
+    /// `addr`'s execute, open until the guard drops: what
+    /// [`stop_for_fail_fast`](Self::stop_for_fail_fast) finds running.
+    /// `None`, at no cost, without `--fail-fast`.
+    pub fn open_execute(&self, addr: &str) -> Option<OpenExecute> {
+        if !self.fail_fast() {
+            return None;
+        }
+        self.data.fail_fast_log.lock().open.insert(addr.to_owned());
+        Some(OpenExecute {
+            data: Arc::clone(&self.data),
+            addr: addr.to_owned(),
+        })
+    }
+
+    /// What `--fail-fast` stopped once a target failed (D5, RUN-24): the
+    /// targets that were running, sorted, and how many never started.
+    /// `None` when fail-fast stopped nothing (no failure, or no fail-fast).
+    pub fn fail_fast_stopped(&self) -> Option<FailFastStopped> {
+        let log = self.data.fail_fast_log.lock();
+        let at_stop = log.running_at_stop.as_ref()?;
+        let (mut running, queued): (Vec<&String>, Vec<&String>) =
+            log.stopped_roots.iter().partition(|a| at_stop.contains(*a));
+        if running.is_empty() && queued.is_empty() {
+            return None;
+        }
+        running.sort_unstable();
+        Some(FailFastStopped {
+            running: running.into_iter().cloned().collect(),
+            queued: queued.len(),
+        })
     }
 
     /// heph's home, while the engine is alive: what no screen or report
@@ -2413,6 +2511,7 @@ impl Engine {
             path_passes: std::sync::atomic::AtomicUsize::new(0),
             took_down: Mutex::new(FxHashMap::default()),
             cancelled: Mutex::new(FxHashSet::default()),
+            fail_fast_log: Mutex::default(),
             approval,
             hash_only,
             selection: std::sync::OnceLock::new(),

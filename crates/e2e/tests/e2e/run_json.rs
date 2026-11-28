@@ -181,8 +181,21 @@ async fn run_json_full(
         }
         (closed, c.res.map(drop), events)
     };
-    // The failure boxes the text run prints, from the same request.
-    let boxes = heph::commands::errors::render_failures_to_string(&rs.failures(), false);
+    // The failure boxes the text run prints, from the same request, and
+    // what `--fail-fast` stopped after them.
+    let mut printed = Vec::new();
+    drop(heph::commands::errors::FailedTargets::reported_in(
+        rs.failures(),
+        None,
+        &std::collections::HashSet::new(),
+        &mut printed,
+        false,
+        heph::commands::errors::BoxRequest {
+            root: None,
+            stopped: rs.fail_fast_stopped(),
+        },
+    ));
+    let boxes = String::from_utf8(printed).expect("utf-8 boxes");
     drain(rs).await;
     let text = String::from_utf8(buf).expect("utf-8");
     let entries = if closed {
@@ -424,7 +437,8 @@ async fn fail_fast_run() -> JsonRun {
 
 /// RUN-24: `--fail-fast` stops the running sibling once `bad` fails. The
 /// sibling ends cancelled, in its event and its record, and is neither
-/// blamed nor boxed: the one failure is `bad`'s.
+/// blamed nor boxed: the one failure is `bad`'s. One line after the box
+/// says it was stopped while running.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fail_fast_siblings_are_cancelled_and_listed() {
     let run = fail_fast_run().await;
@@ -453,7 +467,17 @@ async fn fail_fast_siblings_are_cancelled_and_listed() {
     assert_eq!(ends, [(true, None)], "one cancelled end, naming no root");
     assert_eq!(run.box_count(), 1, "{}", run.boxes);
     assert!(run.boxes.contains("//p:bad"), "{}", run.boxes);
-    assert!(!run.boxes.contains("//p:slow"), "{}", run.boxes);
+    let (boxes, stopped) = run
+        .boxes
+        .split_once("\nstopped by --fail-fast")
+        .unwrap_or_else(|| panic!("a fail-fast line:\n{}", run.boxes));
+    assert!(!boxes.contains("//p:slow"), "{}", run.boxes);
+    assert_eq!(
+        format!("stopped by --fail-fast{stopped}"),
+        "stopped by --fail-fast: //p:slow (was running)\n",
+        "{}",
+        run.boxes
+    );
 }
 
 /// RUN-24 / JSON_OUTPUT.md: under `--fail-fast --json` the failure's record
