@@ -929,6 +929,70 @@ mod tests {
         Ok(())
     }
 
+    /// Under `--fail-fast` the error is the first failing input in
+    /// declaration order: a group member refused inside the walk (`g1` →
+    /// `failed` → `ep_bad1`), not the not-found direct input after it, which
+    /// may fail first. Without it every failure is kept, and `g2`, which
+    /// shares the group `g1`'s walk failed in, is walked again without a
+    /// false circular-group error: the failed walk left the path clean.
+    #[tokio::test]
+    async fn fail_fast_returns_first_input_in_order() -> anyhow::Result<()> {
+        let mut ep = exec_spec("//pkg:ep_bad1");
+        ep.config
+            .insert("entrypoint".to_string(), Value::Bool(true));
+        let (engine, _root) = engine_with(vec![
+            group_spec("//pkg:g1", &["//pkg:failed"]),
+            group_spec("//pkg:g2", &["//pkg:failed"]),
+            group_spec("//pkg:failed", &["//pkg:ep_bad1"]),
+            ep,
+        ])?;
+        let ep_bad1 = hmodel::htaddr::parse_addr("//pkg:ep_bad1")?;
+        let inputs = declaring(vec![
+            input("//pkg:g1", "dep|0", &[]),
+            input("//pkg:bad2", "dep|1", &[]),
+            input("//pkg:g2", "dep|2", &[]),
+        ]);
+        let expand = |fail_fast: bool| {
+            let rs = engine.new_state_with_fail_fast(fail_fast);
+            tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                Arc::clone(&engine).expand_inputs(rs, &inputs),
+            )
+        };
+
+        let Err(err) = expand(true)
+            .await
+            .context("the fail-fast expansion hangs")?
+        else {
+            panic!("a fail-fast expansion with failing inputs succeeded");
+        };
+        let first = hcore::hmemoizer::downcast_chain_ref::<EntrypointAsInput>(&err)
+            .unwrap_or_else(|| panic!("want ep_bad1's EntrypointAsInput, got: {err:#}"));
+        assert_eq!(first.entrypoint, ep_bad1);
+        let msg = format!("{err:#}");
+        assert!(!msg.contains("//pkg:bad2"), "only the first: {msg}");
+        assert!(
+            hcore::hmemoizer::downcast_chain_ref::<PartialExpansion>(&err).is_none(),
+            "fail-fast is not a partial expansion: {msg}"
+        );
+
+        let Err(err) = expand(false)
+            .await
+            .context("the keep-going expansion hangs")?
+        else {
+            panic!("an expansion with failing inputs succeeded");
+        };
+        let msg = format!("{err:#}");
+        assert!(!msg.contains("circular group"), "{msg}");
+        assert!(msg.contains("//pkg:bad2"), "{msg}");
+        assert_eq!(
+            msg.matches("//pkg:ep_bad1").count(),
+            2,
+            "refused through g1 and again through g2: {msg}"
+        );
+        Ok(())
+    }
+
     // Child-set annotations should win over a same-named parent annotation.
     #[tokio::test]
     async fn child_annotation_overrides_parent_on_conflict() -> anyhow::Result<()> {
