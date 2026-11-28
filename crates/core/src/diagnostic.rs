@@ -167,6 +167,13 @@ impl SourceLoc {
     /// `file`, `line`, `col` as a location, or why not: an empty, absolute or
     /// `..`-climbing file, or one over [`FILE_CAP`].
     pub fn checked(file: String, line: u32, col: u32) -> Result<Self, String> {
+        Self::check_file(&file)?;
+        Ok(Self { file, line, col })
+    }
+
+    /// Whether `file` may be a location's file, or why not: see
+    /// [`SourceLoc::checked`].
+    pub fn check_file(file: &str) -> Result<(), String> {
         if file.is_empty() {
             return Err("the location's file is empty".to_owned());
         }
@@ -176,28 +183,64 @@ impl SourceLoc {
         if file.starts_with('/') || file.starts_with('\\') {
             return Err(format!(
                 "the location's file {} is absolute, not workspace-relative",
-                escape_control(&file)
+                escape_control(file)
             ));
         }
         if file.split(['/', '\\']).any(|c| c == "..") {
             return Err(format!(
                 "the location's file {} climbs out of the workspace",
-                escape_control(&file)
+                escape_control(file)
             ));
         }
         if file.chars().any(char::is_control) {
             return Err(format!(
                 "the location's file {} holds a control character",
-                escape_control(&file)
+                escape_control(file)
             ));
         }
-        Ok(Self { file, line, col })
+        Ok(())
     }
 }
 
 impl fmt::Display for SourceLoc {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}:{}:{}", self.file, self.line, self.col)
+    }
+}
+
+/// A stretch of one source file: its start and end, each a 1-based line and
+/// a 1-based column counted in chars. The end is exclusive, as the provider
+/// that reported it measured it.
+///
+/// heph's own type, not a parser's (whose span types implement `Hash`): like
+/// every diagnostic type it has no `Hash`, so it cannot reach a def hash, a
+/// `hashin` or a cache key (I1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Span {
+    pub start_line: u32,
+    pub start_col: u32,
+    pub end_line: u32,
+    pub end_col: u32,
+}
+
+impl Span {
+    /// Whether every line and column is 1-based (none is 0) and the end is
+    /// not before the start.
+    pub fn is_valid(&self) -> bool {
+        self.start_line > 0
+            && self.start_col > 0
+            && self.end_line > 0
+            && self.end_col > 0
+            && (self.start_line, self.start_col) <= (self.end_line, self.end_col)
+    }
+
+    /// Where the span starts, in `file`.
+    pub fn start_in(&self, file: &str) -> SourceLoc {
+        SourceLoc {
+            file: file.to_owned(),
+            line: self.start_line,
+            col: self.start_col,
+        }
     }
 }
 

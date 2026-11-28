@@ -1248,6 +1248,7 @@ pub fn build_lint_spec(p: LintParams) -> TargetSpec {
         labels: vec![],
         transitive: Default::default(),
         approval: Default::default(),
+        source: None,
     }
 }
 
@@ -1299,6 +1300,7 @@ pub fn build_lint_gate_spec(
         labels: listed::owned(listed::LINT_CHECK),
         transitive: Default::default(),
         approval: Default::default(),
+        source: None,
     }
 }
 
@@ -1345,6 +1347,7 @@ pub fn build_lint_fix_spec(
         labels: listed::owned(listed::LINT),
         transitive: Default::default(),
         approval: Default::default(),
+        source: None,
     }
 }
 

@@ -21,6 +21,23 @@
 //! struct Framed(plugin::diagnostic::StageFrame);
 //! #[derive(Clone)]
 //! struct Recorded(plugin::error::FailureRecord);
+//! #[derive(Clone)]
+//! struct Located(plugin::provider::SpecSource, plugin::diagnostic::Span);
+//! # fn main() {}
+//! ```
+//!
+//! `no_hash_on_spec_source` (where a provider declared a target,
+//! [`TargetSpec::source`](crate::provider::TargetSpec::source)):
+//! ```compile_fail,E0277
+//! #[derive(Hash)]
+//! struct Located(plugin::provider::SpecSource);
+//! # fn main() {}
+//! ```
+//!
+//! `no_hash_on_span`:
+//! ```compile_fail,E0277
+//! #[derive(Hash)]
+//! struct Located(plugin::diagnostic::Span);
 //! # fn main() {}
 //! ```
 //!
@@ -56,7 +73,7 @@ use crate::error::MultiError;
 use hmodel::htaddr::Addr;
 use std::fmt;
 
-pub use hcore::diagnostic::{Diagnostic, Hint, HintKind, SourceLoc, Stage, escape_control};
+pub use hcore::diagnostic::{Diagnostic, Hint, HintKind, SourceLoc, Span, Stage, escape_control};
 
 /// The engine boundary a [`StageFrame`] was added at. Each keeps the text the
 /// string context it replaces had.
