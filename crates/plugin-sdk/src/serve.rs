@@ -2357,7 +2357,10 @@ mod tests {
     impl PluginFn for DiagnosticFn {
         async fn call(&self, _ctx: &FnCallContext<'_>, _args: FnArgs) -> Result<FnOutcome> {
             use hplugin::diagnostic::{Diagnostic, Hint, HintKind, SourceLoc, Stage};
-            let d = Diagnostic::new(Stage::Eval, "no image named `bse`")
+            // It claims another stage and another plugin: the host keeps
+            // neither.
+            let d = Diagnostic::new(Stage::Run, "no image named `bse`")
+                .with_plugin("impostor")
                 .with_location(
                     SourceLoc::checked("p/BUILD".into(), 3, 9).map_err(anyhow::Error::msg)?,
                 )
@@ -2389,7 +2392,10 @@ mod tests {
         );
         let err = call(&defs[0], "p", vec![]).expect_err("the call fails");
         let d = find_diagnostic(&err).expect("the diagnostic crossed");
+        // The loader names the stage of the call (a function: Eval) and the
+        // plugin it loaded, whatever the plugin wrote.
         assert_eq!(d.stage, Stage::Eval);
+        assert_eq!(d.plugin.as_deref(), Some("mock"));
         assert_eq!(d.message, "no image named `bse`");
         assert_eq!(
             d.location,
