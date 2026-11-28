@@ -1095,6 +1095,100 @@ mod tests {
         assert!(heard, "the wait never heard its cell abandoned");
     }
 
+    /// A body dropped while it is leaving its caller's stack (yielded, its
+    /// task spawned but not yet run) is abandoned like any other: the code
+    /// after the leave never runs, its token is cancelled, its cell is
+    /// evicted, and the next caller of the key starts a new body.
+    #[tokio::test]
+    async fn a_body_dropped_while_leaving_its_callers_stack_is_abandoned() {
+        let m: TaskInner<String, u32> = inner("leave-dropped");
+        let after = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel::<StdCancellationToken>();
+        let body = {
+            let after = Arc::clone(&after);
+            async move {
+                drop(tx.send(current_abandoned_token().expect("inside a body")));
+                let _token = super::super::abandoned_token().await;
+                after.store(true, Ordering::SeqCst);
+                1
+            }
+        };
+        let mut joiner = Box::pin(m.process("k".to_string(), move || body));
+        assert!(
+            futures::poll!(&mut joiner).is_pending(),
+            "taking the token yields on the caller's stack"
+        );
+        drop(joiner);
+        // Let the runtime turn: the aborted task, had it survived, would run.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        let token = rx.try_recv().expect("the body sent its token");
+        assert!(token.is_cancelled(), "the abandonment cancels the token");
+        assert!(
+            !after.load(Ordering::SeqCst),
+            "the code after the leave never runs"
+        );
+        assert!(m.cache_lock("k").get("k").is_none(), "the cell is evicted");
+        let fresh = within(m.process("k".to_string(), || async { 2 })).await;
+        assert_eq!(fresh, 2, "the next caller starts a new body");
+    }
+
+    /// Nested cells: A's body awaits B's, and B takes its token and then
+    /// holds its thread. A is polled inline from a join whose sibling fails.
+    /// B left its caller's stack (A's inline poll, itself on the join's), so
+    /// A suspends, the join sees the failure, A is abandoned, its drop drops
+    /// B's last interest, and B hears its token.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_nested_body_holding_its_thread_hears_a_sibling_fail() {
+        let m: Arc<TaskInner<String, u32>> = Arc::new(inner("leave-nested"));
+        let entered = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel::<bool>();
+        let b_body = {
+            let entered = Arc::clone(&entered);
+            async move {
+                let token = super::super::abandoned_token()
+                    .await
+                    .expect("inside a body");
+                entered.store(true, Ordering::SeqCst);
+                tokio::task::block_in_place(|| spin_until(|| token.is_cancelled()));
+                let _sent = tx.send(token.is_cancelled());
+                futures::future::pending::<()>().await;
+                0
+            }
+        };
+        let a_body = {
+            let m = Arc::clone(&m);
+            async move { m.process("b".to_string(), move || b_body).await }
+        };
+        let sibling = async {
+            while !entered.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+            Err::<u32, ()>(())
+        };
+        let wanted = async { Ok::<u32, ()>(m.process("a".to_string(), move || a_body).await) };
+        // Joined on this thread, as the dep join runs on its caller's stack.
+        let joined = futures::future::try_join(sibling, wanted).await;
+        assert!(joined.is_err(), "the sibling's failure ends the join");
+        let heard = tokio::task::spawn_blocking(move || rx.recv_timeout(TIMEOUT))
+            .await
+            .expect("join")
+            .expect("B reports");
+        assert!(heard, "B never heard its cell abandoned");
+    }
+
+    /// Outside any memoized body there is no caller's stack to leave: taking
+    /// the token is ready on its first poll, and there is none.
+    #[tokio::test]
+    async fn outside_a_body_taking_the_token_is_ready_at_once() {
+        let mut fut = Box::pin(super::super::abandoned_token());
+        assert!(
+            matches!(futures::poll!(&mut fut), std::task::Poll::Ready(None)),
+            "outside a body the token is no token, at once"
+        );
+    }
+
     /// A body that asks only after it was abandoned finds the token already
     /// cancelled: the abandonment creates it when nobody asked yet.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

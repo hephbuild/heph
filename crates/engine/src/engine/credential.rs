@@ -96,6 +96,12 @@ pub(crate) struct HeldCredentials {
 }
 
 impl HeldCredentials {
+    /// A run with no credentials, for a test that calls `run_in_sandbox`.
+    #[cfg(test)]
+    pub(crate) fn empty() -> Self {
+        Self { held: Vec::new() }
+    }
+
     /// The first credential whose material is no longer usable at `now` —
     /// expired, or inside its skew margin — when any is. Material can lapse
     /// while its consumer waits for its pools.

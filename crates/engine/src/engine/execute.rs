@@ -1734,4 +1734,154 @@ mod tests {
         let a = entrypoint_allotment(0, &req(&[]), units);
         assert_eq!(a.iter().collect::<Vec<_>>(), [("cpu", "1")], "at least 1");
     }
+
+    /// A driver whose `run` holds its thread until its stop is heard, as
+    /// exec's `block_in_place` output park on macOS does, and reports
+    /// whether it heard it (giving up after 20s).
+    struct HoldsItsThread {
+        started: Arc<std::sync::atomic::AtomicBool>,
+        heard: std::sync::mpsc::Sender<bool>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::engine::driver::Driver for HoldsItsThread {
+        fn config(
+            &self,
+            _req: crate::engine::driver::ConfigRequest,
+        ) -> anyhow::Result<crate::engine::driver::ConfigResponse> {
+            Ok(crate::engine::driver::ConfigResponse {
+                name: "holds".to_string(),
+            })
+        }
+        fn schema(&self) -> crate::engine::driver::DriverSchema {
+            crate::engine::driver::DriverSchema::default()
+        }
+        async fn parse(
+            &self,
+            _req: crate::engine::driver::ParseRequest,
+            _ctoken: &(dyn hcore::hasync::Cancellable + Send + Sync),
+        ) -> anyhow::Result<crate::engine::driver::ParseResponse> {
+            anyhow::bail!("never parsed: the test hands run_in_sandbox its def")
+        }
+        async fn apply_transitive(
+            &self,
+            req: crate::engine::driver::ApplyTransitiveRequest,
+            _ctoken: &(dyn hcore::hasync::Cancellable + Send + Sync),
+        ) -> anyhow::Result<crate::engine::driver::ApplyTransitiveResponse> {
+            Ok(crate::engine::driver::ApplyTransitiveResponse {
+                target_def: req.target_def,
+            })
+        }
+        async fn run<'a, 'io>(
+            &self,
+            _req: RunRequest<'a, 'io>,
+            ctoken: &(dyn hcore::hasync::Cancellable + Send + Sync),
+        ) -> anyhow::Result<RunResponse> {
+            use std::time::{Duration, Instant};
+            self.started
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let start = Instant::now();
+            let heard = tokio::task::block_in_place(|| {
+                while !ctoken.is_cancelled() {
+                    if start.elapsed() > Duration::from_secs(20) {
+                        return false;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                true
+            });
+            let _sent = self.heard.send(heard);
+            anyhow::bail!("stopped")
+        }
+        async fn run_shell<'a, 'io>(
+            &self,
+            _req: RunRequest<'a, 'io>,
+            _ctoken: &(dyn hcore::hasync::Cancellable + Send + Sync),
+        ) -> anyhow::Result<RunResponse> {
+            anyhow::bail!("never a shell")
+        }
+    }
+
+    /// An execute none of whose awaits before the run suspends (an
+    /// invocation's lease has nothing to prepare) reaches its run in the
+    /// memo cell's inline first poll, on its caller's stack. That caller is
+    /// a join, as the dep join is, whose sibling fails once the run has
+    /// started. Unless the execute leaves the caller's stack before the run,
+    /// the join is stuck inside the run, never sees the failure, never
+    /// abandons the cell, and the run's stop never comes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_run_reached_inline_hears_its_stop_when_a_sibling_fails() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+        let dir = hcore::fsutil::tempdir().expect("tempdir");
+        let engine =
+            Arc::new(Engine::new(crate::engine::Config::for_tests(dir.path())).expect("engine"));
+        let rs = engine.new_state();
+        let sandbox = dir.path().join("sandbox");
+        std::fs::create_dir_all(&sandbox).expect("sandbox dir");
+        let addr = Addr::new(
+            hmodel::htpkg::PkgBuf::from("pkg"),
+            "holds".to_string(),
+            std::collections::BTreeMap::new(),
+        );
+        let started = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel::<bool>();
+        let driver = Arc::new(crate::engine::engine::Driver {
+            name: "holds".to_string(),
+            driver: Box::new(HoldsItsThread {
+                started: Arc::clone(&started),
+                heard: tx,
+            }),
+            managed: false,
+        });
+        let target = Arc::new(crate::engine::driver::targetdef::TargetDef {
+            addr: addr.clone(),
+            ..Default::default()
+        });
+        let memo: hcore::hmemoizer::Memoizer<String, Result<(), Arc<anyhow::Error>>> =
+            hcore::hmemoizer::Memoizer::with_tag_task(
+                "execute-inline",
+                tokio::runtime::Handle::current(),
+            );
+        let body = enclose!((engine, rs, sandbox, addr) move || async move {
+            let run = SandboxRun {
+                driver,
+                target,
+                inputs: Vec::new(),
+                hashin: String::new(),
+                scratch: Vec::new(),
+                credentials: crate::engine::credential::HeldCredentials::empty(),
+                deferred: std::collections::BTreeMap::new(),
+                wrapper: None,
+                shell: false,
+                options: crate::engine::driver::RunOptions::default(),
+                allotment: None,
+                log: None,
+            };
+            let _ran = engine
+                .run_in_sandbox(&rs, &addr, SandboxLease::Invocation { dir: &sandbox }, run)
+                .await;
+            Ok(())
+        });
+        let sibling = async {
+            let start = Instant::now();
+            while !started.load(Ordering::SeqCst) && start.elapsed() < Duration::from_secs(20) {
+                tokio::task::yield_now().await;
+            }
+            Err::<(), ()>(())
+        };
+        let wanted = async { memo.once("k".to_string(), body).await.map_err(drop) };
+        // Joined on this thread, as the dep join runs on its caller's stack.
+        let joined = futures::future::try_join(sibling, wanted).await;
+        assert!(joined.is_err(), "the sibling's failure ends the join");
+        assert!(started.load(Ordering::SeqCst), "the run started");
+        let heard = tokio::task::spawn_blocking(move || rx.recv_timeout(Duration::from_secs(25)))
+            .await
+            .expect("join")
+            .expect("the run reports");
+        assert!(
+            heard,
+            "the run was never told to stop: it held its caller's stack"
+        );
+    }
 }
