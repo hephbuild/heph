@@ -1055,6 +1055,11 @@ mod tests {
     /// abandons the cell, and the wait never hears its token: it waited on
     /// itself. Taking the token moves the body onto its own task first, so
     /// the join sees the failure and the abandonment reaches the wait.
+    ///
+    /// Asserts the default. Under `HEPH_MEMOIZER_INLINE=0` (always spawn) it
+    /// fails on its `inline_before` assert, deliberately, as
+    /// `a_body_that_never_suspends_is_driven_inline` does: a silent skip
+    /// would stop it testing the inline poll it exists for.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_body_holding_its_thread_off_its_callers_stack_hears_a_sibling_fail() {
         let m: Arc<TaskInner<String, u32>> = Arc::new(inner("leave-stack"));

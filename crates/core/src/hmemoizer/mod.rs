@@ -212,8 +212,9 @@ fn phases() -> &'static Mutex<HashMap<u64, &'static str>> {
 /// spawns does not inherit it.
 ///
 /// It reaches a body only once that body has suspended: during the inline
-/// first poll the caller that holds the cell's only interest is the one
-/// driving it, so the cell cannot be abandoned until the body yields. So
+/// first poll the caller driving it holds an interest of its own (others
+/// may join meanwhile), and that interest keeps the count above zero until
+/// the poll returns, so the cell cannot be abandoned until the body yields. So
 /// this first moves the rest of the body off its caller's stack (see
 /// `leave_caller_stack`): a body that then holds its thread waiting on the
 /// token does so on a task the abandonment can reach, never inside the
