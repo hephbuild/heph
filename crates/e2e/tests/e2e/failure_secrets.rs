@@ -270,6 +270,12 @@ target(name = "spawn", driver = "exec", out = "o.txt", run = ["${read://val:plai
     assert!(spot.contains("//app:spawn"), "the spotlight: {spot:?}");
     assert_no_secret("the spotlight", &spot);
     assert_no_secret("run --json", &serde_json::to_string(&run.entries)?);
+    // The value is in the failure's message, not a log it printed, so the
+    // box and the report hold no `${read://}` value either (gap 2 is only
+    // about what a run prints).
+    assert!(run.boxes.contains("//app:spawn"), "a box:\n{}", run.boxes);
+    assert_no_secret("the CI box", &run.boxes);
+    assert_no_secret("the report", &run.report);
     Ok(())
 }
 
