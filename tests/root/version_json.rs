@@ -39,7 +39,7 @@ fn version_json_is_one_compact_record() {
     let text = stdout(&out);
     assert_eq!(text.lines().count(), 1, "piped: one compact line: {text}");
     let doc: serde_json::Value = serde_json::from_str(&text).expect("JSON");
-    assert_eq!(doc["output_contract"], 1);
+    assert_eq!(doc["output_contract"], 2);
     assert!(doc["version"].is_string(), "{doc}");
     // The text output is unchanged and agrees.
     let plain = heph(&[]);
@@ -53,10 +53,10 @@ fn version_json_is_one_compact_record() {
 fn version_jq_and_fields() {
     let out = heph(&["--jq", ".output_contract"]);
     assert_eq!(out.status.code(), Some(0));
-    assert_eq!(stdout(&out), "1\n");
+    assert_eq!(stdout(&out), "2\n");
 
     let out = heph(&["--fields", "output_contract"]);
-    assert_eq!(stdout(&out), "{\"output_contract\":1}\n");
+    assert_eq!(stdout(&out), "{\"output_contract\":2}\n");
 
     let out = heph(&["--fields", "help"]);
     assert_eq!(out.status.code(), Some(0));
