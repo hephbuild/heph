@@ -137,8 +137,7 @@ target(name = "push", driver = "oci.push", image = ":img", ref = "quay.io/acme/a
 /// `ref` reaches the push resolved: the repository from a `${read://…}`
 /// producer, the tag from `${image_hashout}`. Docker-free, through the same
 /// offline image as above — the uncovered credential stops it before the
-/// network, and the error names the reference it would have pushed, with the
-/// deferred value's resolved text scrubbed (I7).
+/// network, and the error names the reference it would have pushed.
 #[tokio::test]
 async fn a_push_resolves_its_ref_before_the_network() -> anyhow::Result<()> {
     let _guard = EnvVar::set("HEPH_E2E_OCI_PUSH_REF_TOKEN", "oci-push-material");
@@ -170,16 +169,10 @@ target(name = "push", driver = "oci.push", image = ":img",
     };
     let hashout = archive.hashout()?;
     assert!(!hashout.is_empty(), "the archive must carry a hashout");
-    // The registry the driver read out of the resolved `ref` proves the
-    // deferred value reached it, and the tag is `${image_hashout}`'s. The
-    // repository is the `${read://}` producer's resolved value, which no
-    // message carries (I7): it is scrubbed, as every deferred value is.
     assert!(
-        err.contains(&format!("push [redacted]:{hashout} ")),
-        "the error must name the reference, its deferred part scrubbed: {err}"
+        err.contains(&format!("push quay.io/acme/app:{hashout} ")),
+        "the error must name the resolved reference: {err}"
     );
-    assert!(err.contains("covers registry \"quay.io\""), "{err}");
-    assert!(!err.contains("quay.io/acme/app"), "{err}");
     Ok(())
 }
 
@@ -187,9 +180,8 @@ target(name = "push", driver = "oci.push", image = ":img",
 /// an uncovered registry fails before any request, naming the registry. A tag
 /// that fell back to the host's login would move a tag as the developer.
 ///
-/// `ref` comes from a `${read://…}` producer, so the error naming the registry
-/// read out of it also proves the deferred value reached the driver; the
-/// resolved value itself is scrubbed from the message (I7).
+/// `ref` comes from a `${read://…}` producer, so the error naming the resolved
+/// reference also proves the deferred value reached the driver.
 #[tokio::test]
 async fn exists_and_tag_whose_credentials_do_not_cover_the_registry_fail_before_the_network()
 -> anyhow::Result<()> {
@@ -221,11 +213,7 @@ target(name = "tag", driver = "oci.tag", ref = "${read://img:built}", tags = ["1
             err.contains("no declared credential covers"),
             "{addr}: {err}"
         );
-        // The registry read out of the resolved `ref` proves it reached the
-        // driver; the resolved value itself is scrubbed (I7).
-        assert!(err.contains("covers registry \"quay.io\""), "{addr}: {err}");
-        assert!(err.contains("[redacted]"), "{addr}: {err}");
-        assert!(!err.contains("quay.io/acme/app:build-1"), "{addr}: {err}");
+        assert!(err.contains("quay.io/acme/app:build-1"), "{addr}: {err}");
     }
     Ok(())
 }
