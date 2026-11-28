@@ -1514,12 +1514,12 @@ impl RequestState {
     /// out. `None` for an id that is not a merged transitive's, or one whose
     /// declarer this request never merged.
     pub(crate) fn transitive_declarer(&self, origin_id: &str) -> Option<Addr> {
-        const PREFIX: &str = "_transitive_";
+        use crate::engine::expand::TRANSITIVE_PREFIX;
         let map = self.data.transitive_declarers.lock();
         origin_id
-            .rmatch_indices(PREFIX)
+            .rmatch_indices(TRANSITIVE_PREFIX)
             .filter_map(|(at, _)| {
-                let rest = origin_id.get(at + PREFIX.len()..)?;
+                let rest = origin_id.get(at + TRANSITIVE_PREFIX.len()..)?;
                 map.get(rest.split('_').next()?)
             })
             .next()

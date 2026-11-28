@@ -236,9 +236,10 @@ impl std::ops::Deref for ExpandedInputs {
 /// Nothing consumes the inputs that resolved as an input set: the expansion
 /// is an `Err`, so `link`, `hashin` and `hash_dep_count` never see them, and
 /// a partial set is never hashed, whichever input failed (hashed or not).
-/// Only `meta` reads them, to build the hashed ones before it fails with the
-/// errors, so a fault in one subtree does not keep its healthy siblings from
-/// running.
+/// Only `meta` reads them, to build the hashed inputs that resolved before it
+/// fails with the errors, so a fault in one subtree does not keep its healthy
+/// hashed siblings from running. Runtime-only siblings that resolved stay
+/// unbuilt.
 pub(crate) struct PartialExpansion {
     /// Each input that resolved, with the index in the declaring target's own
     /// input list of the input it came through (a group member's is its
@@ -573,35 +574,63 @@ impl Engine {
     }
 }
 
+/// What every merged transitive input's origin id starts with; see
+/// [`transitive_id`].
+pub(crate) const TRANSITIVE_PREFIX: &str = "_transitive_";
+
+/// The origin id the transitive declarations of a consumer's `i`th dep merge
+/// under, where `hash` is that dep's `addr.hash_str()`. `merge_sandbox`
+/// appends `_<kind>_<member id>` to it, nested once per group the input came
+/// through.
+///
+/// The format is frozen: the id reaches the consumer's def hash, so changing
+/// a byte of it moves the cache key of every target with a merged
+/// transitive. [`transitive_origin`] and `RequestState::transitive_declarer`
+/// parse it back.
+pub(crate) fn transitive_id(hash: &str, i: usize) -> String {
+    format!("{TRANSITIVE_PREFIX}{hash}_{i}")
+}
+
 /// The option a merged transitive input was declared under, from its origin
-/// id (`_transitive_<hash>_<i>_<kind>_<id>`, nested once per group it came
+/// id ([`transitive_id`] then `_<kind>_<id>`, nested once per group it came
 /// through): `transitive.deps` / `transitive.tools` for the innermost
 /// declaration. `None` for an id that is not a merged transitive's.
 fn transitive_origin(origin_id: &str) -> Option<String> {
-    const PREFIX: &str = "_transitive_";
-    let at = origin_id.rfind(PREFIX)?;
-    let rest = origin_id.get(at + PREFIX.len()..)?;
+    let at = origin_id.rfind(TRANSITIVE_PREFIX)?;
+    let rest = origin_id.get(at + TRANSITIVE_PREFIX.len()..)?;
     let inner = rest.splitn(4, '_').nth(3)?;
     Some(format!("transitive.{}", declared_origin(inner)))
 }
 
 #[cfg(test)]
 mod transitive_origin_tests {
-    use super::transitive_origin;
+    use super::{transitive_id, transitive_origin};
 
     #[test]
     fn transitive_origin_names_innermost_option() {
-        assert_eq!(
-            transitive_origin("_transitive_ab12_0_dep_dep||0").as_deref(),
-            Some("transitive.deps")
-        );
+        // The ids as the producer writes them (`merge_sandbox` appends
+        // `_<kind>_<member id>`).
+        let dep = format!("{}_dep_dep||0", transitive_id("ab12", 0));
+        assert_eq!(transitive_origin(&dep).as_deref(), Some("transitive.deps"));
         // Through a group: the member's own declaration.
+        let nested = format!(
+            "{}_dep_{}_tool_tool||3",
+            transitive_id("99", 1),
+            transitive_id("ab12", 0)
+        );
         assert_eq!(
-            transitive_origin("_transitive_99_1_dep__transitive_ab12_0_tool_tool||3").as_deref(),
+            transitive_origin(&nested).as_deref(),
             Some("transitive.tools")
         );
         assert_eq!(transitive_origin("dep||0"), None);
-        assert_eq!(transitive_origin("_transitive_ab12_0"), None);
+        assert_eq!(transitive_origin(&transitive_id("ab12", 0)), None);
+    }
+
+    /// The id reaches the def hash: a byte of change moves every consumer's
+    /// cache key.
+    #[test]
+    fn transitive_id_format_is_frozen() {
+        assert_eq!(transitive_id("ab12", 3), "_transitive_ab12_3");
     }
 }
 
