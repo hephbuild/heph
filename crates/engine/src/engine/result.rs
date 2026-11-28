@@ -2224,7 +2224,18 @@ fn classify_failure_fresh(
         } => return classify_each(rs, addr, members, culprit),
         FailureFate::Blame { culprit, entry } => (culprit, entry.clone()),
     };
+    record_culprit(rs, addr, e, culprit, entry)
+}
 
+/// Records `e` against `culprit`, entered through `entry`, and returns the
+/// marker naming it, with whether this call's record won the claim.
+fn record_culprit(
+    rs: &RequestState,
+    addr: &Addr,
+    e: anyhow::Error,
+    culprit: Culprit,
+    entry: Addr,
+) -> (anyhow::Error, bool) {
     // A culprit's failure — this target's own, an input whose def failed, a
     // declarer naming a missing dep, a BUILD file that did not evaluate:
     // record the rich diagnostic once against the culprit (first-writer-wins)
@@ -2283,37 +2294,41 @@ fn classify_failure_fresh(
     (UpstreamFailed { root: culprit }.into(), fresh)
 }
 
-/// [`FailureFate::Each`]: each culprit's members recorded against it (one
-/// bare, several as an aggregate), through the same chokepoint as any other
-/// failure, and a marker naming the lead `culprit` returned. Fresh when the
-/// lead's record was this call's.
+/// [`FailureFate::Each`]: each culprit's members recorded against it, and a
+/// marker naming the lead `culprit` returned. Fresh when the lead's record
+/// was this call's.
+///
+/// A culprit with one member goes back through the chokepoint, which sees a
+/// strictly smaller error (a member, never this aggregate). One with several
+/// is recorded directly against the culprit, through its first member's
+/// entry, as an aggregate: classifying that aggregate again would ask
+/// [`failure_fate`] the question this call is answering.
 fn classify_each(
     rs: &RequestState,
     addr: &Addr,
     members: &MultiError,
     lead: Culprit,
 ) -> (anyhow::Error, bool) {
-    let mut by_culprit: Vec<(Culprit, Vec<anyhow::Error>)> = Vec::new();
+    let mut by_culprit: Vec<(Culprit, Addr, Vec<anyhow::Error>)> = Vec::new();
     for inner in unrecorded(members) {
         let Some(owned) = hcore::hmemoizer::share(inner) else {
             continue;
         };
-        let (culprit, _) = blame(addr, inner);
-        match by_culprit.iter_mut().find(|(c, _)| *c == culprit) {
-            Some((_, errs)) => errs.push(owned),
-            None => by_culprit.push((culprit, vec![owned])),
+        let (culprit, entry) = blame(addr, inner);
+        match by_culprit.iter_mut().find(|(c, _, _)| *c == culprit) {
+            Some((_, _, errs)) => errs.push(owned),
+            None => by_culprit.push((culprit, entry, vec![owned])),
         }
     }
     let mut fresh = false;
-    for (culprit, mut errs) in by_culprit {
-        let e = match errs.pop() {
-            Some(sole) if errs.is_empty() => sole,
+    for (culprit, entry, mut errs) in by_culprit {
+        let recorded = match errs.pop() {
+            Some(sole) if errs.is_empty() => classify_failure_fresh(rs, addr, sole).1,
             last => {
                 errs.extend(last);
-                MultiError(errs).into()
+                record_culprit(rs, addr, MultiError(errs).into(), culprit.clone(), entry).1
             }
         };
-        let (_, recorded) = classify_failure_fresh(rs, addr, e);
         if culprit == lead {
             fresh = recorded;
         }
@@ -2721,11 +2736,15 @@ fn failure_fate<'a>(addr: &Addr, e: &'a anyhow::Error) -> FailureFate<'a> {
         }
         // Unrecorded causes (an input's def failing in `link`/`meta`, which
         // never passes through its `result_addr`): when every one of them
-        // blames the same culprit, that culprit; otherwise the aggregation
-        // is recorded against this target, so no broken input is lost.
+        // blames the same culprit, that culprit, entered through the first
+        // member's entry; otherwise the aggregation is recorded against this
+        // target, so no broken input is lost. Culprits alone are compared:
+        // one broken file reached through two of its targets is one culprit
+        // with two entries, and comparing entries too sent it to `Each`,
+        // whose regrouping met the same aggregate again.
         let mut blamed = unrecorded(multi).map(|inner| blame(addr, inner));
         if let Some(first) = blamed.next()
-            && blamed.all(|other| other == first)
+            && blamed.all(|(culprit, _)| culprit == first.0)
         {
             let (culprit, entry) = first;
             return FailureFate::Blame { culprit, entry };
@@ -3002,6 +3021,28 @@ mod failure_fate_tests {
         let (c, entry) = blamed("//d:t", &e);
         assert_eq!(c, Culprit::File(Arc::from("d/BUILD")), "{e:#}");
         assert_eq!(entry, a("//d:t"));
+    }
+
+    /// One broken file reached through two of its targets, shared or not:
+    /// one culprit, entered through the first member, never `Each` (whose
+    /// regrouping of the two met this aggregate again, without end).
+    #[test]
+    fn failure_fate_one_file_two_entries_blames_the_file() {
+        for share in [false, true] {
+            let member = |input: &str, declarer: &str| {
+                let e = at_input(broken_file("e/BUILD"), input, declarer, "deps");
+                if share { shared(e).0 } else { e }
+            };
+            let e: anyhow::Error =
+                MultiError(vec![member("//e:a", "//d:x"), member("//e:b", "//d:y")]).into();
+            let (c, entry) = blamed("//top:t", &e);
+            assert_eq!(
+                c,
+                Culprit::File(Arc::from("e/BUILD")),
+                "shared {share}: {e:#}"
+            );
+            assert_eq!(entry, a("//e:a"), "shared {share}");
+        }
     }
 }
 
