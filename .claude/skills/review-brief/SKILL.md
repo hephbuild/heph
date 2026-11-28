@@ -137,8 +137,17 @@ written in `why`. A point with no code to anchor goes in `why` of the nearest ca
 none, in your summary, for the decider's `not_in_code`. Propose a candidate when the answer is yes or maybe, with a
 reason from this closed list: <the slugs from the Reasons table below>, and your tier call
 (scrutinize, glance, ai-cleared). Floors in the index are minimums.
+The user reads a card without having read this code, and context outweighs a short diff. For
+each scrutinize or glance candidate, propose where you can: `context` (what the code is for,
+what reaches it, what a heph user, BUILD author or plugin author would see), up to 3 `used_by`
+sites at the head that call or read the changed code (`git grep <name> <head>`), each a short
+range with a `note`, `examples` taken from the real code or a test (an actual error string, CLI
+output or BUILD snippet, labelled such as "Before" / "After"), and a Mermaid `diagram` when the
+change is about a flow, an ordering, a boundary or data crossing components. Keep `ranges` to
+the lines that carry the change, not a whole function.
 Write <SP>/scouts/<agent>.json, format heph-review-brief-scout/1 (fields: format, agent, layer,
-candidates [{claim, reason, tier, why, ranges}], reads [ranges you read]). See
+candidates [{claim, reason, tier, why, ranges, context, examples, diagram, used_by}], reads
+[ranges you read]). See
 .claude/skills/review-brief/FORMAT.md. `agent` is "scout-<PR>[-<part>]"; `layer` is <PR>.
 Report every range you read. Your reported reads must cover all your live ranges.
 Return the path and a three-line summary. No verdict on the stack.
@@ -187,12 +196,31 @@ Its brief states:
 - **Every weakening id** in the index needs a Scrutinize card that lists it in `weakenings`.
 - **Every board item** is carried by a card with `surfaced: <id>`, at no lower tier than its
   `tier`. Its board notes go in `board` with their status.
-- A Scrutinize question is answerable with yes, no or a choice, and names what could be wrong in
-  the lines shown and what the spec says they should do. Not "please review".
+- **Write every card for a reviewer who has not read this code.** Context outweighs a short
+  diff. Every Scrutinize card answers three things: what is this for, what reaches it, and what
+  would I see. Its `title` (at most 90 characters) says what changed in plain words; its
+  `context` (at most 600) says what the code is for, what calls it or which command or stage
+  reaches it, and how it shows up to a heph user, a BUILD author or a plugin author.
+- **One decision per question** (at most 300 characters), and `options` (2 to 4) spell out what
+  each answer costs: each `choice` (at most 80) with its `impact` (at most 300), who is affected
+  and what changes, breaks or stays deferred. The question names what could be wrong in the
+  lines shown. Not "please review".
+- **No bare spec or decision ids** (U28, P20, D4) in `title`, `question` or `options`: render
+  refuses them. Say what the decision says ("values in messages are JSON, not Starlark
+  literals"). `context` may name an id beside its meaning.
+- **Show the impact.** Add `examples` (up to 3, each at most 30 lines, labelled such as
+  "Before" / "After" or "What a user sees") taken from the real code or a test: an actual error
+  string, CLI output or BUILD snippet, not an invented one. Draw a Mermaid `diagram` (at most 40
+  lines; `flowchart`, `graph`, `sequenceDiagram` or `stateDiagram-v2`; no `<`, links or `%%{`)
+  when the decision is about a flow, an ordering, a boundary or data crossing components. Add up
+  to 3 `used_by` sites from the layer's head that use the changed code, each with a `note`; the
+  scouts propose them.
+- **Keep `ranges` to the lines that carry the decision**, not a whole 130-line function. Context
+  and `used_by` give the surroundings.
 - `tests` names tests that pin the card's behavior; each must exist at the layer's head.
 - `proposed_by` is the board agent, `scout:<agent>`, or `decider`. Its own reads go in `reads`
   with `agent: "decider"`.
-- Output: `$SP/triage.json`, format `heph-review-brief-triage/1` (FORMAT.md). Return the path.
+- Output: `$SP/triage.json`, format `heph-review-brief-triage/2` (FORMAT.md). Return the path.
 
 ## 6. Stack review
 
@@ -256,8 +284,8 @@ jq '[.layers[] | {pr, fingerprint}]' "$SP/index/index.json" > "$ST/fingerprints.
 
 | Tier | What it holds | What the page shows | Who decides |
 | --- | --- | --- | --- |
-| **Scrutinize** | A change that needs the user's judgment | A card: claim, reason, question, diff, commits, pinning tests, what the board said | The decider, for a reason from the list below |
-| **Glance** | A change in protected code, or a notable one, the decider is confident in | One sentence and a collapsed diff | The decider. Protected paths and tripwires cannot go lower |
+| **Scrutinize** | A change that needs the user's judgment | A card, top to bottom: title, question, options with their impact, context, diagram, examples, diff, where it's used, why it's flagged, then commits, tests, board and other layers | The decider, for a reason from the list below |
+| **Glance** | A change in protected code, or a notable one, the decider is confident in | Its title (or claim) and a collapsed diff | The decider. Protected paths and tripwires cannot go lower |
 | **AI-cleared** | The rest of the live code | One line per group, the diff one click away | The decider, then the stack reviewer |
 | **Counted** | Tests, moved blocks, renames, docs, lockfiles, generated code, lines a higher layer replaces | File names and line counts | The program |
 

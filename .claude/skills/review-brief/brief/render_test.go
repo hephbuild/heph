@@ -47,9 +47,18 @@ func (b *basic) triage(items ...Item) (*Triage, []Scout) {
 func item(id string, tier Tier, rs ...RangeRef) Item {
 	it := Item{ID: id, Layer: 1, Tier: tier, Claim: "claim " + id, Ranges: rs, ProposedBy: "scout"}
 	if tier == TierScrutinize {
-		it.Reason, it.Question = "engine-flow", "Is this right?"
+		it.Reason = "engine-flow"
+		cardText(&it)
 	}
 	return it
+}
+
+// cardText gives an item what a Scrutinize card must say.
+func cardText(it *Item) {
+	it.Title = "Title of " + it.ID
+	it.Context = "What " + it.ID + " is for, what reaches it and what a user sees."
+	it.Question = "Is this right?"
+	it.Options = []Option{{Choice: "Yes", Impact: "It ships as is."}, {Choice: "No", Impact: "It is reworked first."}}
 }
 
 func Test_every_changed_line_has_one_tier(t *testing.T) {
@@ -266,10 +275,20 @@ func Test_audit_cannot_demote(t *testing.T) {
 	tr, scouts = b.triage(item("util", TierAICleared, b.utilAdded), item("core", TierGlance, b.coreAdded))
 	audit.Promotions = []Promotion{{Item: "util", Tier: TierScrutinize, Note: "not willing to approve",
 		Reason: "low-confidence", Question: "Does first() need a caller?"}}
+	_, err = render(t, b.st, RenderInput{Triage: tr, Scouts: scouts, Audit: audit})
+	wantRefusal(t, err, `item "util": a Scrutinize card needs a title`)
+	wantRefusal(t, err, `item "util": a Scrutinize card needs context`)
+	wantRefusal(t, err, `item "util": a Scrutinize card needs options`)
+
+	tr, scouts = b.triage(item("util", TierAICleared, b.utilAdded), item("core", TierGlance, b.coreAdded))
+	p := &audit.Promotions[0]
+	p.Title, p.Context = "first() is added with no caller", "A helper for the scheduler; nothing calls it yet."
+	p.Options = []Option{{Choice: "Keep it", Impact: "Dead until the next PR."}, {Choice: "Drop it", Impact: "The next PR adds it."}}
 	out := mustRender(t, b.st, RenderInput{Triage: tr, Scouts: scouts, Audit: audit})
 	for _, c := range readLayer(t, out, 1).Cards {
-		if c.ID == "util" && (c.Tier != TierScrutinize || !strings.Contains(c.Provenance.RaisedBy, "stack-review")) {
-			t.Fatalf("promoted card: tier %s raised by %q", c.Tier, c.Provenance.RaisedBy)
+		if c.ID == "util" && (c.Tier != TierScrutinize || !strings.Contains(c.Provenance.RaisedBy, "stack-review") ||
+			c.Title != p.Title || c.Context != p.Context || len(c.Options) != 2) {
+			t.Fatalf("promoted card: tier %s raised by %q, title %q, context %q, options %v", c.Tier, c.Provenance.RaisedBy, c.Title, c.Context, c.Options)
 		}
 	}
 }
@@ -478,7 +497,8 @@ func Test_assessment_must_cite_code(t *testing.T) {
 func Test_large_card_links_instead_of_embedding(t *testing.T) {
 	_, st := manyLines(t, embedLimit+1)
 	tr, scouts := coverAll(st)
-	tr.Items[0].Tier, tr.Items[0].Reason, tr.Items[0].Question = TierScrutinize, "engine-flow", "?"
+	tr.Items[0].Tier, tr.Items[0].Reason = TierScrutinize, "engine-flow"
+	cardText(&tr.Items[0])
 	out := mustRender(t, st, RenderInput{Triage: tr, Scouts: scouts})
 	c := readLayer(t, out, 1).Cards[0]
 	if c.Display != "links" || c.Ranges[0].Diff || readDiffs(t, out, 1).has(c.Ranges[0].Hash) {

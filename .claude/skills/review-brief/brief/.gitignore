@@ -1,0 +1,2 @@
+# `go build` here writes the program under the module's name.
+/reviewbrief

@@ -9,7 +9,7 @@ import (
 // none of them carries a diff, a SHA or a line count (I2).
 
 const (
-	triageFormat  = "heph-review-brief-triage/1"
+	triageFormat  = "heph-review-brief-triage/2"
 	auditFormat   = "heph-review-brief-audit/1"
 	surfaceFormat = "heph-review-brief-surface/1"
 	scoutFormat   = "heph-review-brief-scout/1"
@@ -53,15 +53,24 @@ type BoardNote struct {
 }
 
 // Item is one card or group: a tier, a reason, a claim and the ranges it is
-// about (I12).
+// about (I12). Title, context, example and used_by are written for a
+// reviewer who has not read the code: what changed, what it is for, what
+// reaches it and how it shows up.
 type Item struct {
-	ID         string      `json:"id"`
-	Layer      int         `json:"layer"`
-	Tier       Tier        `json:"tier"`
-	Reason     string      `json:"reason,omitempty"`
-	Claim      string      `json:"claim"`
-	Question   string      `json:"question,omitempty"`
-	Ranges     []RangeRef  `json:"ranges"`
+	ID       string     `json:"id"`
+	Layer    int        `json:"layer"`
+	Tier     Tier       `json:"tier"`
+	Reason   string     `json:"reason,omitempty"`
+	Title    string     `json:"title,omitempty"`
+	Context  string     `json:"context,omitempty"`
+	Claim    string     `json:"claim"`
+	Question string     `json:"question,omitempty"`
+	Options  []Option   `json:"options,omitempty"` // what each answer to the question costs
+	Diagram  string     `json:"diagram,omitempty"` // Mermaid source, from a small allowed subset
+	Examples []Example  `json:"examples,omitempty"`
+	Ranges   []RangeRef `json:"ranges"`
+	UsedBy   []RangeRef `json:"used_by,omitempty"` // sites at the layer's head that use the changed code
+
 	StartFrom  []string    `json:"start_from,omitempty"` // for a whole new file: the functions to read first
 	Tests      []TestRef   `json:"tests,omitempty"`
 	Board      []BoardNote `json:"board,omitempty"`
@@ -70,6 +79,19 @@ type Item struct {
 	ProposedBy string      `json:"proposed_by"`
 	TieredBy   string      `json:"tiered_by,omitempty"`
 	RaisedBy   string      `json:"raised_by,omitempty"`
+}
+
+// Option is one answer to a card's question and what follows from it.
+type Option struct {
+	Choice string `json:"choice"`
+	Impact string `json:"impact"`
+}
+
+// Example is a concrete picture of how a change shows up: an error message,
+// CLI output, a BUILD snippet, or one side of a before/after.
+type Example struct {
+	Label string `json:"label"`
+	Text  string `json:"text"`
 }
 
 // Read is the ranges an agent reports it read.
@@ -106,14 +128,17 @@ type LayerRef struct {
 }
 
 // Promotion raises an item's tier. A promotion can never lower one (I4).
-// One that raises an item to Scrutinize supplies the reason and question
-// the card needs when the item had none.
+// One that raises an item to Scrutinize supplies what the card needs and the
+// item lacks: reason, title, context, question and options.
 type Promotion struct {
-	Item     string `json:"item"`
-	Tier     Tier   `json:"tier"`
-	Note     string `json:"note"`
-	Reason   string `json:"reason,omitempty"`
-	Question string `json:"question,omitempty"`
+	Item     string   `json:"item"`
+	Tier     Tier     `json:"tier"`
+	Note     string   `json:"note"`
+	Reason   string   `json:"reason,omitempty"`
+	Title    string   `json:"title,omitempty"`
+	Context  string   `json:"context,omitempty"`
+	Question string   `json:"question,omitempty"`
+	Options  []Option `json:"options,omitempty"`
 }
 
 // Confirmation is the stack reviewer approving a layer's AI-cleared tier.
@@ -153,12 +178,18 @@ type Surface struct {
 }
 
 // ScoutCandidate is a change a scout proposes the decider look at.
+// Its context, examples, diagram and used_by are proposals for the decider's
+// card; render checks them only once the decider has written them there.
 type ScoutCandidate struct {
-	Claim  string     `json:"claim"`
-	Reason string     `json:"reason,omitempty"`
-	Tier   Tier       `json:"tier"`
-	Why    string     `json:"why,omitempty"`
-	Ranges []RangeRef `json:"ranges"`
+	Claim    string     `json:"claim"`
+	Reason   string     `json:"reason,omitempty"`
+	Tier     Tier       `json:"tier"`
+	Why      string     `json:"why,omitempty"`
+	Context  string     `json:"context,omitempty"`
+	Examples []Example  `json:"examples,omitempty"`
+	Diagram  string     `json:"diagram,omitempty"`
+	Ranges   []RangeRef `json:"ranges"`
+	UsedBy   []RangeRef `json:"used_by,omitempty"`
 }
 
 // Scout is one scout's answer for (part of) one layer.
@@ -284,6 +315,7 @@ func (st *Stack) checkItem(it *Item, ref *Refusals) {
 			ref.add("%s: a Scrutinize card needs a question", where)
 		}
 	}
+	st.checkCard(d, it, where, ref)
 	if len(it.Ranges) == 0 {
 		ref.add("%s: no code range: every card is rooted in code (I12); a point with no code goes in not_in_code", where)
 	}
@@ -334,8 +366,17 @@ func Merge(t *Triage, a *Audit, ref *Refusals) {
 			if it.Reason == "" {
 				it.Reason = p.Reason
 			}
+			if it.Title == "" {
+				it.Title = p.Title
+			}
+			if it.Context == "" {
+				it.Context = p.Context
+			}
 			if it.Question == "" {
 				it.Question = p.Question
+			}
+			if len(it.Options) == 0 {
+				it.Options = p.Options
 			}
 		}
 	}

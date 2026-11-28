@@ -11,6 +11,7 @@
   --t-counted: #a9b0bc; --t-untriaged: #a21caf;
   --add-bg: #e7f5ec; --add-fg: #14532d; --del-bg: #fbeaea; --del-fg: #7f1d1d; --gap: #eef0f4;
   --warn-bg: #fff4e0; --warn-fg: #7a4a00; --err-bg: #fdecec; --err-fg: #8b1c1c;
+  --callout-bg: #fdf1ea; --hit-bg: #e8eefb; --pre-bg: #f1f3f6;
   --sans: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
   --mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
 }
@@ -20,20 +21,22 @@
   --t-scrutinize: #f07a3e; --t-glance: #e0a93b; --t-deep: #3fb68f; --t-scout: #2e6f5b;
   --t-counted: #4a5262; --t-untriaged: #d55be6;
   --add-bg: #13301f; --add-fg: #b7efc9; --del-bg: #3a1717; --del-fg: #f6c4c4; --gap: #20252f;
-  --warn-bg: #3a2a0c; --warn-fg: #f7d79a; --err-bg: #3d1515; --err-fg: #f8b4b4; color-scheme: dark } }
+  --warn-bg: #3a2a0c; --warn-fg: #f7d79a; --err-bg: #3d1515; --err-fg: #f8b4b4;
+  --callout-bg: #2a1d15; --hit-bg: #1d2a45; --pre-bg: #151920; color-scheme: dark } }
 :root[data-theme="dark"] {
   --bg: #12151b; --surface: #1a1e26; --fg: #e4e7ee; --muted: #9aa3b2; --line: #2c323d;
   --accent: #7ea6ff;
   --t-scrutinize: #f07a3e; --t-glance: #e0a93b; --t-deep: #3fb68f; --t-scout: #2e6f5b;
   --t-counted: #4a5262; --t-untriaged: #d55be6;
   --add-bg: #13301f; --add-fg: #b7efc9; --del-bg: #3a1717; --del-fg: #f6c4c4; --gap: #20252f;
-  --warn-bg: #3a2a0c; --warn-fg: #f7d79a; --err-bg: #3d1515; --err-fg: #f8b4b4; color-scheme: dark }
+  --warn-bg: #3a2a0c; --warn-fg: #f7d79a; --err-bg: #3d1515; --err-fg: #f8b4b4;
+  --callout-bg: #2a1d15; --hit-bg: #1d2a45; --pre-bg: #151920; color-scheme: dark }
 
 body { background: var(--bg); color: var(--fg); font: 15px/1.55 var(--sans);
   padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
 main { max-width: 64rem; margin: 0 auto; padding-block: 2rem 4rem; display: grid; gap: 2rem; }
 main > * { min-width: 0; }
-h1, h2, h3 { text-wrap: balance; margin: 0; line-height: 1.25; }
+h1, h2, h3, h4 { text-wrap: balance; margin: 0; line-height: 1.25; }
 h1 { font-size: 1.6rem; font-weight: 600; }
 h2 { font-size: 1.2rem; font-weight: 600; }
 h3 { font-size: 1rem; font-weight: 600; }
@@ -81,11 +84,32 @@ details.layer { display: grid; gap: 1rem; border-top: 1px solid var(--line); pad
 details.layer[open] > summary { margin-bottom: 1rem; }
 .layer-body { display: grid; gap: 1.5rem; }
 
-.card { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 1rem 1.25rem; display: grid; gap: 0.75rem; min-width: 0; }
+/* A card reads top to bottom: what changed, the decision and what each answer
+   costs, what the code is for, then the evidence, then the small print. */
+.card { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 1.1rem 1.25rem; display: grid; gap: 0.9rem; min-width: 0; }
 .card[data-state="fine"] { opacity: 0.72; }
 .card[data-state="concern"] { border-color: var(--t-scrutinize); }
-.card .claim { font-weight: 600; }
-.card .question { border-left: 3px solid var(--t-scrutinize); padding-left: 0.75rem; }
+.card-title { font-size: 1.1rem; font-weight: 600; line-height: 1.35; max-width: 70ch; }
+.prose { max-width: 70ch; line-height: 1.65; overflow-wrap: anywhere; }
+.decision { background: var(--callout-bg); border-left: 3px solid var(--t-scrutinize); border-radius: 0 6px 6px 0; padding: 0.7rem 0.9rem; display: grid; gap: 0.6rem; }
+.decision .question { font-weight: 500; max-width: 70ch; line-height: 1.55; }
+.options { list-style: none; margin: 0; padding: 0; display: grid; }
+.options li { display: grid; grid-template-columns: minmax(7rem, 15rem) 1fr; gap: 0.15rem 1rem; padding: 0.45rem 0; border-top: 1px solid var(--line); font-size: 0.9rem; line-height: 1.5; }
+.options .choice { font-weight: 600; }
+.options .impact { color: var(--muted); max-width: 62ch; }
+@media (max-width: 560px) { .options li { grid-template-columns: 1fr; } }
+.examples { display: grid; gap: 0.6rem; }
+figure { margin: 0; display: grid; gap: 0.3rem; min-width: 0; }
+pre.text { margin: 0; padding: 0.6rem 0.75rem; background: var(--pre-bg); border: 1px solid var(--line); border-radius: 6px; font: 0.8rem/1.5 var(--mono); overflow-x: auto; white-space: pre; }
+.diagram svg { max-width: 100%; height: auto; }
+.diagram { overflow-x: auto; }
+details.uses > summary { cursor: pointer; font-weight: 500; }
+details.uses[open] > summary { margin-bottom: 0.6rem; }
+details.uses .stack { gap: 0.6rem; }
+.diff tr.hit td { background: var(--hit-bg); }
+.why { display: grid; gap: 0.25rem; }
+.card-foot { border-top: 1px solid var(--line); padding-top: 0.7rem; display: grid; gap: 0.6rem; font-size: 0.8rem; }
+.card-foot .meta { font-size: inherit; }
 .chip { display: inline-block; font-size: 0.74rem; padding: 0.05rem 0.5rem; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); white-space: nowrap; }
 .chip.reason { color: var(--t-scrutinize); border-color: currentColor; }
 .chip.reopened { color: var(--err-fg); background: var(--err-bg); border-color: transparent; }
@@ -130,7 +154,10 @@ textarea#review-text { width: 100%; min-height: 8rem; font: 0.8rem var(--mono); 
 // Draws a review brief from the data files `brief render` wrote beside it
 // (FORMAT.md). Every check lives in the Go program; this script only draws,
 // and verifies each file against manifest.json before drawing from it. All
-// data is inserted as text, never as HTML.
+// data is inserted as text, never as HTML. The one exception is a card's
+// diagram: mermaid, loaded at a pinned version with an SRI hash and run at
+// its strict security level, draws the SVG that is adopted (FORMAT.md says
+// why). Without mermaid the diagram's source is shown as text.
 (function () {
   const app = document.getElementById("app");
   const TIERS = [
@@ -344,6 +371,83 @@ textarea#review-text { width: 100%; min-height: 8rem; font: 0.8rem var(--mono); 
     return box;
   }
 
+  // "Where it's used": each site cut from the layer's head, with the cited
+  // lines marked. The snippets are in the diffs file, loaded with the diffs.
+  function usesOf(stack, l, manifest, c) {
+    if (!c.used_by || !c.used_by.length) return null;
+    const blocks = c.used_by.map((u) => {
+      const box = el("div", { class: "diff" },
+        el("div", { class: "path" },
+          el("span", {}, link(u.link, u.path + ":" + u.start + (u.end !== u.start ? "-" + u.end : "")),
+            u.symbol ? el("span", { class: "muted" }, " in ", el("code", { text: u.symbol })) : null),
+          el("span", { text: u.note })));
+      const body = el("div", { class: "muted", style: "padding:0.4rem 0.6rem", text: "Loading…" });
+      box.append(body);
+      diffsFor(stack, l, manifest).then((d) => {
+        const lines = d.snippets && d.snippets[u.key];
+        if (!lines) { body.textContent = "This site's lines are missing from the data file."; return; }
+        body.replaceWith(el("table", {}, el("tbody", {}, lines.map(([k, , n, t]) =>
+          el("tr", { class: k === ">" ? "hit" : "" }, el("td", { class: "n", text: n }), el("td", { text: t }))))));
+      }, (e) => { body.className = "banner err"; body.textContent = "This site cannot be shown: " + e.message + "."; });
+      return box;
+    });
+    return el("details", { class: "uses" },
+      el("summary", {}, "Where it's used ", el("span", { class: "muted", text: "(" + c.used_by.length + (c.used_by.length === 1 ? " site)" : " sites)") })),
+      el("div", { class: "stack" }, blocks));
+  }
+
+  function examplesOf(c) {
+    if (!c.examples || !c.examples.length) return null;
+    return el("div", { class: "examples" }, c.examples.map((x) =>
+      el("figure", { class: "example" }, el("figcaption", { class: "label", text: x.label }), el("pre", { class: "text", text: x.text }))));
+  }
+
+  // Diagrams: mermaid is fetched once, the first time a drawn card has a
+  // diagram. Until it draws, and whenever it cannot, the source is the
+  // diagram, as text.
+  const MERMAID_SRC = "https://cdnjs.cloudflare.com/ajax/libs/mermaid/11.12.0/mermaid.min.js";
+  const MERMAID_SRI = "sha512-5TKaYvhenABhlGIKSxAWLFJBZCSQw7HTV7aL1dJcBokM/+3PNtfgJFlv8E6Us/B1VMlQ4u8sPzjudL9TEQ06ww==";
+  let mermaidLoad = null;
+  function loadMermaid() {
+    if (!mermaidLoad) mermaidLoad = new Promise((resolve, reject) => {
+      const s = document.createElement("script");
+      s.src = MERMAID_SRC; s.integrity = MERMAID_SRI; s.crossOrigin = "anonymous"; s.referrerPolicy = "no-referrer";
+      s.onload = () => {
+        const m = window.mermaid;
+        if (!m || !m.render) { reject(new Error("mermaid did not load")); return; }
+        const theme = document.documentElement.dataset.theme;
+        const dark = theme ? theme === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
+        m.initialize({ startOnLoad: false, securityLevel: "strict", theme: dark ? "dark" : "neutral" });
+        resolve(m);
+      };
+      s.onerror = () => reject(new Error("mermaid did not load"));
+      document.head.append(s);
+    });
+    return mermaidLoad;
+  }
+  let diagramSeq = 0;
+  function diagramOf(c) {
+    if (!c.diagram) return null;
+    const note = el("figcaption", { class: "muted", style: "font-size:0.8rem", text: "Diagram source. It is drawn when the diagram renderer loads." });
+    const box = el("figure", { class: "diagram" }, el("pre", { class: "text", text: c.diagram }), note);
+    const id = "diagram-" + (++diagramSeq);
+    loadMermaid().then((m) => m.render(id, c.diagram)).then(({ svg }) => {
+      // mermaid's strict level sanitizes its SVG; this strips scripts and
+      // handlers again before the node is adopted, never assigned as HTML.
+      const node = new DOMParser().parseFromString(svg, "text/html").body.querySelector("svg");
+      if (!node) throw new Error("no svg");
+      for (const s of node.querySelectorAll("script")) s.remove();
+      for (const e of [node, ...node.querySelectorAll("*")]) {
+        for (const a of [...e.attributes]) if (/^on/i.test(a.name) || /javascript:/i.test(a.value)) e.removeAttribute(a.name);
+      }
+      box.replaceChildren(document.importNode(node, true));
+    }).catch(() => {
+      for (const stray of [document.getElementById(id), document.getElementById("d" + id)]) if (stray && !box.contains(stray)) stray.remove();
+      note.textContent = "Diagram source: the diagram renderer is unavailable or could not draw it.";
+    });
+    return box;
+  }
+
   function codeOf(stack, l, manifest, c) {
     if (c.display === "embed") return c.ranges.map((r) => diffBlock(stack, l, manifest, r));
     if (c.display === "file") {
@@ -404,44 +508,65 @@ textarea#review-text { width: 100%; min-height: 8rem; font: 0.8rem var(--mono); 
         onChange();
       },
     }));
-    const board = (c.board || []).map((b) => el("div", {}, el("strong", { text: b.agent + " (" + b.status + "): " }), b.said));
     add(card,
       el("div", { class: "row" },
         c.reason_title ? el("span", { class: "chip reason", text: c.reason_title }) : null,
         st.reopened ? el("span", { class: "chip reopened", text: "changed since you reviewed it" }) : null,
-        st.surroundings ? el("span", { class: "chip", text: "surroundings changed" }) : null,
-        el("span", { class: "muted", style: "font-size:0.8rem", text: provenance(c) })),
-      el("p", { class: "claim", text: c.claim }),
-      c.question ? el("p", { class: "question", text: c.question }) : null,
+        st.surroundings ? el("span", { class: "chip", text: "surroundings changed" }) : null),
+      el("h4", { class: "card-title", text: c.title || c.claim }),
+      c.question ? el("div", { class: "decision" },
+        el("p", { class: "question", text: c.question }),
+        c.options && c.options.length ? el("ul", { class: "options", "aria-label": "What each answer means" },
+          c.options.map((o) => el("li", {}, el("span", { class: "choice", text: o.choice }), el("span", { class: "impact", text: o.impact })))) : null) : null,
+      c.context ? el("p", { class: "context prose", text: c.context }) : null,
+      diagramOf(c),
+      examplesOf(c),
       el("div", { class: "stack" }, codeOf(stack, l, manifest, c)),
+      usesOf(stack, l, manifest, c),
+      c.title ? el("div", { class: "why" }, el("span", { class: "label", text: "Why it's flagged" }), el("p", { class: "prose", text: c.claim })) : null,
+      cardFoot(c),
+      el("div", { class: "states" }, buttons));
+    return card;
+  }
+
+  // The small print: every link names what it opens (a short SHA, a test,
+  // a PR and symbol), never a URL.
+  function cardFoot(c) {
+    const board = (c.board || []).map((b) => el("div", {}, el("strong", { text: b.agent + " (" + b.status + "): " }), b.said));
+    return el("div", { class: "card-foot" },
       el("dl", { class: "meta" },
         el("dt", { text: "Commits" }), el("dd", {}, commitsOf(c)),
-        el("dt", { text: "Tests" }), el("dd", {}, c.tests && c.tests.length ? c.tests.map((t, i) => [i ? ", " : "", link(t.link, t.name)]) : el("span", { class: "muted", text: "none named" })),
+        el("dt", { text: "Tests" }), el("dd", {}, c.tests && c.tests.length ? c.tests.map((t, i) => [i ? ", " : "", link(t.link, t.name, "mono")]) : el("span", { class: "muted", text: "none named" })),
         c.weakenings && c.weakenings.length ? [el("dt", { text: "Weakens" }), el("dd", {}, c.weakenings.map((w) => el("div", {}, el("code", { text: w }))))] : null,
         board.length ? [el("dt", { text: "Board" }), el("dd", {}, board)] : null,
         c.other_layers && c.other_layers.length ? [el("dt", { text: "Also in" }), el("dd", {}, c.other_layers.map((o, i) => [i ? ", " : "", link(o.link, "#" + o.pr + " " + o.symbol)]))] : null),
-      el("div", { class: "states" }, buttons));
-    return card;
+      el("span", { class: "muted", text: provenance(c) }));
   }
 
   function commitsOf(c) {
     const seen = new Map();
     for (const r of c.ranges) for (const m of r.commits || []) seen.set(m.sha, m);
     if (!seen.size) return el("span", { class: "muted", text: "none in the pinned range" });
-    return [...seen.values()].map((m) => el("div", {}, link(m.link, m.short), " ", m.subject || ""));
+    return [...seen.values()].map((m) => el("div", {}, link(m.link, m.short, "mono"), " ", m.subject || ""));
   }
 
   function drawItem(stack, l, manifest, c) {
     const d = el("details", { class: "item", id: "card-" + l.pr + "-" + c.id },
-      el("summary", {}, el("span", { text: c.claim }), el("span", { class: "muted num", text: " · " + fmt(c.changed) + " lines" })));
+      el("summary", {}, el("span", { text: c.title || c.claim }), el("span", { class: "muted num", text: " · " + fmt(c.changed) + " lines" })));
     let filled = false;
     d.addEventListener("toggle", () => {
       if (!d.open || filled) return;
       filled = true;
       d.append(el("div", { class: "stack" },
-        el("span", { class: "muted", style: "font-size:0.8rem", text: provenance(c) }),
+        c.title ? el("p", { class: "prose", text: c.claim }) : null,
+        c.context ? el("p", { class: "prose muted", text: c.context }) : null,
+        diagramOf(c),
+        examplesOf(c),
         codeOf(stack, l, manifest, c),
-        el("dl", { class: "meta" }, el("dt", { text: "Commits" }), el("dd", {}, commitsOf(c)))));
+        usesOf(stack, l, manifest, c),
+        el("div", { class: "card-foot" },
+          el("dl", { class: "meta" }, el("dt", { text: "Commits" }), el("dd", {}, commitsOf(c))),
+          el("span", { class: "muted", text: provenance(c) }))));
     });
     return d;
   }
@@ -512,7 +637,7 @@ textarea#review-text { width: 100%; min-height: 8rem; font: 0.8rem var(--mono); 
       for (const l of stack.layers) for (const c of layers[l.pr].cards) {
         if (cardState(stack, c).state !== "concern") continue;
         const r = c.ranges[0];
-        lines.push("- **#" + l.pr + " " + refText(r) + "**: " + c.claim + (c.question ? "\n  " + c.question : "") + "\n  " + r.link);
+        lines.push("- **#" + l.pr + " " + refText(r) + "**: " + (c.title || c.claim) + (c.question ? "\n  " + c.question : "") + "\n  " + r.link);
       }
       const text = lines.length ? "Concerns from the review brief:\n\n" + lines.join("\n") : "No card is marked as a concern.";
       out.value = text; out.hidden = false;

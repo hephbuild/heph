@@ -46,6 +46,17 @@ type PageRange struct {
 	Diff    bool         `json:"diff"` // its lines are in the layer's diffs file
 }
 
+// PageUse is a site that uses a card's code, cut from the layer's head.
+type PageUse struct {
+	Path   string `json:"path"`
+	Start  int    `json:"start"`
+	End    int    `json:"end"`
+	Note   string `json:"note"`
+	Symbol string `json:"symbol,omitempty"` // the function or type it is in
+	Link   string `json:"link"`             // the lines on GitHub at the pinned head
+	Key    string `json:"key"`              // its snippet in the diffs file
+}
+
 type PageTest struct {
 	Name string `json:"name"`
 	Link string `json:"link"`
@@ -68,11 +79,17 @@ type PageCard struct {
 	Tier        Tier        `json:"tier"`
 	Reason      string      `json:"reason,omitempty"`
 	ReasonTitle string      `json:"reason_title,omitempty"`
+	Title       string      `json:"title,omitempty"`
+	Context     string      `json:"context,omitempty"`
 	Claim       string      `json:"claim"`
 	Question    string      `json:"question,omitempty"`
+	Options     []Option    `json:"options,omitempty"`
+	Diagram     string      `json:"diagram,omitempty"`
+	Examples    []Example   `json:"examples,omitempty"`
 	Display     string      `json:"display"` // embed, links or file
 	Changed     int         `json:"changed"`
 	Ranges      []PageRange `json:"ranges"`
+	UsedBy      []PageUse   `json:"used_by,omitempty"`
 	StartFrom   []string    `json:"start_from,omitempty"`
 	Tests       []PageTest  `json:"tests,omitempty"`
 	Board       []BoardNote `json:"board,omitempty"`
@@ -112,9 +129,10 @@ type PageLayer struct {
 type DiffLine [4]any
 
 type PageDiffs struct {
-	Format string                `json:"format"`
-	PR     int                   `json:"pr"`
-	Ranges map[string][]DiffLine `json:"ranges"`
+	Format   string                `json:"format"`
+	PR       int                   `json:"pr"`
+	Ranges   map[string][]DiffLine `json:"ranges"`
+	Snippets map[string][]DiffLine `json:"snippets"` // PageUse key to its lines
 }
 
 type PageLayerHead struct {
@@ -305,7 +323,11 @@ func (st *Stack) Render(in RenderInput, pagePath, outDir string) error {
 				open = open || b.Status == "open" || b.Status == "overruled"
 			}
 			if c.Reason == "decision" || open {
-				ps.Decisions = append(ps.Decisions, PageDecision{Layer: d.PR, Card: c.ID, Text: c.Claim})
+				text := c.Title
+				if text == "" {
+					text = c.Claim
+				}
+				ps.Decisions = append(ps.Decisions, PageDecision{Layer: d.PR, Card: c.ID, Text: text})
 			}
 		}
 		ps.Layers = append(ps.Layers, PageLayerHead{Layer: d.Layer, File: name, DiffsFile: dname, Sums: pl.Sums, Cards: cards})
@@ -505,7 +527,7 @@ func (st *Stack) renderLayer(d *LayerData, t *Triage, a *Audit, untriaged []*CLi
 	if pl.Weakenings == nil {
 		pl.Weakenings = []Weakening{}
 	}
-	diffs := &PageDiffs{Format: pageFormat, PR: d.PR, Ranges: map[string][]DiffLine{}}
+	diffs := &PageDiffs{Format: pageFormat, PR: d.PR, Ranges: map[string][]DiffLine{}, Snippets: map[string][]DiffLine{}}
 	pl.Budget = BudgetFor(pl.Live)
 
 	// Ordinals for identical blocks, in path/line order so a rebase keeps them.
@@ -624,10 +646,20 @@ func (st *Stack) renderLayer(d *LayerData, t *Triage, a *Audit, untriaged []*CLi
 			}
 		}
 		title, _ := reasonTitle(it.Reason)
-		c := PageCard{ID: it.ID, Tier: it.Tier, Reason: it.Reason, ReasonTitle: title, Claim: it.Claim,
-			Question: it.Question, Display: display, Changed: changed, StartFrom: it.StartFrom,
+		c := PageCard{ID: it.ID, Tier: it.Tier, Reason: it.Reason, ReasonTitle: title, Title: it.Title, Context: it.Context,
+			Claim: it.Claim, Question: it.Question, Options: it.Options, Diagram: it.Diagram, Examples: it.Examples,
+			Display: display, Changed: changed, StartFrom: it.StartFrom,
 			Board: it.Board, Weakenings: it.Weakenings,
 			Provenance: Provenance{ProposedBy: it.ProposedBy, TieredBy: it.TieredBy, RaisedBy: it.RaisedBy}}
+		for _, u := range it.UsedBy {
+			src := st.git.Lines(d.Head, u.Path)
+			lines := snippet(src, u)
+			key := snippetKey(u.Path, lines)
+			diffs.Snippets[key] = lines
+			c.UsedBy = append(c.UsedBy, PageUse{Path: u.Path, Start: u.Start, End: u.End, Note: u.Note,
+				Symbol: enclosingSymbol(src, u.Start), Key: key,
+				Link: fmt.Sprintf("https://github.com/%s/blob/%s/%s#L%d-L%d", st.Pin.Repo, d.Head, u.Path, u.Start, u.End)})
+		}
 		floors := map[string]bool{}
 		others := map[PageOther]bool{}
 		for _, r := range it.Ranges {

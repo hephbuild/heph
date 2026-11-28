@@ -2,12 +2,16 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -51,8 +55,12 @@ func dumpDOM(t *testing.T, url string) string {
 	chrome := chromePath(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
+	// No host name resolves, so no test reaches the network: the fonts and
+	// mermaid fail at once, and the page must draw without them. The fake
+	// GitHub API is served at 127.0.0.1, which needs no resolving.
 	cmd := exec.CommandContext(ctx, chrome, "--headless=new", "--disable-gpu", "--no-sandbox",
 		"--no-first-run", "--no-default-browser-check", "--disable-extensions",
+		"--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1",
 		"--user-data-dir="+t.TempDir(), "--virtual-time-budget=10000", "--dump-dom", url)
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
@@ -74,6 +82,7 @@ func servedBrief(t *testing.T, api func(w http.ResponseWriter, head string)) (di
 	t.Helper()
 	f := newFixture(t)
 	f.write("src/a.rs", "fn a() {}\n")
+	f.write("src/use.rs", "fn caller() {\n    a();\n}\n\n#[test]\nfn pins_a() {}\n")
 	f.trunk(f.commit("base"))
 	f.write("src/a.rs", "fn a() {}\nconst S: &str = \"</script><b>bold</b>\";\n")
 	st := f.stack(ModeWhole, f.commit("layer"))
@@ -87,8 +96,17 @@ func servedBrief(t *testing.T, api func(w http.ResponseWriter, head string)) (di
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	tr, scouts := coverAll(st)
-	tr.Items[0].Tier, tr.Items[0].Reason = TierScrutinize, "security"
-	tr.Items[0].Claim, tr.Items[0].Question = hostile, hostile
+	it := &tr.Items[0]
+	it.Tier, it.Reason = TierScrutinize, "security"
+	cardText(it)
+	it.Title = "A string constant joins a()"
+	it.Claim, it.Question = hostile, hostile
+	it.Context = "Context for the constant. " + hostile
+	it.Options = []Option{{Choice: "Keep the constant", Impact: "Callers of a() see it."}, {Choice: "Drop it", Impact: hostile}}
+	it.Examples = []Example{{Label: "What a user sees", Text: "error: the constant is shown\n  at src/a.rs:2"}, {Label: "Before", Text: hostile}}
+	it.Diagram = "flowchart LR\n  caller --> a"
+	it.UsedBy = []RangeRef{{Path: "src/use.rs", Start: 2, End: 2, Note: "caller() calls a()"}}
+	it.Tests = []TestRef{{Name: "pins_a"}}
 	cited := LayerRef{Layer: 1, RangeRef: RangeRef{Path: "src/a.rs", Start: 2, End: 2}}
 	audit := &Audit{Format: auditFormat, Assessment: Assessment{Text: "Hangs together.", Refs: []LayerRef{cited, cited}}}
 	if err := st.Render(RenderInput{Triage: tr, Scouts: scouts, Audit: audit, FreshnessAPI: srv.URL + "/api/pulls/"}, pagePath(t), dir); err != nil {
@@ -98,6 +116,91 @@ func servedBrief(t *testing.T, api func(w http.ResponseWriter, head string)) (di
 }
 
 func apiDown(w http.ResponseWriter, _ string) { http.Error(w, "down", http.StatusInternalServerError) }
+
+// A Scrutinize card reads top to bottom, and its small print is links that
+// name what they open.
+func Test_card_reads_top_to_bottom(t *testing.T) {
+	_, url := servedBrief(t, apiDown)
+	dom := dumpDOM(t, url)
+	start := strings.Index(dom, `<article class="card"`)
+	end := strings.Index(dom, `</article>`)
+	if start < 0 || end < start {
+		t.Fatalf("no card on the page:\n%s", tail(dom))
+	}
+	card := dom[start:end]
+	at := 0
+	for _, want := range []string{
+		`class="card-title">A string constant joins a()</h4>`,
+		`class="question">&lt;img src=x`,
+		`<span class="choice">Keep the constant</span><span class="impact">Callers of a() see it.</span>`,
+		`class="context prose">Context for the constant.`,
+		`class="diagram"`,
+		`<figcaption class="label">What a user sees</figcaption><pre class="text">error: the constant is shown` + "\n  at src/a.rs:2</pre>",
+		`class="diff"`,
+		`<details class="uses">`,
+		`<tr class="hit"><td class="n">2</td><td>    a();</td></tr>`,
+		`Why it's flagged`,
+		`class="card-foot"`,
+	} {
+		i := strings.Index(card[at:], want)
+		if i < 0 {
+			t.Fatalf("after offset %d the card lacks %q:\n%s", at, want, card)
+		}
+		at += i + len(want)
+	}
+	if !regexp.MustCompile(`class="diagram"><pre class="text">flowchart LR\n  caller --&gt; a</pre>|class="diagram"><svg`).MatchString(card) {
+		t.Errorf("the diagram is neither its source as text nor an svg:\n%s", card)
+	}
+	for _, re := range []string{
+		`<a href="https://github.com/o/r/pull/1/commits/[0-9a-f]{40}"[^>]*>[0-9a-f]{9}</a>`,
+		`<a href="https://github.com/o/r/search\?q=pins_a&amp;type=code"[^>]*>pins_a</a>`,
+		`<a href="https://github.com/o/r/blob/[0-9a-f]{40}/src/use.rs#L2-L2"[^>]*>src/use.rs:2</a>`,
+	} {
+		if !regexp.MustCompile(re).MatchString(card) {
+			t.Errorf("the card has no link matching %s", re)
+		}
+	}
+	text := regexp.MustCompile(`(?s)<script\b.*?</script>|<style\b.*?</style>|<[^>]*>`).ReplaceAllString(dom, " ")
+	if strings.Contains(text, "https://") || strings.Contains(text, "[object ") {
+		t.Errorf("the page shows a URL or a stringified object as text")
+	}
+}
+
+// A diagram that reaches the page with markup in it (render refuses one, so
+// the test writes it into the data) is shown as text and runs nothing.
+func Test_hostile_diagram_is_text(t *testing.T) {
+	dir, url := servedBrief(t, apiDown)
+	p := filepath.Join(dir, "layer-1.json")
+	var pl PageLayer
+	b, _ := os.ReadFile(p)
+	if err := json.Unmarshal(b, &pl); err != nil {
+		t.Fatal(err)
+	}
+	pl.Cards[0].Diagram = "flowchart LR\n  A[\"" + hostile + "\"]"
+	b, _ = json.Marshal(pl)
+	if err := os.WriteFile(p, b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var m Manifest
+	mb, _ := os.ReadFile(filepath.Join(dir, "manifest.json"))
+	if err := json.Unmarshal(mb, &m); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(b)
+	m.Files["layer-1.json"] = hex.EncodeToString(sum[:])
+	mb, _ = json.MarshalIndent(m, "", "  ")
+	if err := os.WriteFile(filepath.Join(dir, "manifest.json"), mb, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dom := dumpDOM(t, url)
+	i := strings.Index(dom, `class="diagram"`)
+	if i < 0 || !strings.Contains(dom[i:], `<pre class="text">flowchart LR`+"\n"+`  A["&lt;img src=x onerror=`) {
+		t.Fatalf("the hostile diagram is not on the page as text:\n%s", tail(dom))
+	}
+	if strings.Contains(dom, "<title>pwned") || strings.Contains(dom, `<img src="x"`) {
+		t.Fatal("the diagram's markup ran")
+	}
+}
 
 func Test_page_draws_a_valid_brief(t *testing.T) {
 	_, url := servedBrief(t, func(w http.ResponseWriter, head string) {

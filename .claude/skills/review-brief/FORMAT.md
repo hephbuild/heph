@@ -50,13 +50,14 @@ side, runs past the file's end, or holds none of the layer's changed lines.
 
 ## The four inputs
 
-### triage.json: `heph-review-brief-triage/1`
+### triage.json: `heph-review-brief-triage/2`
 
-The decider's answer.
+The decider's answer. Version 2 added the card text a reviewer who has not read the code needs:
+`title`, `context`, `options`, `examples`, `diagram` and `used_by`. A version 1 file is refused.
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `format` | string | `heph-review-brief-triage/1` |
+| `format` | string | `heph-review-brief-triage/2` |
 | `items` | Item[] | Every card and group |
 | `not_in_code` | NotInCode[], optional | Points with no code to show (I12). Not cards |
 | `reads` | Read[] | What the decider read |
@@ -69,9 +70,15 @@ The decider's answer.
 | `layer` | int | The PR number the item belongs to |
 | `tier` | Tier | Required |
 | `reason` | Reason | Required at Scrutinize; optional below |
-| `claim` | string | One sentence on what the code now does differently. Required |
-| `question` | string | Required at Scrutinize: answerable with yes, no or a choice |
-| `ranges` | RangeRef[] | At least one (I12) |
+| `title` | string | What changed, in plain words: the card's heading. At most 90 characters. Required at Scrutinize; below it the page falls back to the claim |
+| `context` | string | What the code is for, what reaches it (callers, the command or stage) and how it shows up to whoever meets it (a heph user, a BUILD author, a plugin author). At most 600 characters. Required at Scrutinize |
+| `claim` | string | One sentence on what the code now does differently: shown as "Why it's flagged". Required |
+| `question` | string | Required at Scrutinize: one decision, answerable with yes, no or a choice. At most 300 characters |
+| `options` | Option[] | 2 to 4 answers to the question, each with what follows from it. Required at Scrutinize |
+| `examples` | Example[], optional | Up to 3 concrete pictures of how the change shows up |
+| `diagram` | string, optional | Mermaid source, at most 40 lines, from the subset below |
+| `ranges` | RangeRef[] | At least one (I12). The lines that carry the decision, not a whole function |
+| `used_by` | RangeRef[], optional | Up to 3 sites that use the changed code, each with a `note`. Read at the layer's head; they need not be in the diff |
 | `start_from` | string[], optional | For a whole new file: the functions to read first |
 | `tests` | TestRef[], optional | Tests that pin it. Each must exist at the layer's head and not be `#[ignore]`d |
 | `board` | BoardNote[], optional | What each board agent said about this code |
@@ -80,6 +87,25 @@ The decider's answer.
 | `proposed_by` | string | Who proposed it: a board agent's name, `scout:<agent>`, `decider` |
 | `tiered_by` | string, optional | Defaults to `decider` |
 | `raised_by` | string, optional | Set by render when the stack reviewer promotes the item. Leave it empty |
+
+**Option**: `choice` (at most 80 characters) and `impact` (at most 300): what follows if the
+reviewer picks that choice, who is affected, and what changes, breaks or stays deferred.
+
+**Example**: `label` (at most 40 characters, such as "Before", "After", "What a user sees") and
+`text` (plain text, at most 30 lines, shown preformatted).
+
+**The card-text rules**, each a render refusal:
+
+- Over a cap above.
+- A bare spec or decision id in `title`, `question` or an option: a token matching
+  `\b[A-Z][0-9]{1,3}\b` (U28, P20, D4, I11), except the product names S3, R2, V8, L1, L2 and
+  L3. The reviewer decides from those fields, so they say what the rule says. `context` may name
+  an id beside its meaning.
+- A `diagram` whose first keyword (after `%%` comments) is not `flowchart`, `graph`,
+  `sequenceDiagram`, `stateDiagram` or `stateDiagram-v2`; or that has a `%%{` directive, a
+  `click`, `link` or `links` line, a `<`, or `javascript:`.
+- A `used_by` range on the old side, without a `note`, empty or inverted, over 40 lines, or not
+  inside the file at the layer's head (each layer's own head, not the top's).
 
 **TestRef**: `name` (the test function's name), `path` (optional, narrows the lookup to one file).
 
@@ -107,8 +133,9 @@ The stack reviewer's answer. It can only promote (I4).
 text cites code (I12).
 
 **Promotion**: `item` (an id in the triage), `tier` (at least the item's current tier; lower is
-refused), `note` (why, shown as "raised by"), and `reason` and `question`, which fill the card's
-own when it had none. A promotion to Scrutinize of an item with no reason or question needs both.
+refused), `note` (why, shown as "raised by"), and `reason`, `title`, `context`, `question` and
+`options`, which fill the card's own when it had none. A promotion to Scrutinize supplies each one
+the item lacks; the card is then checked like any other.
 
 **Confirmation**: `layer` and `note`. The page then says "AI-approved: N lines, by triage and
 stack review" for that layer.
@@ -154,7 +181,9 @@ One scout's answer for one layer, or for its part of a split layer.
 | `reads` | RangeRef[] | What it read. The reads of every scout on a layer together must cover all its live lines |
 
 **ScoutCandidate**: `claim`, `reason` (optional), `tier` (its own call), `why` (optional, one
-line), `ranges`.
+line), `ranges`, and the optional proposals `context`, `examples`, `diagram` and `used_by`, in
+the Item's shapes. Render does not check a scout's proposals; it checks what the decider copies
+into the triage.
 
 ## Program-written intermediates
 
@@ -233,8 +262,10 @@ One per layer, N its PR number.
 | `weakenings` | Weakening[] | What the program found |
 | `fingerprint` | string | See above |
 
-**Card**: `id`, `tier`, `reason`, `reason_title`, `claim`, `question`, `display`, `changed`
-(changed lines under its ranges), `ranges` (PageRange[]), `start_from`, `tests` (each `name` and
+**Card**: `id`, `tier`, `reason`, `reason_title`, `title`, `context`, `claim`, `question`,
+`options`, `diagram`, `examples`, `display`, `changed`
+(changed lines under its ranges), `ranges` (PageRange[]), `used_by` (PageUse[]), `start_from`,
+`tests` (each `name` and
 `link`), `board` (BoardNote[]), `weakenings`, `provenance` (`proposed_by`, `tiered_by`,
 `raised_by`), `other_layers` (each `pr`, `symbol`, `link`: other layers that change the same
 function), `floors` (the flags that held a line at this tier, such as `protected`).
@@ -254,6 +285,10 @@ read the ranges in order), or `file` (a whole new or rewritten file: start from 
 | `commits` | object[] | Each `sha`, `short`, `subject`, `link`: the commits in the pinned range that last touched these lines |
 | `diff` | bool | Its lines are in the diffs file under `hash` |
 
+**PageUse**: `path`, `start`, `end`, `note`, `symbol` (the function or type the site is in),
+`link` (the lines on GitHub at the layer's pinned head) and `key` (its snippet in the diffs
+file).
+
 **Counted**: `path`, `class` (`test`, `moved`, `docs`, `lockfile`, `generated`, `superseded`,
 `binary`, `symlink`, `submodule`, `mode`), `added`, `removed`, `link`, `moved` (the other end of
 moved lines, as `path:line`), `note` (a rename, a mode change, or how many existing lockfile pins
@@ -265,13 +300,29 @@ moved).
 | --- | --- | --- |
 | `pr` | int | |
 | `ranges` | map | PageRange `hash` to its diff lines |
+| `snippets` | map | PageUse `key` to its lines |
 
 A diff line is a four-element array `[kind, old, new, text]`. `kind` is `" "` (context), `"+"`,
 `"-"`, or `"@"` for a gap between non-adjacent lines (then `old` and `new` are 0 and `text` is
 empty). `old` and `new` are the line numbers on each side, 0 where the line has none. The text is
 cut from git at the pinned SHAs (I2).
 
+A snippet line has the same shape: `kind` is `">"` for a line of the cited range and `" "` for
+the three lines around it, `old` is 0 and `new` is the line number at the layer's head. The key is
+a hash of the path and the lines, so a site two cards cite is stored once. The snippets are in the
+diffs file, so the manifest's checksum of that file covers them.
+
 ### index.html
 
 The page itself, `page.html` copied unchanged. It loads `manifest.json` first, then
 `stack.json`, then each layer's two files on demand.
+
+**Diagrams are the one place the page inserts generated markup.** Everything else is inserted as
+text. A card's `diagram` is handed to mermaid 11.12.0, loaded from cdnjs with an SRI `integrity`
+hash, initialized with `securityLevel: "strict"` and `startOnLoad: false`, and run only when the
+card is drawn. Its SVG, which strict mode sanitizes, is parsed with `DOMParser`, stripped again of
+scripts, `on*` attributes and `javascript:` values, and adopted as a node. This is accepted
+because a picture of a flow is worth it, the source is already held to a subset with no markup,
+links or directives (render refuses the rest), and the script is pinned by hash. The brief never
+depends on the CDN: until mermaid draws, and whenever it fails to load or to parse, the source is
+shown as preformatted text.
