@@ -146,9 +146,7 @@ fn lenient_stage<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Stage, D::Err
 
 /// [`Diagnostic::location`] decoded leniently: a location of the wrong shape,
 /// or one [`SourceLoc::checked`] refuses, is `None`.
-fn lenient_location<'de, D: serde::Deserializer<'de>>(
-    d: D,
-) -> Result<Option<SourceLoc>, D::Error> {
+fn lenient_location<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<SourceLoc>, D::Error> {
     #[derive(Deserialize)]
     #[serde(untagged)]
     enum Loose {
