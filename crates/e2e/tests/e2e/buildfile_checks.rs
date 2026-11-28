@@ -128,10 +128,16 @@ impl Ws {
 }
 
 /// What one `heph run` did: the addrs that failed (with their error), the
-/// ones that built, and each cacheable target's cache outcome.
+/// culprits it recorded (with theirs), the ones that built, and each
+/// cacheable target's cache outcome.
 #[derive(Debug)]
 struct Run {
     failed: BTreeMap<String, String>,
+    /// Each recorded culprit's error, keyed by the broken file for a file
+    /// culprit and by its addr otherwise: what the failure box renders. A
+    /// target in `failed` only because of one carries the bare
+    /// `dependency failed (root: …)` marker instead.
+    culprits: BTreeMap<String, String>,
     ok: BTreeSet<String>,
     outcomes: BTreeMap<String, CacheOutcomeKind>,
 }
@@ -147,8 +153,16 @@ async fn run(ws: &Ws, m: &Matcher) -> Run {
     try_run(ws, m).await.expect("the selection resolves")
 }
 
+/// Why a selection did not resolve: the request's error, and the culprits it
+/// recorded (as [`Run::culprits`]).
+#[derive(Debug)]
+struct Unresolved {
+    error: String,
+    culprits: BTreeMap<String, String>,
+}
+
 /// [`run`], or why the selection itself did not resolve.
-async fn try_run(ws: &Ws, m: &Matcher) -> anyhow::Result<Run> {
+async fn try_run(ws: &Ws, m: &Matcher) -> Result<Run, Unresolved> {
     let engine = ws.engine();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let rs = engine.new_state_with_events(false, Some(tx));
@@ -160,11 +174,22 @@ async fn try_run(ws: &Ws, m: &Matcher) -> anyhow::Result<Run> {
             &ResultOptions::default(),
         )
         .await;
+    let culprits = rs
+        .failures()
+        .iter()
+        .map(|f| {
+            let key = f.file.as_deref().map_or_else(|| f.addr.format(), str::to_owned);
+            (key, format!("{:#}", f.source))
+        })
+        .collect();
     let batch = match batch {
         Ok(batch) => batch,
         Err(e) => {
             crate::common::drain(rs).await;
-            return Err(e);
+            return Err(Unresolved {
+                error: format!("{e:#}"),
+                culprits,
+            });
         }
     };
     let failed = batch
@@ -193,6 +218,7 @@ async fn try_run(ws: &Ws, m: &Matcher) -> anyhow::Result<Run> {
     }
     Ok(Run {
         failed,
+        culprits,
         ok,
         outcomes,
     })
@@ -680,7 +706,7 @@ async fn format_unparseable_leaves_package_untouched() {
 
     let m = Matcher::Addr(parse_addr("//pkg:build-format").expect("addr"));
     let err = match try_run(&ws, &m).await {
-        Err(e) => format!("{e:#}"),
+        Err(e) => e.error,
         Ok(r) => {
             assert_fails(&r, "//pkg:build-format");
             r.failed["//pkg:build-format"].clone()
@@ -876,13 +902,24 @@ def lib(name: str, **kwargs: heph.types.bash.Kwargs):
         &format!("{LIB}\nlib(name = \"t\", rnu = \"true\")\n"),
     );
     let m = Matcher::Addr(parse_addr("//pkg:build-lint-check").expect("addr"));
-    let err = match try_run(&ws, &m).await {
-        Err(e) => format!("{e:#}"),
-        Ok(r) => {
+    // The broken file is the culprit and the check is collateral (D1.b):
+    // the key is named in the file's diagnostic, which the failure box
+    // renders, not in the check's own `dependency failed` marker.
+    let (marker, culprits) = match try_run(&ws, &m).await {
+        Err(e) => (e.error, e.culprits),
+        Ok(mut r) => {
             assert_fails(&r, "//pkg:build-lint-check");
-            r.failed["//pkg:build-lint-check"].clone()
+            let marker = r.failed.remove("//pkg:build-lint-check").unwrap_or_default();
+            (marker, r.culprits)
         }
     };
+    assert!(
+        marker.contains("(root: pkg/BUILD)"),
+        "the check is collateral of the file: {marker}"
+    );
+    let err = culprits
+        .get("pkg/BUILD")
+        .unwrap_or_else(|| panic!("the file is a culprit: {culprits:#?}"));
     assert!(
         err.contains("Unexpected key `rnu` for argument `kwargs`"),
         "names the key: {err}"
