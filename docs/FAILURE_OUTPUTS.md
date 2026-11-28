@@ -83,8 +83,10 @@ parse, a missing dependency, a run that failed and kept nothing, and a BUILD
 file that did not evaluate. A BUILD file's slot is keyed by the file, not by
 a target: `<home>/failures/file_<path>-<digest>/`, its manifest's `addr` is
 `file:<path>` (workspace-relative), and it lists the packages whose targets
-were reached through the file. Nothing clears it when the file evaluates
-again; `heph tool gc` keeps it while the file exists and drops it once the
+were reached through the file. It is cleared when a target of any package it
+lists next resolves, as a target's own slot is: the file evaluated again, so
+`heph inspect failure` and `heph log` stop showing the old failure. Until
+then, `heph tool gc` keeps it while the file exists and drops it once the
 file is gone or the slot is older than the max age.
 
 **Credential material gets no `diagnostic.json`.** A target whose outputs are
@@ -299,15 +301,20 @@ It keeps what a build keeps, read the same way, with these differences:
 
 ## `heph inspect failure`
 
-`heph inspect failure <addr>` prints where the target's last failure was kept.
-It reads the slot and builds nothing:
+`heph inspect failure <addr>` prints the target's last recorded failure: what
+went wrong, at which stage, and where its slot kept each part. It reads the
+slot and builds nothing:
 
 ```
 $ heph inspect failure //web:e2e
+failure: //web:e2e (run stage): exit status 1
 slot: /ws/.heph/failures/web_e2e-…
 log: /ws/.heph/failures/web_e2e-…/log.txt
 out: /ws/.heph/failures/web_e2e-…/out
 ```
+
+A failure before the run adds `location:` and `hint:` lines when it has them,
+and `run: never (it failed before running)`.
 
 `--json` prints one object (pretty on a terminal, as here; one line when
 piped). Paths are absolute, and an absent part is `null`. `--fields` picks
@@ -316,28 +323,73 @@ keys and `--jq` filters it, as on every command (`docs/JSON_OUTPUT.md`):
 ```json
 {
   "addr": "//web:e2e",
+  "file": null,
   "slot": "/ws/.heph/failures/web_e2e-…",
+  "stage": "run",
+  "message": "exit status 1",
+  "location": null,
+  "hints": [],
+  "truncated": false,
   "hashin": "…",
   "failed_at": 1762790400000,
   "log": "/ws/.heph/failures/web_e2e-…/log.txt",
+  "log_lines": 212,
+  "log_replaced": false,
   "out": "/ws/.heph/failures/web_e2e-…/out",
   "fixes": null
 }
 ```
 
-`failed_at` is in milliseconds since the Unix epoch. `hashin` is the input hash
-of the run that failed, which may no longer be the target's, and `null` for a
-failure before the run. Both are in the JSON only.
+- `stage` is one of `eval`, `spec`, `parse`, `link`, `run`, `cache`, `config`
+  or `cli`, and `message` is the failure on one line. Neither is ever `null`;
+  a slot written by an older heph, with no `diagnostic.json`, gets `run` (or
+  `eval` for a file's slot) and a message that says so. The message and the
+  hints' wording are not contract.
+- `location` is where in a BUILD or `.bzl` file it was raised, the file
+  workspace-relative. `truncated` says a cap cut something from the record.
+- `failed_at` is in milliseconds since the Unix epoch. `hashin` is the input
+  hash of the run that failed, which may no longer be the target's. Both are
+  `null` for every failure before the run (a def that does not parse, a
+  missing dependency, a BUILD file that did not evaluate). So are `log` and
+  `log_lines`.
+- `log_lines` counts the lines of `log`: `0` for a run that printed nothing,
+  whose empty `log.txt` is still kept. `log_replaced` is true when a newer
+  failed run filled the slot again while it was read, so `log` is that run's.
+- The message is scrubbed as `run --json`'s `error` is: heph's home redacted,
+  workspace paths made relative.
 
-With no recorded failure (the target never failed, or passed or hit the cache
-since):
+**A target in a BUILD file that did not evaluate** has no slot of its own:
+`heph inspect failure //d:t` answers with the file's slot instead. Then
+`addr` is `null`, `file` is the file (`d/BUILD`), `stage` is `eval`, and the
+text form's first line names the file.
 
-- the text form prints `no recorded failure for <addr>` on stderr and exits 1;
+**Only a culprit has a record.** A target skipped because a dependency failed
+keeps none, and `inspect failure` answers for it as for a target that never
+failed. The run's own `--json` and its end report carry the skipped target's
+`root` (its culprit) and `path`. With no recorded failure (the target never
+failed, was skipped, or passed or hit the cache since):
+
+- the text form prints `no failure recorded for <addr> (skipped targets keep
+  no record; the run's --json carries root and path)` on stderr and exits 1;
 - `--json` prints `null` on stdout and exits 0 (with `--jq`, the filter runs
   over `null`).
 
 So a script reads "no failure" as `null`, and a non-zero exit only means the
 command itself failed.
+
+### `heph log` on a failure before the run
+
+A culprit that failed before its process ran has no log, and running it again
+would not produce one. `heph log` says so and points here, rather than at a
+rerun:
+
+```
+$ heph log //d:t
+heph: //d:t failed while its BUILD file was evaluated; it never ran. See `heph inspect failure //d:t`
+```
+
+The clause names the stage: `while its driver parsed its definition`, `while
+its inputs were linked`, and so on.
 
 ### A failed package probe
 

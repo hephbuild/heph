@@ -299,6 +299,13 @@ the first lock chain, `null` when no chain leads to a session. `next` is
   `inspect_failure` and `list`, which depend on it; `null` for the commands
   that take a session id and run from anywhere, or when no `cwd` was recorded.
 - All three are `null` for `none`.
+- A failed session's `inspect_failure` names the first **culprit** the
+  session recorded: a target that failed on its own, or the target a broken
+  BUILD file was reached through (whose `inspect failure` answers with the
+  file's record). It never names a target skipped because a dependency
+  failed, even one that ended first: that target keeps no record, and
+  `heph inspect failure` would print `null` for it. A failed session with no
+  culprit recorded gets `rerun`.
 
 The text `Next:` line prints `command` alone, its reason on the line below.
 

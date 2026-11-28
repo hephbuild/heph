@@ -27,8 +27,9 @@ flags, and any of them exits 2 (see "Commands without JSON").
   one array, a **record-shaped** one (`version`, `inspect failure`,
   `session show`, …) one object. Which of the two a command prints is part of
   its contract: a list with nothing in it is `[]`, and a record with nothing to
-  report is `null` with exit 0 (`inspect failure` of a target that never
-  failed).
+  report is `null` with exit 0 (`inspect failure` of a target with no
+  recorded failure: one that never failed, or one skipped because a
+  dependency failed, since only a culprit keeps a record).
 - **Whitespace.** On a terminal the document is pretty-printed. Piped, a
   record is one compact line, and a list is `[`, then one compact element per
   line, then `]`, so `grep` and `head` work on it line by line. What is printed
@@ -344,8 +345,10 @@ does not evaluate still leaves that package a gap.
   fails through the failure path (exit 1, a closed list), where it reported
   a selection gap.
 - `heph inspect failure --json`'s `addr`, `hashin` and `failed_at` are
-  nullable. Each is always set today; a reader that indexes them must accept
-  `null`.
+  nullable: `addr` is `null` on a BUILD file's record (its path is in
+  `file`), and `hashin` and `failed_at` on every failure before the run. A
+  reader that indexes them must accept `null`. See `heph inspect failure`
+  below.
 - A cancelled command (Ctrl-C, SIGTERM or SIGHUP) exits 130, also when a
   failure had already failed it. It exited 1. A cancel that `--fail-fast` made
   after a failure is not a user's, and exits 1.
@@ -385,6 +388,44 @@ terminal, so with `--json`, `--fields` or `--jq` they exit 2 at parse time.
 it has no entry to report: `heph run <entrypoint> --json` is refused once the
 selector resolves, before anything runs, naming the target. It is a usage
 error, exit 2, like the flags refused at parse time.
+
+### `heph inspect failure`
+
+`heph inspect failure <addr> --json` prints one record: a culprit's last
+recorded failure and where its slot kept each part (`docs/FAILURE_OUTPUTS.md`
+has the example).
+
+| Field | Meaning |
+|---|---|
+| `addr` | the target's address; null on a BUILD or `.bzl` file's record |
+| `file` | the workspace-relative file that did not evaluate; null on a target's record |
+| `slot` | the failure slot's directory, absolute |
+| `stage` | `eval`, `spec`, `parse`, `link`, `run`, `cache`, `config` or `cli`; never null |
+| `message` | what went wrong, on one line; never null. Its wording is not contract |
+| `location` | `{file, line, col}` in a BUILD or `.bzl` file; null when it names no place |
+| `hints` | `[{kind, text}]`; a hint's wording is not contract |
+| `truncated` | a cap cut something from the record |
+| `hashin` | the input hash of the run that failed; null for a failure before the run |
+| `failed_at` | when it failed, ms since the Unix epoch; null for a failure before the run |
+| `log` | the run's full process log; null when it kept none, and for a failure before the run |
+| `log_lines` | how many lines `log` holds (0 for a run that printed nothing); null with no log |
+| `log_replaced` | a newer failed run filled the slot again while it was read |
+| `out` | the `failure_out` matches; null when none matched |
+| `fixes` | the list of files an `in_place` write-back changed; null when none |
+
+`heph inspect failure //d:t` for a target whose BUILD file did not evaluate
+answers with the file's record: `addr` null, `file` `d/BUILD`. It answers for
+culprits only: for a target skipped because a dependency failed it prints
+`null` (exit 0), as for one that never failed. The run's own `--json` carries
+the skipped target's `root` and `path`.
+
+### `heph query` on a broken BUILD file
+
+`heph query <addr> --json`, naming one address, on a target whose BUILD or
+`.bzl` file does not evaluate prints `[]`, a closed list, and exits 1 with
+the file's failure box on stderr, as `heph run` does. It does not report a
+selection gap: the address named one package, and that package's file is the
+culprit.
 
 ### Commands without JSON
 
