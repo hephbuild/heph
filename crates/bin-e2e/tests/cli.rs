@@ -241,3 +241,33 @@ fn sighup_exits_130() {
     let (code, stderr) = stopped_run(&["//pkg:slow"], &[], libc::SIGHUP);
     assert_eq!(code, Some(130), "{stderr}");
 }
+
+/// Started with SIGHUP ignored, as `nohup` starts it, heph leaves it ignored:
+/// a HUP mid-build changes nothing, and the run finishes and exits 0, not
+/// 130. TERM is still a cancel then (heph only keeps the ignore it was given).
+#[test]
+fn sighup_ignored_when_inherited_ignored() {
+    use std::os::unix::process::CommandExt as _;
+
+    let dist = Dist::locate();
+    let ws = Workspace::new().expect("workspace");
+    ws.write(
+        "pkg/BUILD",
+        "target(name = \"nap\", driver = \"bash\", run = \"sleep 3\", cache = False)\n",
+    )
+    .expect("write BUILD");
+    let mut run = Bg::spawn_with(&ws, &dist, &["run", "//pkg:nap"], |cmd| {
+        let ignore_hup = || {
+            // SAFETY: setting a signal's disposition to `SIG_IGN`.
+            unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
+            Ok(())
+        };
+        // SAFETY: the closure only calls `signal(2)`, which is
+        // async-signal-safe, between fork and exec.
+        unsafe { cmd.pre_exec(ignore_hup) };
+    });
+    run.wait_executing("//pkg:nap");
+    common::signal(run.pid(), libc::SIGHUP);
+    let status = run.wait();
+    assert_eq!(status.code(), Some(0), "{}", run.stderr());
+}

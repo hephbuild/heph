@@ -605,13 +605,24 @@ fn spawn_sigint_producer(trigger: ShutdownTrigger) {
 /// While an entrypoint's tool holds the terminal, the trigger drops what these
 /// send and the relay forwards the signal to the tool instead
 /// ([`SignalRelay`]).
+///
+/// A HUP heph was started with ignored stays ignored, so `nohup heph run …`
+/// keeps running when its terminal closes. The disposition is the one `main`
+/// recorded before anything installed a handler
+/// (`hcore::process::record_inherited`); a handler installed here would
+/// replace the `SIG_IGN` for good. TERM is a cancel either way.
 pub fn cancel_on_term_and_hup(trigger: &ShutdownTrigger) {
     use tokio::signal::unix::{SignalKind, signal};
 
+    let hup_ignored = inherited_ignored(libc::SIGHUP);
     for (kind, name) in [
         (SignalKind::terminate(), "SIGTERM"),
         (SignalKind::hangup(), "SIGHUP"),
     ] {
+        if name == "SIGHUP" && hup_ignored {
+            tracing::debug!("SIGHUP was ignored when heph started (nohup); it stays ignored");
+            continue;
+        }
         let mut listener = match signal(kind) {
             Ok(listener) => listener,
             Err(e) => {
@@ -626,6 +637,22 @@ pub fn cancel_on_term_and_hup(trigger: &ShutdownTrigger) {
             }
         });
     }
+}
+
+/// Whether `sig` was `SIG_IGN` when this process started, as `main` recorded
+/// it. False when nothing was recorded (a test binary, an embedder).
+fn inherited_ignored(sig: libc::c_int) -> bool {
+    inherited_ignored_in(hcore::process::inherited_dispositions(), sig)
+}
+
+fn inherited_ignored_in(
+    recorded: &[(hcore::process::Signal, hcore::process::Disposition)],
+    sig: libc::c_int,
+) -> bool {
+    let sig = hcore::process::Signal::from_raw(sig);
+    recorded
+        .iter()
+        .any(|&(s, d)| s == sig && d == hcore::process::Disposition::Ignore)
 }
 
 /// Set by the first stop that reached the shutdown handler while heph was the
@@ -802,6 +829,21 @@ fn hard_abort(exit: impl FnOnce(i32)) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only a signal recorded as ignored reads as ignored: under `nohup` HUP
+    /// keeps its `SIG_IGN` while TERM is still a cancel, and with nothing
+    /// recorded both get a handler.
+    #[test]
+    fn inherited_ignore_is_per_signal() {
+        use hcore::process::{Disposition, Signal};
+        let nohup = [
+            (Signal::from_raw(libc::SIGHUP), Disposition::Ignore),
+            (Signal::from_raw(libc::SIGTERM), Disposition::Default),
+        ];
+        assert!(inherited_ignored_in(&nohup, libc::SIGHUP));
+        assert!(!inherited_ignored_in(&nohup, libc::SIGTERM));
+        assert!(!inherited_ignored_in(&[], libc::SIGHUP));
+    }
 
     /// A hook whose final write is a task on the command's runtime, as a cdylib
     /// hook's delivery task is: `drain` waits for it.

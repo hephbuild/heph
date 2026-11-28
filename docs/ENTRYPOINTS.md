@@ -283,8 +283,9 @@ heph is an ordinary run: Ctrl-C, TERM and HUP cancel it (exit 130), SIGQUIT
 writes its diagnostic dump, as for any command that a cancel ends (`run` and
 every command that can build under the progress view). The long-lived ones,
 `heph tool build-lsp` and `heph log -f`, are not cancelled by TERM or HUP:
-they die of it, as every command did before. Nothing sent then is held for
-the tool. While the TUI has stepped aside, laying out a large closure prints
+they die of it, as every command did before. Under `nohup`, which starts
+heph with HUP ignored, HUP stays ignored and cancels nothing. Nothing sent
+then is held for the tool. While the TUI has stepped aside, laying out a large closure prints
 nothing; it is still heph's, and Ctrl-C still cancels it.
 
 ## What will it run?
