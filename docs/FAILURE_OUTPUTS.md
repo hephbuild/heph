@@ -293,6 +293,18 @@ since):
 So a script reads "no failure" as `null`, and a non-zero exit only means the
 command itself failed.
 
+### A failed package probe
+
+A failure is recorded under its culprit: a target, or a BUILD file that did
+not evaluate. No culprit is a package. When the provider's probe of a package
+fails (it cannot list it, for a reason other than a BUILD file that does not
+evaluate), the failure is recorded under the target that was being resolved
+in that package. The failure report, `run --json` and the event stream name
+that target, not the package. The targets that depend on it are not blamed.
+This is a known limit: an error about the whole package reads as one
+target's failure. `deep_probe_error_blames_the_package` in
+`crates/e2e/tests/e2e/blame.rs` pins it.
+
 ## `in_place` on failure
 
 | Run ends with | `in_place` | `in_place_on_success` |
