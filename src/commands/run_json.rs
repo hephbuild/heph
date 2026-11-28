@@ -474,6 +474,7 @@ impl Fold {
                 entry,
                 error,
                 path,
+                failure: _,
             } => {
                 let mut ready = Vec::new();
                 if self.files.insert(file.clone()) {
@@ -1017,6 +1018,7 @@ mod tests {
 
     fn end(addr: &str, error: Option<&str>, upstream_of: Option<&str>) -> BuildEventKind {
         BuildEventKind::ResultEnd {
+            failure: None,
             duplicate: false,
             upstream_file: None,
             path: Vec::new(),
@@ -1097,6 +1099,7 @@ mod tests {
 
     fn file_failed(file: &str, entry: &str, path: &[&str]) -> BuildEventKind {
         BuildEventKind::FileFailed {
+            failure: None,
             file: file.to_string(),
             entry: entry.to_string(),
             error: "d/BUILD:3:1: fail: boom\nTraceback (most recent call last):".to_string(),

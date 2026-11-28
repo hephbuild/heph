@@ -3095,6 +3095,7 @@ mod tests {
         }));
         assert_eq!(s.open_count(Op::Result), 1);
         h.on_event(&ev(BuildEventKind::ResultEnd {
+            failure: None,
             duplicate: false,
             left_behind: None,
             cancelled: false,

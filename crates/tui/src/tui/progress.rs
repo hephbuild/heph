@@ -2955,6 +2955,7 @@ impl CIAppView for CiProgressView {
                 // announcing one carries the block (one box per culprit).
                 duplicate: false,
                 left_behind,
+                failure: _,
             } if !self.failures_printed.contains(addr) => {
                 self.failures_printed.insert(addr.clone());
                 let block = with_left_behind(
@@ -2981,6 +2982,7 @@ impl CIAppView for CiProgressView {
                 entry,
                 error,
                 path,
+                failure: _,
             } if !self.failures_printed.contains(entry) => {
                 self.failures_printed.insert(entry.clone());
                 let block = live_failure_block(
@@ -3259,6 +3261,7 @@ mod tests {
     }
     fn result_end(addr: &str, error: Option<String>) -> BuildEventKind {
         BuildEventKind::ResultEnd {
+            failure: None,
             duplicate: false,
             upstream_file: None,
             path: Vec::new(),
@@ -4635,6 +4638,7 @@ mod tests {
         tail: Option<&str>,
     ) -> BuildEventKind {
         BuildEventKind::ResultEnd {
+            failure: None,
             duplicate: false,
             upstream_file: None,
             path: Vec::new(),
@@ -4727,6 +4731,7 @@ mod tests {
     #[test]
     fn ci_view_live_block_carries_the_box_rows() {
         let end = BuildEventKind::ResultEnd {
+            failure: None,
             duplicate: false,
             upstream_file: None,
             path: Vec::new(),
@@ -4813,6 +4818,7 @@ mod tests {
         assert_eq!(s.failure_split(), (1, 0), "one root, nothing taken down");
 
         let file = BuildEventKind::FileFailed {
+            failure: None,
             file: "d/BUILD".into(),
             entry: "//d:t".into(),
             error: "evaluating d/BUILD: boom".into(),
@@ -4833,6 +4839,7 @@ mod tests {
     fn duplicate_end_in_a_broken_file_is_taken_down_by_it() {
         use crate::tui::dashboard::RowState;
         let file = BuildEventKind::FileFailed {
+            failure: None,
             file: "d/BUILD".into(),
             entry: "//d:t1".into(),
             error: "evaluating d/BUILD: boom".into(),
@@ -4902,6 +4909,7 @@ mod tests {
         assert!(!log.contains("reached by:"), "{log}");
 
         let file = BuildEventKind::FileFailed {
+            failure: None,
             file: "d/BUILD".into(),
             entry: "//d:t".into(),
             error: "boom".into(),
@@ -4932,6 +4940,7 @@ mod tests {
     #[test]
     fn ci_view_live_block_words_and_sanitizing() {
         let timed_out = BuildEventKind::ResultEnd {
+            failure: None,
             duplicate: false,
             upstream_file: None,
             path: Vec::new(),
@@ -4969,6 +4978,7 @@ mod tests {
         );
 
         let no_status = BuildEventKind::ResultEnd {
+            failure: None,
             duplicate: false,
             upstream_file: None,
             path: Vec::new(),
@@ -6307,6 +6317,7 @@ mod tests {
                 });
             }
             ev(BuildEventKind::ResultEnd {
+                failure: None,
                 duplicate: false,
                 upstream_file: None,
                 path: Vec::new(),

@@ -735,6 +735,7 @@ mod tests {
         v.apply(&at(
             10,
             BuildEventKind::ResultEnd {
+                failure: None,
                 duplicate: false,
                 upstream_file: None,
                 path: Vec::new(),
@@ -806,6 +807,7 @@ mod tests {
         const HOME: &str = "/home/u/.heph";
         let fail =
             |addr: &str, error: String, upstream_of: Option<&str>| BuildEventKind::ResultEnd {
+                failure: None,
                 duplicate: false,
                 upstream_file: None,
                 path: Vec::new(),
@@ -864,6 +866,7 @@ mod tests {
         cancelled: bool,
     ) -> hcore::events::BuildEventKind {
         hcore::events::BuildEventKind::ResultEnd {
+            failure: None,
             duplicate: false,
             upstream_file: None,
             path: Vec::new(),
