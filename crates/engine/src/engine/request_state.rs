@@ -1583,18 +1583,57 @@ impl RequestState {
         out
     }
 
+    /// `e`, a failure resolving `dep`, which `declarer` declared: with a
+    /// [`MissingDep`](hplugin::error::MissingDep) located at the declaration
+    /// ([`decl_field_loc`](Self::decl_field_loc)) when `e` is `dep`'s
+    /// not-found, else as `otherwise` wraps it
+    /// ([`MissingDep::wrap_or`](hplugin::error::MissingDep::wrap_or)).
+    ///
+    /// The one way a `MissingDep` site locates the declaration, so none can
+    /// look it up in an index it never loaded (FQ r2 N-3).
+    pub(crate) async fn missing_dep_or(
+        &self,
+        e: anyhow::Error,
+        dep: &Addr,
+        declarer: &Addr,
+        origin_id: impl FnOnce() -> String,
+        otherwise: impl FnOnce(anyhow::Error) -> anyhow::Error,
+    ) -> anyhow::Error {
+        use hplugin::error::MissingDep;
+        if !MissingDep::names(&e, dep) {
+            return otherwise(e);
+        }
+        let origin_id = origin_id();
+        let field = crate::engine::deferred::origin_field(&origin_id);
+        let at = self.decl_field_loc(declarer, field).await;
+        MissingDep::wrap_or(e, dep, declarer, || origin_id, |_| at, otherwise)
+    }
+
     /// Where `addr` declared option `field`, for a diagnostic about it: the
     /// span its provider's [`SourceIndex`](hplugin::provider::SourceIndex)
     /// finds in the declaring call, else that call's start (its spec's
     /// [`SpecSource`](hplugin::provider::SpecSource)); `field` `None` is the
     /// call. Marked changed when the index finds the file no longer holds
-    /// the call as evaluated. Error path only, and never asks the provider:
-    /// the index is the one [`load_source_index`](Self::load_source_index)
-    /// loaded, and a file whose index was not loaded points at the call.
+    /// the call as evaluated. Error path only: it loads the file's index
+    /// first ([`load_source_index`](Self::load_source_index)).
     ///
     /// Never resolves anything: a spec not yet resolved, resolved with an
     /// error, or whose provider reported no source has no location here.
-    pub(crate) fn decl_field_loc(
+    pub(crate) async fn decl_field_loc(
+        &self,
+        addr: &Addr,
+        field: Option<&str>,
+    ) -> Option<hplugin::provider::DeclAt> {
+        self.load_source_index(addr).await;
+        self.loaded_decl_field_loc(addr, field)
+    }
+
+    /// [`decl_field_loc`](Self::decl_field_loc) without the load, for a
+    /// caller that cannot await: it never asks the provider, and a file
+    /// whose index the request did not load points at the call. Only the
+    /// record of a failure `get_def` raised after loading the index (a
+    /// refused parse, an unknown driver) reads it.
+    pub(crate) fn loaded_decl_field_loc(
         &self,
         addr: &Addr,
         field: Option<&str>,

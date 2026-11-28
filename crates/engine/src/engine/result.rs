@@ -2342,7 +2342,8 @@ fn culprit_location(
     }
     let field = hplugin::htspec::error_option(e)
         .or_else(|| no_driver.then_some(hplugin::error::DriverNotFound::FIELD));
-    rs.decl_field_loc(culprit, field)
+    // `get_def` loaded the index before raising either failure.
+    rs.loaded_decl_field_loc(culprit, field)
 }
 
 /// Records `e` against `culprit`, entered through `entry`, and returns the
@@ -7260,22 +7261,15 @@ impl Engine {
                     let spec = match Arc::clone(&engine).get_spec(rs.clone(), dep).await {
                         Ok(spec) => spec,
                         Err(e) => {
-                            if MissingDep::names(&e, dep) {
-                                rs.load_source_index(declarer).await;
-                            }
-                            return Err(MissingDep::wrap_or(
-                                e,
-                                dep,
-                                declarer,
-                                || crate::engine::deferred::declared_origin(&input.origin_id),
-                                |o| {
-                                    rs.decl_field_loc(
-                                        declarer,
-                                        crate::engine::deferred::origin_field(o),
-                                    )
-                                },
-                                |e| hplugin::diagnostic::with_stage(e, Boundary::GetSpec, dep),
-                            ));
+                            return Err(rs
+                                .missing_dep_or(
+                                    e,
+                                    dep,
+                                    declarer,
+                                    || crate::engine::deferred::declared_origin(&input.origin_id),
+                                    |e| hplugin::diagnostic::with_stage(e, Boundary::GetSpec, dep),
+                                )
+                                .await);
                         }
                     };
 

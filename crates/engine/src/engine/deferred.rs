@@ -575,17 +575,15 @@ impl Engine {
                 let value = match self.read_deferred_value_cached(rs, &p.addr).await {
                     Ok(value) => value,
                     Err(e) => {
-                        if hplugin::error::MissingDep::names(&e, &p.addr.r#ref) {
-                            rs.load_source_index(consumer).await;
-                        }
-                        return Err(hplugin::error::MissingDep::wrap_or(
-                            e,
-                            &p.addr.r#ref,
-                            consumer,
-                            || format!("${{{READ}://}}"),
-                            |o| rs.decl_field_loc(consumer, origin_field(o)),
-                            |e| e.context(format!("{consumer}: `{}` in `{}`", r.raw, r.path)),
-                        ));
+                        return Err(rs
+                            .missing_dep_or(
+                                e,
+                                &p.addr.r#ref,
+                                consumer,
+                                || format!("${{{READ}://}}"),
+                                |e| e.context(format!("{consumer}: `{}` in `{}`", r.raw, r.path)),
+                            )
+                            .await);
                     }
                 };
                 by_addr.insert(key, value);

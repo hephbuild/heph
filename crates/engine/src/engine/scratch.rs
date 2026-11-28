@@ -342,21 +342,19 @@ impl Engine {
             let spec = match Arc::clone(self).get_spec(rs.clone(), &addr).await {
                 Ok(spec) => spec,
                 Err(e) => {
-                    if hplugin::error::MissingDep::names(&e, &addr) {
-                        rs.load_source_index(consumer).await;
-                    }
-                    return Err(hplugin::error::MissingDep::wrap_or(
-                        e,
-                        &addr,
-                        consumer,
-                        || crate::engine::deferred::declared_origin(&input.origin_id),
-                        |o| rs.decl_field_loc(consumer, crate::engine::deferred::origin_field(o)),
-                        |e| {
-                            e.context(format!(
-                                "{consumer} references scratch {addr}, which does not resolve"
-                            ))
-                        },
-                    ));
+                    return Err(rs
+                        .missing_dep_or(
+                            e,
+                            &addr,
+                            consumer,
+                            || crate::engine::deferred::declared_origin(&input.origin_id),
+                            |e| {
+                                e.context(format!(
+                                    "{consumer} references scratch {addr}, which does not resolve"
+                                ))
+                            },
+                        )
+                        .await);
                 }
             };
 
