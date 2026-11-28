@@ -143,9 +143,20 @@ async fn failed_run(ws: &Workspace) -> JsonRun {
 
 /// Panic naming `what` if `text` holds any planted secret.
 fn assert_no_secret(what: &str, text: &str) {
-    for s in secrets() {
+    assert_no(secrets(), what, text);
+}
+
+/// Panic naming `what` if `text` holds any of `secrets`.
+fn assert_no<'a>(secrets: impl IntoIterator<Item = &'a str>, what: &str, text: &str) {
+    for s in secrets {
         assert!(!text.contains(s), "{what} holds {s}:\n{text}");
     }
+}
+
+/// Every planted secret but [`READ_SECRET`], which a run's log still holds
+/// verbatim until the user decides how `${read://}` values are redacted.
+fn secrets_but_read() -> impl Iterator<Item = &'static str> {
+    secrets().filter(|s| *s != READ_SECRET)
 }
 
 /// `heph inspect failure --json <addr>`.
@@ -164,9 +175,9 @@ fn inspect_json(engine: &Engine, addr: &str) -> anyhow::Result<String> {
     Ok(String::from_utf8(buf)?)
 }
 
-/// I7 on stderr: the CI box and the interactive report.
+/// I7 on stderr: the CI box and the interactive report hold no URL or
+/// credential secret.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "pending user decision: redact ${read://} values in every run log, or only in the rendered tail"]
 async fn no_secret_on_stderr() -> anyhow::Result<()> {
     let ws = workspace();
     let run = failed_run(&ws).await;
@@ -178,8 +189,20 @@ async fn no_secret_on_stderr() -> anyhow::Result<()> {
             run.report
         );
     }
-    assert_no_secret("the CI boxes", &run.boxes);
-    assert_no_secret("the report", &run.report);
+    assert_no(secrets_but_read(), "the CI boxes", &run.boxes);
+    assert_no(secrets_but_read(), "the report", &run.report);
+    Ok(())
+}
+
+/// I7 on stderr for a `${read://}` value the run printed: its log tail,
+/// shown in the box and the report, must not hold it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "pending user decision: redact ${read://} values in every run log, or only in the rendered tail"]
+async fn no_read_secret_on_stderr() -> anyhow::Result<()> {
+    let ws = workspace();
+    let run = failed_run(&ws).await;
+    assert_no([READ_SECRET], "the CI boxes", &run.boxes);
+    assert_no([READ_SECRET], "the report", &run.report);
     Ok(())
 }
 
