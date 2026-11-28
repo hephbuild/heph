@@ -1178,7 +1178,8 @@ pub(crate) struct Extra<'a> {
     /// workspace-relative path: what [`DeclSite::source`] points at, shared by
     /// that file's targets rather than built once per target, however BUILD
     /// and macro declarations interleave. One evaluation sees few files.
-    pub source_file: std::cell::RefCell<HashMap<String, Arc<str>>>,
+    /// An `FxHashMap`: every declaration hashes its file's absolute path.
+    pub source_file: std::cell::RefCell<rustc_hash::FxHashMap<String, Arc<str>>>,
 }
 
 /// Unsupported starlark value types (not str/bool/int/float/list/dict) are a

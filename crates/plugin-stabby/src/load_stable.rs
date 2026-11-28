@@ -1028,8 +1028,7 @@ fn decode_state_schema(bytes: &[u8]) -> anyhow::Result<Option<StateSchema>> {
 /// spec's bytes cannot rebuild when a declaration moves, and one cannot carry
 /// the location into its run. Field 7 travels only provider to host.
 fn parse_request_to_pb(req: ParseRequest, driver: &str) -> pb::ParseRequest {
-    let mut spec = convert::target_spec_to_pb(req.target_spec.as_ref());
-    spec.source = Default::default();
+    let spec = convert::target_spec_to_pb_without_source(req.target_spec.as_ref());
     pb::ParseRequest {
         request_id: Some(req.request_id),
         target_spec: spec.into(),
