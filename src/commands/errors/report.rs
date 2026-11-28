@@ -303,6 +303,36 @@ mod tests {
         assert_eq!(out, "");
     }
 
+    /// D6.1c, U6: a process that failed while its output streamed was told
+    /// in its one line, so the report leaves its box out. A streamed target
+    /// that failed after its run, or before it, keeps its box: streaming
+    /// never suppresses a failure, only the log that already reached the
+    /// screen.
+    #[test]
+    fn gather_drops_told_streamed_keeps_after_run() {
+        let streamed = |addr: &str, failed_in| {
+            let mut r = rec(addr, &format!("{addr} failed"));
+            r.streamed = true;
+            r.failed_in = failed_in;
+            failure(addr, r)
+        };
+        let failures = [
+            streamed("//p:exec", FailedIn::Exec),
+            streamed("//p:after", FailedIn::AfterRun),
+            streamed("//p:before", FailedIn::BeforeRun),
+        ];
+        let ctx = ReportContext::gather(&failures, |_| false, None, 3);
+        let kept: Vec<_> = ctx.records.iter().filter_map(|r| r.addr.clone()).collect();
+        assert_eq!(kept, ["//p:after", "//p:before"]);
+        let out = ctx.with_width(80).render(false);
+        assert!(!out.contains("//p:exec"), "{out}");
+        assert!(out.contains("✗ //p:after"), "{out}");
+        assert!(out.contains("✗ //p:before"), "{out}");
+
+        let out = ReportContext::gather(&failures[..1], |_| false, None, 3).render(false);
+        assert_eq!(out, "", "a report of told failures alone is empty");
+    }
+
     /// The report draws 50 boxes, then one line per further failure, then
     /// how to read them all (E5; the cap is the user's, 2026-11-27).
     #[test]
