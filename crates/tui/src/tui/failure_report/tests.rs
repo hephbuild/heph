@@ -917,6 +917,33 @@ fn raised_diagnostic_with_exit_is_shown() {
         streamed_exec_line(&status_only, false),
         "✗ //p:t · exit status 1 · heph log //p:t"
     );
+
+    // PV r2 M1: a remedy kept beside the exit frame is shown without the
+    // `: exit status 1` the header already says.
+    let remedy = exit(target(
+        "//app:img",
+        Diagnostic::new(
+            Stage::Run,
+            "select a builder with `builder = \"heph\"`: exit status 1",
+        ),
+    ));
+    let b = render_box(&remedy, &ctx);
+    assert_eq!(b.matches("exit status 1").count(), 1, "{b}");
+    assert!(
+        b.contains("select a builder with `builder = \"heph\"`"),
+        "{b}"
+    );
+    assert_eq!(
+        one_line(&remedy, &ctx),
+        "✗ //app:img · exit status 1 · select a builder with `builder = \"heph\"`"
+    );
+    assert_eq!(
+        streamed_exec_line(&remedy, false),
+        "✗ //app:img · exit status 1 · heph log //app:img\n  \
+         select a builder with `builder = \"heph\"`"
+    );
+    // The record keeps the whole message, for `--json`.
+    assert!(remedy.diagnostic.message.ends_with(": exit status 1"));
 }
 
 #[test]
