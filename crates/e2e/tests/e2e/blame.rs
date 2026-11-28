@@ -29,7 +29,7 @@ use heph::htmatcher::Matcher;
 use heph::htpkg::PkgBuf;
 use heph::pluginexec;
 use heph::pluginstatictarget::Target;
-use hplugin::diagnostic::Stage;
+use hplugin::diagnostic::{Boundary, Stage};
 use hplugin::error::{CancelledError, Culprit, MissingDep, TargetFailure};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -200,24 +200,20 @@ async fn run(engine: &Arc<Engine>, a: &str) -> Run {
     r
 }
 
-/// The [`MissingDep`] a recorded failure's message says, read back from its
-/// text (`{declarer} depends on {dep}, which does not exist (`{origin}`, …`),
-/// or a panic. The record holds no error chain (D7b): what a user is told is
-/// the message, so that is where the facts must be.
+/// The [`MissingDep`] a recorded failure's record holds (its typed
+/// `missing_dep`), or a panic. The record holds no error chain (D7b), so the
+/// facts are its own fields, not read back from its message.
 fn missing_dep(f: &TargetFailure) -> MissingDep {
-    let text = crate::common::failure_text(f);
-    let parse = || -> Option<MissingDep> {
-        let (head, rest) = text.split_once(" depends on ")?;
-        let declarer = head.rsplit(' ').next()?;
-        let (dep, rest) = rest.split_once(", which does not exist (`")?;
-        let (origin, _) = rest.split_once('`')?;
-        Some(MissingDep {
-            dep: addr(dep),
-            declarer: addr(declarer),
-            origin_id: origin.to_owned(),
-        })
-    };
-    parse().unwrap_or_else(|| panic!("a MissingDep on {text}"))
+    let m = f
+        .record
+        .missing_dep
+        .as_ref()
+        .unwrap_or_else(|| panic!("a missing_dep on {:?}", f.record));
+    MissingDep {
+        dep: addr(&m.dep),
+        declarer: addr(&m.declarer),
+        origin_id: m.origin_id.clone(),
+    }
 }
 
 /// A BUILD-file workspace: `files` is `(package, content)`.
@@ -932,7 +928,14 @@ async fn transitive_dep_spec_error_blames_the_dep() -> anyhow::Result<()> {
     )?;
     let r = run(&ws.engine, "//f:l2").await;
     let f = r.assert_blames("//f:l3");
-    // The innermost stage frame (`get_spec //f:l3`) is the record's stage.
+    // The innermost stage frame (`get_spec //f:l3`) is the record's
+    // boundary, and its stage.
+    assert_eq!(
+        f.record.boundary.as_deref(),
+        Some(Boundary::GetSpec.as_str()),
+        "{:?}",
+        f.record
+    );
     assert_eq!(f.record.diagnostic.stage, Stage::Spec, "{:?}", f.record);
     assert_eq!(f.record.addr.as_deref(), Some("//f:l3"));
     Ok(())

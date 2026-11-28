@@ -79,6 +79,19 @@ pub enum Boundary {
 }
 
 impl Boundary {
+    /// Its name, as a [`FailureRecord::boundary`](hcore::failure::FailureRecord::boundary)
+    /// holds it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::GetSpec => "get_spec",
+            Self::GetDef => "get_def",
+            Self::Link => "link",
+            Self::Meta => "meta",
+            Self::Execute => "execute",
+            Self::Run => "run",
+        }
+    }
+
     /// The stage a failure under this boundary belongs to.
     pub fn stage(self) -> Stage {
         match self {

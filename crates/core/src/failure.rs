@@ -101,6 +101,28 @@ pub struct FailureRecord {
     /// wire as the failure happens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub took_down: Option<TookDownData>,
+    /// The engine boundary the failure crossed innermost (`get_spec`,
+    /// `get_def`, `link`, `meta`, `execute`, `run`), when it crossed one:
+    /// what set the stage of a failure that raised no diagnostic. A name, not
+    /// an enum, so a newer host's boundary never fails a reader's decode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boundary: Option<String>,
+    /// The failure is a target depending on one that does not exist: who
+    /// declared the dependency, on what, and the declaration's origin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub missing_dep: Option<MissingDepData>,
+}
+
+/// A dependency on a target that does not exist ([`FailureRecord::missing_dep`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissingDepData {
+    /// The target that does not exist.
+    pub dep: String,
+    /// The target that declared the dependency.
+    pub declarer: String,
+    /// The id of the declaration the dependency came from (the dep's
+    /// `deps`/`tools` origin).
+    pub origin_id: String,
 }
 
 /// The targets one culprit took down: the first few by name, in the order
@@ -132,6 +154,8 @@ impl FailureRecord {
             log: None,
             streamed: false,
             took_down: None,
+            boundary: None,
+            missing_dep: None,
         }
     }
 
@@ -165,6 +189,11 @@ impl FailureRecord {
             + self.entry.len()
             + self.exit.as_ref().map_or(0, |x| x.status.len())
             + opt(&self.frozen_diff)
+            + opt(&self.boundary)
+            + self
+                .missing_dep
+                .as_ref()
+                .map_or(0, |m| m.dep.len() + m.declarer.len() + m.origin_id.len())
     }
 
     /// How the failed process ended, in the words every renderer uses: its
@@ -448,6 +477,28 @@ mod tests {
     /// record on `ResultEnd`/`FileFailed` reaches `events.ndjson`, the
     /// session store and hook plugins (E2, D7b). A wire copy that names one
     /// decodes without it. In-process renderers read it off the record.
+    /// The typed facts are additive: absent, a record decodes without them
+    /// and encodes without the keys; a newer host's boundary name decodes as
+    /// it is.
+    #[test]
+    fn boundary_and_missing_dep_are_optional() {
+        let rec = FailureRecord::new(Diagnostic::new(crate::diagnostic::Stage::Link, "m"));
+        let json = serde_json::to_string(&rec).expect("encode");
+        assert!(
+            !json.contains("boundary") && !json.contains("missing_dep"),
+            "{json}"
+        );
+        let back: FailureRecord = serde_json::from_str(&json).expect("decode");
+        assert_eq!(back, rec);
+        let newer = json.replacen('{', r#"{"boundary":"from_the_future","missing_dep":{"dep":"//d:m","declarer":"//c:y","origin_id":"deps"},"#, 1);
+        let back: FailureRecord = serde_json::from_str(&newer).expect("decode");
+        assert_eq!(back.boundary.as_deref(), Some("from_the_future"));
+        assert_eq!(
+            back.missing_dep.map(|m| m.declarer).as_deref(),
+            Some("//c:y")
+        );
+    }
+
     #[test]
     fn memory_tail_never_serialized() {
         let rec = FailureRecord {

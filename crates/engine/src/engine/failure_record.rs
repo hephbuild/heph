@@ -145,23 +145,23 @@ pub(crate) fn compact(
     let mut causes = Vec::new();
     let found = find_diagnostic(e);
     let raised = found.is_some();
+    // The culprit declared a dependency on a target that does not exist.
+    let missing_dep =
+        downcast_chain_ref::<MissingDep>(e).filter(|m| culprit.target() == Some(&m.declarer));
+    let frame = hplugin::diagnostic::innermost_stage_frame(e);
     let mut diagnostic = match found {
         Some(d) => d.clone(),
         None => {
             // A dependent blamed for an input that does not exist stopped
             // linking its inputs; the innermost frame is the input's
             // `get_def`, which would read as a parse failure.
-            let missing_dep = downcast_chain_ref::<MissingDep>(e)
-                .is_some_and(|m| culprit.target() == Some(&m.declarer));
-            let stage = if missing_dep {
+            let stage = if missing_dep.is_some() {
                 Stage::Link
             } else {
-                hplugin::diagnostic::innermost_stage_frame(e)
-                    .map(StageFrame::stage)
-                    .unwrap_or(match culprit {
-                        Culprit::File(_) => Stage::Eval,
-                        Culprit::Target(_) => Stage::Run,
-                    })
+                frame.map(StageFrame::stage).unwrap_or(match culprit {
+                    Culprit::File(_) => Stage::Eval,
+                    Culprit::Target(_) => Stage::Run,
+                })
             };
             Diagnostic::new(stage, own_message(e, &mut causes))
         }
@@ -180,6 +180,12 @@ pub(crate) fn compact(
     rec.file = culprit.file().map(str::to_owned);
     rec.entry = entry.format();
     rec.causes = causes;
+    rec.boundary = frame.map(|f| f.boundary.as_str().to_owned());
+    rec.missing_dep = missing_dep.map(|m| hcore::failure::MissingDepData {
+        dep: m.dep.format(),
+        declarer: m.declarer.format(),
+        origin_id: m.origin_id.clone(),
+    });
 
     (rec.exit, rec.timed_out) = exec_facts(e);
     // A process that ended with no diagnostic of its driver's is said as
@@ -336,6 +342,8 @@ fn scrubbed(mut rec: FailureRecord, clean: &impl Fn(&str) -> String) -> FailureR
         entry: _,
         path: _,
         took_down: _,
+        missing_dep: _,
+        boundary: _,
         more_causes: _,
         failed_in: _,
         timed_out: _,
