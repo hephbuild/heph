@@ -1424,6 +1424,56 @@ mod tests {
         );
     }
 
+    /// FQ-4: a pure chain of 5000 selected targets, all skipped under the
+    /// one culprit at its foot. Every node is asked for its record, and each
+    /// record carries the whole path down: the output is quadratic in the
+    /// chain's depth, 12,507,500 path entries for 5000 records, made by one
+    /// pass over the graph.
+    #[tokio::test]
+    async fn finish_pure_chain_output_size() {
+        const N: usize = 5_000;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine =
+            Arc::new(Engine::new(crate::engine::Config::for_tests(dir.path())).expect("engine"));
+        let rs = engine.new_state_with_events(false, None);
+        let a = |s: &str| crate::htaddr::parse_addr(s).expect("addr");
+        let names: Vec<String> = (0..N).map(|i| format!("//p:n{i:04}")).collect();
+        let chain: Vec<Addr> = names.iter().map(|n| a(n)).collect();
+        let c = a("//p:c");
+        for w in chain.windows(2) {
+            if let [from, to] = w {
+                rs.add_dep_for_test(from, to).expect("edge");
+            }
+        }
+        rs.add_dep_for_test(&chain[N - 1], &c).expect("edge");
+        rs.mark_requested(&chain[0]);
+        rs.record_failure(
+            Culprit::Target(c.clone()),
+            Arc::new(TargetFailure::new(c, None, anyhow::anyhow!("boom"))),
+        );
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let events = std::iter::once(ev(0, matched(&refs, true)))
+            .chain(
+                refs.iter()
+                    .map(|n| ev(1, end(n, Some("dependency failed"), Some("//p:c")))),
+            )
+            .collect();
+        let (_, mut f) = fold_with(events, &Known::default());
+        let entries = f.finish(&rs);
+        assert_eq!(rs.report_passes(), 1);
+        assert_eq!(entries.len(), N, "one record per skipped target");
+        let paths: Vec<usize> = entries
+            .iter()
+            .map(|e| e.path.as_ref().map_or(0, Vec::len))
+            .collect();
+        // `n_i`'s path is `n_i … n_4999, c`: N - i + 1 entries.
+        assert_eq!(paths.first(), Some(&(N + 1)));
+        assert_eq!(paths.last(), Some(&2));
+        let total: usize = paths.iter().sum();
+        assert_eq!(total, N * (N + 1) / 2 + N);
+        assert_eq!(total, 12_507_500);
+    }
+
     /// A dependency that built, then was blamed when it later ended failed,
     /// all before the matched set completed: its culprit record is written
     /// at the end of matching, not lost behind its first, successful end.
