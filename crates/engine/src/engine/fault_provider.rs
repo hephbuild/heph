@@ -825,6 +825,59 @@ mod tests {
         Ok(())
     }
 
+    /// A not-found of the dep a target declares, in a request that loaded no
+    /// index yet: the `MissingDep` is located at the option its origin names,
+    /// because locating it loads the index first (FQ r2 N-3). Any other
+    /// failure is `otherwise`'s, and loads nothing.
+    #[tokio::test]
+    async fn a_missing_dep_loads_the_index_it_is_located_in() -> anyhow::Result<()> {
+        let index = SourceIndexFn::new(|_| {
+            Some(
+                Arc::new(FixedIndex(crate::engine::provider::Located::Field(span(
+                    4, 9,
+                )))) as Arc<dyn SourceIndex>,
+            )
+        });
+        let (engine, _root) = located_engine(Some(index))?;
+        let rs = engine.new_state();
+        let declarer = addr("//a:x");
+        Arc::clone(&engine)
+            .get_spec(Arc::clone(&rs), &declarer)
+            .await?;
+        let dep = addr("//d:gone");
+
+        let other = rs
+            .missing_dep_or(
+                anyhow::anyhow!("boom"),
+                &dep,
+                &declarer,
+                || "deps".to_owned(),
+                |e| e.context("otherwise"),
+            )
+            .await;
+        assert_eq!(format!("{other:#}"), "otherwise: boom");
+        assert_eq!(rs.source_index_loads(), 0, "not a not-found: no load");
+
+        let e = rs
+            .missing_dep_or(
+                hplugin::error::TargetNotFoundError { addr: dep.clone() }.into(),
+                &dep,
+                &declarer,
+                || "deps".to_owned(),
+                |e| e.context("otherwise"),
+            )
+            .await;
+        let missing = hcore::hmemoizer::downcast_chain_ref::<hplugin::error::MissingDep>(&e)
+            .expect("a MissingDep");
+        let at = missing.at.as_ref().expect("a location");
+        assert_eq!(
+            (at.loc.file.as_str(), at.loc.line, at.loc.col),
+            ("a/BUILD", 4, 9)
+        );
+        assert_eq!(rs.source_index_loads(), 1);
+        Ok(())
+    }
+
     /// A driver named `refuse` whose `parse` fails: with a cancellation when
     /// it holds `true`, else with a refusal.
     struct RefusingDriver(bool);

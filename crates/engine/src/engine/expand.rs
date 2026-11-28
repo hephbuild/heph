@@ -1,8 +1,8 @@
 use crate::engine::Engine;
-use crate::engine::deferred::{declared_origin, origin_field};
+use crate::engine::deferred::declared_origin;
 use crate::engine::driver::TargetAddr;
 use crate::engine::driver::targetdef::{Input, InputMode, TargetDef};
-use crate::engine::error::{InputDefFailed, MissingDep, MultiError};
+use crate::engine::error::{InputDefFailed, MultiError};
 use crate::engine::invoke::EntrypointAsInput;
 use crate::engine::request_state::{AddrKey, RequestState};
 use crate::engine::result::ExtendedTargetDef;
@@ -515,7 +515,8 @@ impl Engine {
     /// could run something in a developer's cwd.
     ///
     /// A def that fails is marked where it fails, for the failure classifier:
-    /// a not-found of the input itself is `declarer`'s [`MissingDep`] (the
+    /// a not-found of the input itself is `declarer`'s
+    /// [`MissingDep`](crate::engine::error::MissingDep) (the
     /// target, or the group, that names it), anything else the input's own
     /// failure ([`InputDefFailed`]), never `declarer`'s.
     fn input_defs<'a>(
@@ -544,26 +545,24 @@ impl Engine {
                                 .then(|| rs.transitive_declarer(&input.origin_id))
                                 .flatten();
                             let declarer = real.as_ref().unwrap_or(declarer);
-                            if MissingDep::names(&e, dep) {
-                                rs.load_source_index(declarer).await;
-                            }
-                            return Err(MissingDep::wrap_or(
-                                e,
-                                dep,
-                                declarer,
-                                || {
-                                    transitive_origin(&input.origin_id)
-                                        .unwrap_or_else(|| declared_origin(&input.origin_id))
-                                },
-                                |o| rs.decl_field_loc(declarer, origin_field(o)),
-                                |e| {
-                                    e.context(InputDefFailed {
-                                        input: dep.clone(),
-                                        declarer: declarer.clone(),
-                                        origin_id: input.origin_id.clone(),
-                                    })
-                                },
-                            ));
+                            return Err(rs
+                                .missing_dep_or(
+                                    e,
+                                    dep,
+                                    declarer,
+                                    || {
+                                        transitive_origin(&input.origin_id)
+                                            .unwrap_or_else(|| declared_origin(&input.origin_id))
+                                    },
+                                    |e| {
+                                        e.context(InputDefFailed {
+                                            input: dep.clone(),
+                                            declarer: declarer.clone(),
+                                            origin_id: input.origin_id.clone(),
+                                        })
+                                    },
+                                )
+                                .await);
                         }
                     };
                     if def.target_def.entrypoint.is_some() {
