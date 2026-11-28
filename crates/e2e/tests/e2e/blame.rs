@@ -503,6 +503,45 @@ async fn walk_into_broken_loaded_file_enters_through_the_scanned_package() -> an
     Ok(())
 }
 
+/// CQ round 2: the walk of `-e '//a:x || //d/...'` fails on `d/sub/BUILD`,
+/// a package no named address is in. `//a:x` did not lead into the file, so
+/// it is neither requested for it nor its entry: the error is returned as a
+/// pure package selection's is, and `//a:x` is blamed for nothing.
+#[tokio::test]
+async fn walk_into_broken_package_no_named_address_is_in_blames_none() -> anyhow::Result<()> {
+    let ws = build_ws(&[
+        ("a", &t("x", "")),
+        ("d/sub", "target(name = \"t\"\nbroken(\n"),
+    ]);
+    let r = run_matcher(
+        &ws.engine,
+        &Matcher::Or(vec![
+            Matcher::Addr(addr("//a:x")),
+            Matcher::PackagePrefix(PkgBuf::from("d")),
+        ]),
+    )
+    .await;
+    let err = r.err.as_ref().expect("the selection must fail");
+    assert!(
+        r.failures.iter().all(|f| f.addr.format() != "//a:x"),
+        "//a:x is no file's entry:\n{}\nerr: {err:#}",
+        r.describe()
+    );
+    let entered: Vec<&str> = r
+        .events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            BuildEventKind::FileFailed { entry, .. } => Some(entry.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(!entered.contains(&"//a:x"), "{entered:?}");
+    // The same as the package alone.
+    let pure = run_matcher(&ws.engine, &Matcher::PackagePrefix(PkgBuf::from("d"))).await;
+    assert_eq!(r.culprits(), pure.culprits(), "{}", r.describe());
+    Ok(())
+}
+
 /// D1.c rule 5: `a → b → c → d` with `d/BUILD` failing at evaluation (not
 /// parse): the file, never `//c:t`, which only resolved it.
 #[tokio::test]

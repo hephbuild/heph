@@ -2389,8 +2389,9 @@ fn announce_culprit(
 /// against the file (U2), through the same registry as every other culprit,
 /// so it is one failure however many requested targets the file holds, and
 /// the run reports it like any other. The record's address is the requested
-/// one that led into the file. Any other walk error, and one from a matcher
-/// that names no address (a package pattern), is returned unchanged.
+/// one that led into the file. Any other walk error, one from a matcher that
+/// names no address (a package pattern), and one from a walk of a package no
+/// named address is in, is returned unchanged.
 fn blame_walk_failure(rs: &RequestState, matcher: &Matcher, e: anyhow::Error) -> anyhow::Error {
     let Some(file) = downcast_chain_ref::<FileEvalFailed>(&e) else {
         return e;
@@ -2402,14 +2403,19 @@ fn blame_walk_failure(rs: &RequestState, matcher: &Matcher, e: anyhow::Error) ->
     // it loads, or a parent package's BUILD, anywhere in the tree. The
     // file's own directory only when the walk did not say (a confirm's
     // resolution, which names its target's package anyway).
-    let pkg = match downcast_chain_ref::<crate::engine::discovery::WalkedPackage>(&e) {
-        Some(w) => w.package.as_str(),
-        None => std::path::Path::new(&*file.file)
-            .parent()
-            .and_then(std::path::Path::to_str)
-            .unwrap_or(""),
+    // A scanned package no named address is in was walked for a package
+    // pattern: none of them led into the file.
+    let (pkg, any) = match downcast_chain_ref::<crate::engine::discovery::WalkedPackage>(&e) {
+        Some(w) => (w.package.as_str(), false),
+        None => (
+            std::path::Path::new(&*file.file)
+                .parent()
+                .and_then(std::path::Path::to_str)
+                .unwrap_or(""),
+            true,
+        ),
     };
-    let Some(entry) = walk_entry(matcher, pkg) else {
+    let Some(entry) = walk_entry(matcher, pkg, any) else {
         return e;
     };
     // Named by the selection, so requested though its match never resolved:
@@ -2418,9 +2424,9 @@ fn blame_walk_failure(rs: &RequestState, matcher: &Matcher, e: anyhow::Error) ->
     classify_failure_fresh(rs, &entry, e).0
 }
 
-/// The matcher's first named address in package `pkg`, else its first named
-/// address: what a failed walk of `pkg` was resolving for.
-fn walk_entry(matcher: &Matcher, pkg: &str) -> Option<Addr> {
+/// The matcher's first named address in package `pkg`, else (when `any`)
+/// its first named address: what a failed walk of `pkg` was resolving for.
+fn walk_entry(matcher: &Matcher, pkg: &str, any: bool) -> Option<Addr> {
     fn named<'m>(m: &'m Matcher, out: &mut Vec<&'m Addr>) {
         match m {
             Matcher::Addr(a) => out.push(a),
@@ -2438,7 +2444,7 @@ fn walk_entry(matcher: &Matcher, pkg: &str) -> Option<Addr> {
     addrs
         .iter()
         .find(|a| a.package.as_str() == pkg)
-        .or_else(|| addrs.first())
+        .or_else(|| addrs.first().filter(|_| any))
         .map(|a| (*a).clone())
 }
 
