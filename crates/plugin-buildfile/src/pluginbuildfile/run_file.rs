@@ -8,10 +8,11 @@ use hcore::htvalue::signature::{FnSignature, ParamType};
 use hcore::htvalue::{self, parse_map_string_string, parse_map_string_strings, parse_strings};
 use hmodel::htaddr;
 use hmodel::htpkg::PkgBuf;
+use hplugin::diagnostic::Span;
 use hplugin::driver::sandbox::{Dep, Env, EnvValue, Mode, Sandbox, SandboxParts, Tool};
 use hplugin::driver::{DriverSchema, TargetAddr};
 use hplugin::function::{FnArgs, FnCallContext, FunctionRegistry, PluginFn};
-use hplugin::provider::{Approval, ProvenanceFrame};
+use hplugin::provider::{Approval, ProvenanceFrame, SpecSource};
 use hwalk::{CachedWalker, EntryKind};
 use starlark::any::ProvidesStaticType;
 use starlark::environment::{FrozenModule, Globals, GlobalsBuilder, Module};
@@ -666,13 +667,23 @@ pub(crate) struct OnTargetPayload {
 pub(crate) struct DeclSite {
     pub span: Option<starlark::codemap::FileSpan>,
     pub cell: Option<Arc<str>>,
+    /// The same call as the spec reports it ([`TargetSpec::source`]): the
+    /// workspace-relative file and the call's span. `None` for a call outside
+    /// the workspace (a builtin module's) or with no span. The innermost
+    /// frame, so a macro's `target()` call points into the `.bzl`.
+    ///
+    /// [`TargetSpec::source`]: hplugin::provider::TargetSpec::source
+    pub source: Option<SpecSource>,
 }
 
 impl DeclSite {
     fn capture(eval: &Evaluator, extra: &Extra) -> Self {
+        let span = eval.call_stack_top_location();
+        let source = span.as_ref().and_then(|span| spec_source(extra, span));
         Self {
-            span: eval.call_stack_top_location(),
+            span,
             cell: extra.cell.borrow().clone(),
+            source,
         }
     }
 
@@ -686,6 +697,40 @@ impl DeclSite {
         }
         out
     }
+}
+
+/// `span` as a [`SpecSource`]: its file relative to the workspace root (one
+/// `Arc` per file, kept in [`Extra::source_file`]) and its start and end as
+/// 1-based line:col, columns in chars as starlark counts them. `None` when the
+/// file is outside the workspace or not UTF-8.
+fn spec_source(extra: &Extra, span: &starlark::codemap::FileSpan) -> Option<SpecSource> {
+    let file = {
+        let mut last = extra.source_file.borrow_mut();
+        match &*last {
+            Some((abs, rel)) if abs == span.filename() => Arc::clone(rel),
+            _ => {
+                let rel: Arc<str> = Path::new(span.filename())
+                    .strip_prefix(extra.root)
+                    .ok()?
+                    .to_str()?
+                    .into();
+                *last = Some((span.filename().to_owned(), Arc::clone(&rel)));
+                rel
+            }
+        }
+    };
+    let rs = span.resolve_span();
+    let one_based = |n: usize| u32::try_from(n).unwrap_or(u32::MAX - 1).saturating_add(1);
+    SpecSource::checked(
+        file,
+        Span {
+            start_line: one_based(rs.begin.line),
+            start_col: one_based(rs.begin.column),
+            end_line: one_based(rs.end.line),
+            end_col: one_based(rs.end.column),
+        },
+    )
+    .ok()
 }
 
 /// `p/BUILD:12`: a span as errors name it, its file relative to the workspace
@@ -1117,6 +1162,10 @@ pub(crate) struct Extra<'a> {
     /// overhead there); on only for the LSP, which needs it to map a source
     /// position back to the targets a symbol produced.
     pub capture_provenance: bool,
+    /// The last file a declaration was made in, as its span names it, and its
+    /// workspace-relative path: what [`DeclSite::source`] points at, shared by
+    /// that file's targets rather than built once per target.
+    pub source_file: std::cell::RefCell<Option<(String, Arc<str>)>>,
 }
 
 /// Unsupported starlark value types (not str/bool/int/float/list/dict) are a
@@ -2810,6 +2859,7 @@ fn eval_ast(
             root: &loader.root,
             cell: std::cell::RefCell::new(None),
             capture_provenance,
+            source_file: std::cell::RefCell::new(None),
             on_target: {
                 let targets = targets.clone();
                 Box::new(move |p| {
