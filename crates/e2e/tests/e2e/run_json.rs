@@ -106,6 +106,19 @@ pub(crate) async fn run_json_with(
     cancel_at: Option<&str>,
     fail_fast: bool,
 ) -> JsonRun {
+    run_json_full(engine, m, flags, cancel_at, fail_fast, false).await
+}
+
+/// [`run_json_with`]; with `cancel_first`, the request is cancelled before
+/// the build starts, so the walk never runs.
+async fn run_json_full(
+    engine: &Arc<Engine>,
+    m: &Matcher,
+    flags: &[&str],
+    cancel_at: Option<&str>,
+    fail_fast: bool,
+    cancel_first: bool,
+) -> JsonRun {
     let args = RunArgs::try_parse_from(flags).expect("run flags");
     let out = &args.out;
     assert!(out.enabled(), "{flags:?}");
@@ -115,6 +128,9 @@ pub(crate) async fn run_json_with(
     let (tx, rx) = request_events(out.enabled(), Some(forward.clone()));
     let rx = rx.expect("under an output flag the request gets its own channel");
     let rs = engine.new_state_with_events(fail_fast, tx);
+    if cancel_first {
+        rs.ctoken().cancel();
+    }
     let gaps = Gaps::new("test");
     let opts = ResultOptions {
         discovery: Discovery::keep_going_unless(fail_fast, &gaps),
@@ -838,6 +854,132 @@ async fn package_matcher_broken_dep_file() {
             run.boxes
         );
     }
+}
+
+/// A BUILD file that does not parse, for the keep-going blame rows below.
+const BROKEN_BUILD: &str = "target(name = \"t\"\nbroken(\n";
+
+/// Whether any `FileFailed` was announced for `file`.
+fn file_failed(run: &JsonRun, file: &str) -> usize {
+    run.events
+        .iter()
+        .filter(|e| matches!(&e.kind, BuildEventKind::FileFailed { file: f, .. } if f == file))
+        .count()
+}
+
+/// U2 under a selection that does not name its targets only by address:
+/// `//d:t` beside a package or a label. What else `d` held is unknown, so
+/// its gap is kept (the list stays open, the selection is incomplete) and
+/// nothing is recorded for the named address, which never had a scope. The
+/// healthy part of the selection still runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn broken_named_package_beside_a_package_or_label_keeps_its_gap() {
+    let root = tempfile::tempdir().expect("root tempdir");
+    write_pkg(root.path(), "q", &bash("ok", r#", labels = ["x"]"#));
+    write_pkg(root.path(), "d", BROKEN_BUILD);
+    let engine = build_engine_with_remote(root.path(), None);
+
+    for m in [
+        Matcher::Or(vec![addr("//d:t"), Matcher::Package(PkgBuf::from("q"))]),
+        Matcher::Or(vec![addr("//d:t"), Matcher::Label("x".into())]),
+    ] {
+        let run = run_json(&engine, &m, &["--json"], None).await;
+        assert!(!run.closed, "{m:?}: the gap leaves the list open");
+        let skipped = run
+            .complete
+            .as_ref()
+            .expect_err("the selection is incomplete");
+        assert!(
+            skipped
+                .downcast_ref::<heph::commands::errors::IncompleteSelection>()
+                .is_some(),
+            "{m:?}: {skipped:#}"
+        );
+        // The second selection finds the first one's output in the cache.
+        let ok = &run.entry("//q:ok")["outcome"];
+        assert!(ok == "ran" || ok == "cached", "{m:?}: {ok}");
+        assert!(
+            run.entries
+                .iter()
+                .all(|e| e["addr"] != "//d:t" && e["file"].is_null()),
+            "{m:?}: nothing recorded for //d:t: {:?}",
+            run.entries
+        );
+        assert_eq!(file_failed(&run, "d/BUILD"), 0, "{m:?}");
+    }
+}
+
+/// U2 with a healthy named sibling: `//d:t` in a broken package and
+/// `//q:ok`. The sibling runs, the file is recorded once and takes `//d:t`
+/// down, and every named address is accounted for: the list closes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn broken_named_package_beside_a_healthy_named_sibling() {
+    let root = tempfile::tempdir().expect("root tempdir");
+    write_pkg(root.path(), "q", &bash("ok", ""));
+    write_pkg(root.path(), "d", BROKEN_BUILD);
+    let engine = build_engine_with_remote(root.path(), None);
+
+    let m = Matcher::Or(vec![addr("//d:t"), addr("//q:ok")]);
+    let run = run_json(&engine, &m, &["--json"], None).await;
+    assert!(run.closed, "{:?}", run.entries);
+    assert!(run.complete.is_ok(), "{:?}", run.complete);
+    assert!(run.res.is_err(), "the run fails");
+    assert_eq!(run.entry("//q:ok")["outcome"], "ran");
+    let files: Vec<&Value> = run
+        .entries
+        .iter()
+        .filter(|e| e["file"] == "d/BUILD")
+        .collect();
+    assert_eq!(files.len(), 1, "one file record: {:?}", run.entries);
+    assert_eq!(file_failed(&run, "d/BUILD"), 1);
+    let t = run.entry("//d:t");
+    assert_eq!(t["outcome"], "skipped", "{t}");
+    assert_eq!(t["root_file"], "d/BUILD", "{t}");
+    assert_eq!(run.entries.len(), 3, "{:?}", run.entries);
+    assert_eq!(run.box_count(), 1, "{}", run.boxes);
+}
+
+/// U2 for an address the broken package may not even declare: whether it
+/// exists is unknowable while the file does not evaluate, so it is the
+/// file's, as a declared one would be, and the list closes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn broken_named_package_missing_address_is_the_files() {
+    let root = tempfile::tempdir().expect("root tempdir");
+    write_pkg(root.path(), "d", BROKEN_BUILD);
+    let engine = build_engine_with_remote(root.path(), None);
+
+    let run = run_json(&engine, &addr("//d:nope"), &["--json"], None).await;
+    assert!(run.closed, "{:?}", run.entries);
+    assert!(run.complete.is_ok(), "{:?}", run.complete);
+    assert!(run.res.is_err(), "the run fails");
+    assert_eq!(run.entries.len(), 2, "{:?}", run.entries);
+    assert_eq!(run.entries[0]["file"], "d/BUILD", "{:?}", run.entries);
+    let t = run.entry("//d:nope");
+    assert_eq!(t["outcome"], "skipped", "{t}");
+    assert_eq!(t["root_file"], "d/BUILD", "{t}");
+    assert_eq!(file_failed(&run, "d/BUILD"), 1);
+}
+
+/// A request cancelled before its walk blames no file: the run is a
+/// cancel, nothing is recorded, nothing announced, and the list is open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn broken_named_package_cancelled_before_the_walk() {
+    let root = tempfile::tempdir().expect("root tempdir");
+    write_pkg(root.path(), "d", BROKEN_BUILD);
+    let engine = build_engine_with_remote(root.path(), None);
+
+    let run = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        run_json_full(&engine, &addr("//d:t"), &["--json"], None, false, true),
+    )
+    .await
+    .expect("the cancelled run ends");
+    let err = run.res.as_ref().expect_err("cancelled");
+    assert!(heph::commands::errors::is_cancelled(err), "{err:#}");
+    assert!(!run.closed, "a cancelled run's list is not whole");
+    assert!(run.entries.is_empty(), "{:?}", run.entries);
+    assert_eq!(file_failed(&run, "d/BUILD"), 0);
+    assert_eq!(run.box_count(), 0, "{}", run.boxes);
 }
 
 /// D5: whichever order the selection names them in, a culprit's record is
