@@ -64,7 +64,7 @@ pub(crate) const FAILURES_DIR: &str = "failures";
 pub(crate) const TEMP_PREFIX: &str = ".tmp-";
 /// The kept log, inside a slot.
 pub use hcore::failure_log::LOG;
-use hcore::failure_log::MANIFEST;
+use hcore::failure_log::{DIAGNOSTIC, MANIFEST};
 /// The kept `failure_out` matches, inside a slot, by workspace-relative path.
 pub const OUT: &str = "out";
 /// Every path a failed `in_place` run wrote back over the tree, one per line,
@@ -853,12 +853,18 @@ pub fn read_manifest(dir: &Path, addr: &Addr) -> Option<SlotManifest> {
 /// The manifest of the slot at `dir`, if it is complete and of a version this
 /// heph reads, whichever address it names. What `heph tool gc` reads a slot
 /// it found by listing with. A complete slot holds a `log.txt`, an `out/`, a
-/// `fixes.txt`, or any of them together.
+/// `fixes.txt`, a `diagnostic.json` (a failure before the run keeps only
+/// that), or any of them together. A `diagnostic.json` of a version this heph
+/// does not read still makes the slot complete; it reads as no diagnostic
+/// ([`hcore::failure_log::read_diagnostic`]).
 pub(crate) fn read_any_manifest(dir: &Path) -> Option<SlotManifest> {
     let bytes = std::fs::read(dir.join(MANIFEST)).ok()?;
     let m: SlotManifest = serde_json::from_slice(&bytes).ok()?;
     (m.version == MANIFEST_VERSION
-        && (dir.join(LOG).is_file() || dir.join(OUT).is_dir() || dir.join(FIXES).is_file()))
+        && (dir.join(LOG).is_file()
+            || dir.join(OUT).is_dir()
+            || dir.join(FIXES).is_file()
+            || dir.join(DIAGNOSTIC).is_file()))
     .then_some(m)
 }
 
@@ -1043,6 +1049,80 @@ mod tests {
         )
         .expect("m");
         assert_eq!(slots.read(&a), Some(manifest_for(&a)));
+    }
+
+    /// A manifest written before `hashin` was optional, and one written for a
+    /// failure before the run (no `hashin`, no `fill_id`), both read.
+    #[test]
+    fn slot_manifest_without_hashin_reads() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let slots = FailureSlots::new(home.path());
+        let a = addr("//p:a");
+        let dir = slots.slot_dir(&a);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(dir.join(LOG), "x").expect("log");
+        let old = format!(
+            r#"{{"version":1,"addr":"{}","hashin":"h","failed_at":7}}"#,
+            a.format()
+        );
+        std::fs::write(dir.join(MANIFEST), old).expect("m");
+        let m = slots.read(&a).expect("an older heph's slot reads");
+        assert_eq!(
+            (m.hashin.as_deref(), m.fill_id, m.failed_at),
+            (Some("h"), None, 7)
+        );
+        let pre_run = format!(r#"{{"version":1,"addr":"{}","failed_at":8}}"#, a.format());
+        std::fs::write(dir.join(MANIFEST), pre_run).expect("m");
+        let m = slots.read(&a).expect("a slot with no revision reads");
+        assert_eq!((m.hashin, m.failed_at), (None, 8));
+    }
+
+    /// A slot filled before the run holds a manifest and `diagnostic.json`
+    /// only, and is complete: not read as absent.
+    #[test]
+    fn slot_with_diagnostic_and_no_log_is_complete() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let slots = FailureSlots::new(home.path());
+        let a = addr("//p:a");
+        let dir = slots.slot_dir(&a);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let mut m = manifest_for(&a);
+        m.hashin = None;
+        std::fs::write(dir.join(MANIFEST), serde_json::to_vec(&m).expect("json")).expect("m");
+        assert_eq!(slots.read(&a), None, "a manifest alone is no slot");
+        let rec = hcore::failure::FailureRecord::new(hcore::diagnostic::Diagnostic::new(
+            hcore::diagnostic::Stage::Spec,
+            "no such dep",
+        ));
+        let bytes =
+            hcore::failure_log::encode_diagnostic(&rec, m.fill_id.as_deref()).expect("encode");
+        std::fs::write(dir.join(DIAGNOSTIC), bytes).expect("diagnostic");
+        assert_eq!(slots.read(&a), Some(m));
+        let read = hcore::failure_log::read_diagnostic(&dir).expect("the diagnostic reads");
+        assert_eq!(read.diagnostic.message, "no such dep");
+    }
+
+    /// A `diagnostic.json` of a version this heph does not know still makes
+    /// the slot complete, and reads as no diagnostic.
+    #[test]
+    fn diagnostic_json_unknown_version_ignored() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let slots = FailureSlots::new(home.path());
+        let a = addr("//p:a");
+        let dir = slots.slot_dir(&a);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let m = manifest_for(&a);
+        std::fs::write(dir.join(MANIFEST), serde_json::to_vec(&m).expect("json")).expect("m");
+        let future = format!(
+            r#"{{"version":99,"fill_id":"{}","stage":"def","message":"from the future"}}"#,
+            m.fill_id.as_deref().unwrap_or_default()
+        );
+        std::fs::write(dir.join(DIAGNOSTIC), future).expect("diagnostic");
+        assert_eq!(slots.read(&a), Some(m), "the slot is complete");
+        assert!(
+            hcore::failure_log::read_diagnostic(&dir).is_none(),
+            "an unknown version is no diagnostic"
+        );
     }
 
     #[test]
