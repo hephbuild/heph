@@ -41,6 +41,7 @@ mod json_print_gate;
 mod lint_gate;
 mod log_cmd;
 mod lsp_lifecycle;
+mod plugin_agnostic_gate;
 mod resources_gate;
 mod run_outputs_cli;
 mod stack_status;
