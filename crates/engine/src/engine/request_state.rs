@@ -710,6 +710,17 @@ impl TookDown {
     pub const NAMED: usize = 5;
 }
 
+/// The values a request's targets were handed to scrub
+/// ([`RequestStateData::scrubs`]).
+#[derive(Default)]
+struct Scrubs {
+    by_addr: FxHashMap<Addr, crate::engine::failure_record::Scrub>,
+    /// Every value of `by_addr` together, with its scrubber: built by the
+    /// first failure event after a change, dropped by the next change
+    /// (FQ-15).
+    all: Option<Arc<crate::engine::failure_record::Scrub>>,
+}
+
 /// Shared mutable state for a request — common across all child RequestStates.
 pub struct RequestStateData {
     pub engine: Weak<Engine>,
@@ -860,7 +871,7 @@ pub struct RequestStateData {
     /// state only: never on a def, never hashed (I1), dropped with the
     /// request. Written only by a target that has some to scrub, read only on
     /// a failure.
-    scrubs: Mutex<FxHashMap<Addr, crate::engine::failure_record::Scrub>>,
+    scrubs: Mutex<Scrubs>,
     /// The target behind each `_transitive_<hash>_<i>` origin id a
     /// dependent's merged transitive inputs carry, keyed by `<hash>`
     /// (`Addr::hash_str`): who declared a merged input, for a failure that
@@ -1522,19 +1533,21 @@ impl RequestState {
         if values.peek().is_none() {
             return;
         }
-        self.data
-            .scrubs
-            .lock()
+        let mut scrubs = self.data.scrubs.lock();
+        scrubs
+            .by_addr
             .entry(addr.clone())
             .or_default()
             .extend(values);
+        scrubs.all = None;
     }
 
     /// Every value `addrs` were handed to scrub, together: what a failure
     /// recorded against one of them and entered through another is
     /// scrubbed of. Empty when none has any.
     pub(crate) fn scrub_for(&self, addrs: &[&Addr]) -> crate::engine::failure_record::Scrub {
-        let scrubs = self.data.scrubs.lock();
+        let guard = self.data.scrubs.lock();
+        let scrubs = &guard.by_addr;
         let mut out = crate::engine::failure_record::Scrub::default();
         if scrubs.is_empty() {
             return out;
@@ -2150,12 +2163,15 @@ impl RequestStateData {
     /// a text this has not seen. Called on the failure path only.
     pub(crate) fn scrub_event_text(&self, text: &str) -> String {
         let all = {
-            let scrubs = self.scrubs.lock();
-            let mut all = crate::engine::failure_record::Scrub::default();
-            for s in scrubs.values() {
-                all.extend_from(s);
-            }
-            all
+            let scrubs = &mut *self.scrubs.lock();
+            let by_addr = &scrubs.by_addr;
+            Arc::clone(scrubs.all.get_or_insert_with(|| {
+                let mut all = crate::engine::failure_record::Scrub::default();
+                for s in by_addr.values() {
+                    all.extend_from(s);
+                }
+                Arc::new(all)
+            }))
         };
         crate::engine::failure_record::scrub_line(text, &all)
     }
@@ -2523,7 +2539,7 @@ impl Engine {
             bg_pending: Arc::clone(&bg_pending),
             sandbox_removals: crate::engine::sandbox_cleaner::PendingCounter::default(),
             failures: Mutex::new(indexmap::IndexMap::new()),
-            scrubs: Mutex::new(FxHashMap::default()),
+            scrubs: Mutex::new(Scrubs::default()),
             transitive_declarers: Mutex::new(FxHashMap::default()),
             report_passes: std::sync::atomic::AtomicUsize::new(0),
             path_passes: std::sync::atomic::AtomicUsize::new(0),
@@ -2613,6 +2629,25 @@ mod tests {
             "[redacted] [redacted] secret-of-c short"
         );
         assert!(rs.scrub_for(&[&addr("d")]).is_empty());
+        Ok(())
+    }
+
+    /// FQ-15: the union every event is scrubbed with is built once, and a
+    /// value added after it was built is scrubbed from the next event on.
+    #[test]
+    fn event_text_is_scrubbed_of_a_value_added_later() -> anyhow::Result<()> {
+        let (_dir, engine) = test_engine()?;
+        let rs = engine.new_state();
+        assert_eq!(rs.data.scrub_event_text("secret-of-a"), "secret-of-a");
+        rs.add_scrub(&addr("a"), ["secret-of-a".to_owned()]);
+        let text = "secret-of-a secret-of-b";
+        assert_eq!(rs.data.scrub_event_text(text), "[redacted] secret-of-b");
+        let built = rs.data.scrubs.lock().all.clone().expect("built");
+        assert_eq!(rs.data.scrub_event_text(text), "[redacted] secret-of-b");
+        let again = rs.data.scrubs.lock().all.clone().expect("kept");
+        assert!(Arc::ptr_eq(&built, &again), "built once");
+        rs.add_scrub(&addr("b"), ["secret-of-b".to_owned()]);
+        assert_eq!(rs.data.scrub_event_text(text), "[redacted] [redacted]");
         Ok(())
     }
 
