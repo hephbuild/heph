@@ -131,21 +131,34 @@ const PATH_SHOWN_WHOLE: usize = 5;
 /// is the one to edit, so it is always shown. `--json` carries the whole
 /// path; only text elides it.
 fn elide_path<S: AsRef<str>>(path: &[S]) -> String {
-    let shown = |p: &[&S]| {
+    let shown = |p: &[S]| {
         p.iter()
             .map(|a| crate::tui::text::clean_inline(a.as_ref()).into_owned())
             .collect::<Vec<_>>()
             .join(" → ")
     };
-    match path {
-        [a, b, hidden @ .., y, z] if path.len() > PATH_SHOWN_WHOLE => format!(
-            "{} → … {} more (--json has the full path) … → {}",
-            shown(&[a, b]),
-            hidden.len(),
-            shown(&[y, z]),
+    match path_elision(path) {
+        (head, 0, _) => shown(head),
+        (head, hidden, tail) => format!(
+            "{} → … {hidden} more (--json has the full path) … → {}",
+            shown(head),
+            shown(tail),
         ),
-        _ => shown(&path.iter().collect::<Vec<_>>()),
     }
+}
+
+/// The one elision rule, for text and for `--json`'s skipped records
+/// (U23): `(head, hidden, tail)`, where a path of more than
+/// [`PATH_SHOWN_WHOLE`] targets keeps the requested target and the first hop
+/// in `head` and the last two in `tail`, `hidden` counting the targets
+/// between. A shorter path is `(path, 0, [])`.
+pub fn path_elision<T>(path: &[T]) -> (&[T], usize, &[T]) {
+    if path.len() > PATH_SHOWN_WHOLE
+        && let (Some(head), Some(tail)) = (path.get(..2), path.get(path.len().saturating_sub(2)..))
+    {
+        return (head, path.len().saturating_sub(4), tail);
+    }
+    (path, 0, &[])
 }
 
 /// The rows a culprit's box prints for how the request reached it, from its

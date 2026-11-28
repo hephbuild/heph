@@ -1079,11 +1079,13 @@ async fn culprit_record_precedes_its_skipped_records() {
     }
 }
 
-/// U3: a 500-deep chain to a culprit. The text box elides the path; the
-/// JSON record carries all of it: 501 entries, from the requested target
-/// to the culprit.
+/// U3, U23: a 500-deep chain to a culprit. The text box elides the path;
+/// the culprit's JSON record carries all of it: 501 entries, from the
+/// requested target to the culprit. A skipped record's path is elided by the
+/// text's rule, `path_elided` counting what it dropped (a short one, whole
+/// and without it, is `finish_pure_chain_output_size`'s).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn long_chain_elided_in_text_full_in_json() {
+async fn long_chain_elided_in_text_and_skipped_json() {
     const DEPTH: usize = 500;
     let root = tempfile::tempdir().expect("root tempdir");
     let mut build = bash("leaf", r#", deps = [":missing"]"#);
@@ -1109,8 +1111,15 @@ async fn long_chain_elided_in_text_full_in_json() {
     assert_eq!(path.len(), DEPTH + 1, "{leaf}");
     assert_eq!(path.first().and_then(Value::as_str), Some("//a:n000"));
     assert_eq!(path.last().and_then(Value::as_str), Some("//a:leaf"));
+    assert!(leaf.get("path_elided").is_none(), "{leaf}");
     let top = run.entry("//a:n000");
-    assert_eq!(top["path"], leaf["path"], "{top}");
+    assert_eq!(top["outcome"], "skipped", "{top}");
+    assert_eq!(
+        top["path"],
+        serde_json::json!(["//a:n000", "//a:n001", "//a:n499", "//a:leaf"]),
+        "{top}"
+    );
+    assert_eq!(top["path_elided"], DEPTH - 3, "{top}");
 
     assert_eq!(run.box_count(), 1, "{}", run.boxes);
     assert!(
