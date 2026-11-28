@@ -90,9 +90,11 @@ impl ErrorDetail {
         let slot =
             hcore::hmemoizer::downcast_chain_ref::<crate::engine::failure_slot::FailureSlot>(e);
         let mut d = Self {
-            // Not `{e:#}`: a failure's artifacts ride the chain as an
-            // empty-`Display` frame, which that would render as `: :`.
-            message: hcore::hmemoizer::chain_message(e),
+            // The cause as the user reads it: the diagnostic when one rides
+            // the chain, else its frames with the engine's stage frames
+            // (`execute //p:t`) and empty-`Display` frames (a failure's
+            // artifacts) left out. `chain_message` is for `debug!`.
+            message: hplugin::diagnostic::cause_frames(e).join(": "),
             cancelled: hplugin::error::is_cancelled(e),
             kept: slot.is_some(),
             streamed: crate::engine::failure_slot::RunStreamed::on(e),
@@ -359,5 +361,24 @@ mod tests {
             "one Start, one End carrying the body's failure"
         );
         Ok(())
+    }
+
+    /// The event's message is the cause as the user reads it: none of the
+    /// engine's stage frames (`execute //p:t`, `run`), and no empty frame
+    /// rendered as `: :`; the context a driver added stays.
+    #[test]
+    fn error_detail_message_leaves_out_stage_frames() {
+        use hplugin::diagnostic::{Boundary, with_stage};
+        let a = hmodel::htaddr::parse_addr("//p:t").expect("addr");
+        let e = anyhow::anyhow!("exit status: 1").context("driver run");
+        let e = with_stage(with_stage(e, Boundary::Run, &a), Boundary::Execute, &a);
+        assert_eq!(
+            ErrorDetail::from_error(&e).message,
+            "driver run: exit status: 1"
+        );
+        assert!(
+            hcore::hmemoizer::chain_message(&e).contains("execute //p:t"),
+            "the debug chain keeps them"
+        );
     }
 }
