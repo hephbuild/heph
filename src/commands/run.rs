@@ -1147,8 +1147,8 @@ impl App for RunApp {
             }),
         );
         // The request's first event, before anything resolves: the clock
-        // counts from it, and the lookups below can take as long as a BUILD
-        // file does to evaluate (STAGE-18).
+        // counts from it, and the lookups below can take as long as a
+        // provider does to evaluate its source (STAGE-18).
         self.engine.announce_request(&rs, self.scratch_off);
         // Both `--shell=` warnings are this command's: the one before the run
         // here, the one after it below, on the entrypoint path and the build

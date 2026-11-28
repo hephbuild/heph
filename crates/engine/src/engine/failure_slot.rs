@@ -47,7 +47,7 @@
 //!   compacted record is written as `diagnostic.json`: into the slot the run
 //!   filled, under that fill's id, or into a slot of its own (manifest and
 //!   `diagnostic.json`, no revision) for a failure that kept nothing — one
-//!   before the run, or a BUILD file that did not evaluate (keyed by
+//!   before the run, or a source file that did not evaluate (keyed by
 //!   [`file_key`]). In the background, counted on the request's `bg_pending`;
 //!   a fill or a clear of the same slot waits for it. Not for credential
 //!   material, nor for a record another request surfaced.
@@ -119,12 +119,12 @@ pub fn addr_key(addr: &Addr) -> String {
     )
 }
 
-/// The prefix of a BUILD file's slot address in its manifest: the slot of the
+/// The prefix of a source file's slot address in its manifest: the slot of the
 /// file at workspace-relative `rel` names `file:<rel>`.
 pub const FILE_ADDR_PREFIX: &str = "file:";
 
-/// The directory name of the slot of the BUILD file at workspace-relative
-/// `rel`, which did not evaluate: as [`addr_key`], over `file:<rel>`. Its
+/// The directory name of the slot of the source file at workspace-relative
+/// `rel`, which a provider reported as not evaluating: as [`addr_key`], over `file:<rel>`. Its
 /// digest never meets an address's: an address's starts with a length, and
 /// `file:` read as one is far past any name.
 pub fn file_key(rel: &str) -> String {
@@ -169,7 +169,7 @@ pub struct SlotManifest {
     /// `None` in a slot from an older heph. Never hashed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fill_id: Option<String>,
-    /// For a BUILD file's slot (`addr` is `file:<path>`): the packages whose
+    /// For a source file's slot (`addr` is `file:<path>`): the packages whose
     /// targets were reached through it, so `inspect failure //d:t` finds the
     /// file's slot when `//d:t` has none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -330,7 +330,7 @@ pub struct FailureSlots {
     /// Slot names this engine knows exist: what `failures/` held when it was
     /// first listed, plus the slots filled since. Listed on first use.
     known: tokio::sync::OnceCell<std::sync::Mutex<HashSet<String>>>,
-    /// Of the known slots, each BUILD file's (`file:` manifests): the
+    /// Of the known slots, each source file's (`file:` manifests): the
     /// packages it lists. Filled with `known`; a target of one of those
     /// packages resolving means the file evaluated again, and its slot is
     /// cleared with the target's ([`clear`](Self::clear)).
@@ -439,20 +439,20 @@ impl FailureSlots {
         read_manifest(&self.slot_dir(addr), addr)
     }
 
-    /// The directory the slot of the BUILD file at workspace-relative `rel`
+    /// The directory the slot of the source file at workspace-relative `rel`
     /// lives in, whether or not it exists ([`file_key`]).
     pub fn file_slot_dir(&self, rel: &str) -> PathBuf {
         self.root.join(file_key(rel))
     }
 
-    /// The manifest of the slot of the BUILD file at `rel`, `None` when there
+    /// The manifest of the slot of the source file at `rel`, `None` when there
     /// is no complete slot for it.
     pub fn read_file(&self, rel: &str) -> Option<SlotManifest> {
         read_any_manifest(&self.file_slot_dir(rel))
             .filter(|m| m.addr.strip_prefix(FILE_ADDR_PREFIX) == Some(rel))
     }
 
-    /// The newest complete slot of a BUILD file whose manifest lists
+    /// The newest complete slot of a source file whose manifest lists
     /// `package`, with its directory: what `inspect failure //d:t` answers
     /// when `d/BUILD` did not evaluate and `//d:t` has no slot of its own.
     /// Lists `failures/`; for a command, not a build.
@@ -495,7 +495,7 @@ impl FailureSlots {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Take out of `known` (and the file map) every BUILD file slot that
+    /// Take out of `known` (and the file map) every source file slot that
     /// lists `package`: its targets resolve, so the file evaluated again.
     fn take_files_of(&self, known: &mut HashSet<String>, package: &str) -> Vec<String> {
         let mut files = self.lock_file_packages();
@@ -521,7 +521,7 @@ impl FailureSlots {
     /// A claim write registered for the slot before this call
     /// ([`write_claim`]) lands first, and is then removed with it.
     ///
-    /// The slot of each BUILD file that lists `addr`'s package goes too: the
+    /// The slot of each source file that lists `addr`'s package goes too: the
     /// target resolved, so its package's files evaluated (D5, "a target
     /// fixed and rebuilt green clears its slot").
     pub async fn clear(&self, addr: &Addr) {
@@ -746,7 +746,7 @@ impl FailureSlots {
 
 /// What a fresh claim writes into the culprit's slot (P28): the claim's
 /// record as `diagnostic.json`, beside the log the run kept, or in a slot of
-/// its own for a failure that kept nothing (one before the run, a BUILD
+/// its own for a failure that kept nothing (one before the run, a source
 /// file that did not evaluate).
 pub(crate) struct ClaimWrite {
     pub culprit: hplugin::error::Culprit,
@@ -1402,7 +1402,7 @@ pub(crate) fn write_test_slot(root: &Path, addr: &Addr, failed_at: u64, log: &[u
     dir
 }
 
-/// Write a complete slot for the BUILD file at `rel` under `root` by hand,
+/// Write a complete slot for the source file at `rel` under `root` by hand,
 /// as a failure before the run leaves it: a manifest and `diagnostic.json`.
 #[cfg(test)]
 pub(crate) fn write_test_file_slot(root: &Path, rel: &str, failed_at: u64) -> PathBuf {
@@ -1428,7 +1428,7 @@ pub(crate) fn write_test_file_slot(root: &Path, rel: &str, failed_at: u64) -> Pa
 }
 
 /// The slot names under `root`; temporaries are not slots. With them, each
-/// BUILD file slot's name and the packages its manifest lists: a file key's
+/// source file slot's name and the packages its manifest lists: a file key's
 /// readable part starts `file_`, so only those manifests are read.
 fn list_slots(root: &Path) -> (HashSet<String>, HashMap<String, Vec<String>>) {
     let Ok(entries) = std::fs::read_dir(root) else {
@@ -2235,7 +2235,7 @@ mod tests {
         assert!(!slots.slot_dir(&b).exists());
     }
 
-    /// A BUILD file's slot lists the packages reached through it; a target of
+    /// A source file's slot lists the packages reached through it; a target of
     /// one of them resolving clears it (the file evaluated), a target of
     /// another package does not, and a slot listing no package stays.
     #[tokio::test]

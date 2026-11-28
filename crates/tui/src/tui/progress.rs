@@ -623,7 +623,7 @@ impl BuildState {
                     self.root_failed += 1;
                 }
             }
-            // A BUILD file that did not evaluate: one failure and one root,
+            // A source file that did not evaluate: one failure and one root,
             // on the row of the address that led into it (folded by `dash`).
             BuildEventKind::FileFailed { entry, error, .. } => {
                 self.errored += 1;
@@ -3099,7 +3099,7 @@ impl CIAppView for CiProgressView {
                 self.print_box(&block);
                 self.culprits.push(addr.clone());
             }
-            // A BUILD file that did not evaluate: its block, once, headed by
+            // A source file that did not evaluate: its block, once, headed by
             // the file (it is not a target).
             BuildEventKind::FileFailed {
                 file,
@@ -6078,7 +6078,7 @@ mod tests {
     }
 
     /// STAGE-18: a request's `RequestConfig`, sent before anything resolves,
-    /// starts the clock on its own. Through a slow BUILD file no target event
+    /// starts the clock on its own. Through a slow provider no target event
     /// arrives, and the line still counts the seconds; the first target event
     /// does not move the anchor. bin-e2e: `tui_clock_ticks_during_slow_get`.
     #[test]

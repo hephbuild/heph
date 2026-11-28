@@ -38,8 +38,8 @@ pub struct FailureRecord {
     /// The culprit target (`//pkg:name`); `None` for a file culprit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub addr: Option<String>,
-    /// The culprit file, workspace-relative, when the culprit is a BUILD or
-    /// `.bzl` file that did not evaluate.
+    /// The culprit file, workspace-relative, when the culprit is a source
+    /// file a provider reported as not evaluating (e.g. `d/BUILD`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
     /// The target the failure was reached through: the culprit itself, or for
@@ -286,8 +286,8 @@ fn is_zero(n: &u32) -> bool {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FailedIn {
-    /// Before the target's process ran, or with no process at all: a BUILD
-    /// file, a spec, a parse, a link, a missing dep.
+    /// Before the target's process ran, or with no process at all: a
+    /// provider's source file, a spec, a parse, a link, a missing dep.
     #[default]
     BeforeRun,
     /// The process itself: it exited non-zero, was killed, or timed out.

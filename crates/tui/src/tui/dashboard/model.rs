@@ -473,7 +473,7 @@ pub struct Model {
     open: HashSet<Id>,
     /// How many records carry `IN_FLIGHT`.
     in_flight: usize,
-    /// Each BUILD file that did not evaluate, and the row its failure is on
+    /// Each source file that did not evaluate, and the row its failure is on
     /// (its `FileFailed` entry): the root a target in that file names. One
     /// per broken file.
     file_rows: HashMap<Box<str>, Id>,
@@ -665,7 +665,7 @@ impl Model {
                 };
                 self.set_state(id, state);
             }
-            // A BUILD file that did not evaluate: its failure is shown on the
+            // A source file that did not evaluate: its failure is shown on the
             // row of the address that led into it (the root its collateral
             // names), which never had a scope of its own.
             BuildEventKind::FileFailed {
@@ -842,7 +842,7 @@ impl Model {
     }
 
     /// The first culprit to end: a target that failed on its own, or the
-    /// entry row of a BUILD file that did not evaluate. Never a target a
+    /// entry row of a source file that did not evaluate. Never a target a
     /// dependency or a broken file took down, which has no record of its own.
     pub fn first_culprit(&self) -> Option<&str> {
         self.failures()

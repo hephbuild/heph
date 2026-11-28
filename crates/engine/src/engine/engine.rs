@@ -773,7 +773,7 @@ impl Engine {
     /// that resolves a target before building it (`run` of one address asks
     /// whether it is an entrypoint) would otherwise send no event for as long
     /// as that resolution takes, and a client's clock, which counts from the
-    /// first event, would read 0 through a slow BUILD file. Once per request:
+    /// first event, would read 0 through a slow provider. Once per request:
     /// the `result` call's own announcement is then a no-op.
     pub fn announce_request(
         &self,

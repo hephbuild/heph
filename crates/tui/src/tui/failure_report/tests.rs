@@ -197,7 +197,7 @@ fn golden_facts_equal_across_renderers() {
     }
 }
 
-/// U4, in both text modes: an unknown option's box frames the BUILD line
+/// U4, in both text modes: an unknown option's box frames the source line
 /// and puts the marker under the kwarg, the near-miss at its end, and the
 /// valid options after the frame.
 #[test]
@@ -345,7 +345,7 @@ fn reframe_stale_span() {
 }
 
 #[test]
-fn reframe_builtin_bzl_no_file() {
+fn reframe_builtin_source_no_file() {
     assert_eq!(
         reframe(None, Some("def f():"), &loc("x.bzl", 3, 1), None),
         None

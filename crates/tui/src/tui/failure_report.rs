@@ -60,8 +60,8 @@ pub const BOX_CAP: usize = 50;
 /// How many culprits the totals line names before `+N more` (D6.1c).
 pub const TOTALS_NAMED: usize = 5;
 
-/// The largest source file an excerpt is read from. A BUILD file is far
-/// smaller; past this, the location is named without an excerpt.
+/// The largest source file an excerpt is read from. A hand-written source
+/// file is far smaller; past this, the location is named without an excerpt.
 const SOURCE_READ_CAP: u64 = 4 * 1024 * 1024;
 
 /// Which screen a box is drawn for.
@@ -445,7 +445,8 @@ pub enum FrameRow {
 }
 
 /// The source file `loc` names, read from under `root`; `None` when there
-/// is none there (a builtin `.bzl`) or it is over [`SOURCE_READ_CAP`].
+/// is none there (a provider's builtin source, with no file on disk) or it
+/// is over [`SOURCE_READ_CAP`].
 /// Invalid UTF-8 reads as U+FFFD.
 fn read_source(root: &Path, loc: &SourceLoc) -> Option<String> {
     let path = root.join(&loc.file);
@@ -474,7 +475,7 @@ fn read_source(root: &Path, loc: &SourceLoc) -> Option<String> {
 /// - Control characters are shown escaped.
 ///
 /// `None` (the caller names `file:line` with no excerpt) when there is no
-/// source (a builtin `.bzl` with no file on disk) or the span is not in it
+/// source (a provider's builtin source, with no file on disk) or the span is not in it
 /// (the file was shortened since eval).
 pub fn reframe(
     source: Option<&str>,
