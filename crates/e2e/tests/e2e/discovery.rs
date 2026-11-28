@@ -61,6 +61,11 @@ fn workspace(
             .collect::<anyhow::Result<_>>()?,
         ..Default::default()
     };
+    workspace_with(targets, faults)
+}
+
+/// The static targets behind a provider that fails as `faults` says.
+fn workspace_with(targets: Vec<Target>, faults: Faults) -> anyhow::Result<htestkit::Workspace> {
     let provider = FaultProvider::new(targets, faults)?;
     htestkit::WorkspaceBuilder::new()?
         .with_provider(move |_| Box::new(provider))
@@ -250,5 +255,71 @@ async fn ctrl_c_with_skips_exits_as_cancelled() -> anyhow::Result<()> {
     // a cancelled exit with no report is covered in `src/commands/errors.rs`.)
     assert!(heph::commands::errors::is_cancelled(&err), "{err:#}");
     assert!(!gaps.is_empty(), "the skip was recorded before the cancel");
+    Ok(())
+}
+
+/// What a keep-going `heph run` over `m` ran, and the "incomplete
+/// selection" block it ends with, uncoloured.
+async fn run_incomplete(
+    ws: &htestkit::Workspace,
+    m: Matcher,
+    selector: &str,
+) -> anyhow::Result<(usize, String)> {
+    let gaps = Gaps::new(selector);
+    let opts = ResultOptions {
+        discovery: Discovery::KeepGoing(gaps.clone()),
+        ..Default::default()
+    };
+    let rs = ws.engine.new_state_with_fail_fast(false);
+    let ran = heph::commands::run::build(
+        Arc::clone(&ws.engine),
+        rs,
+        m,
+        OutputMatcher::All,
+        &opts,
+        &gaps,
+    )
+    .await?;
+    let err = heph::commands::errors::require_complete_selection(&gaps)
+        .expect_err("the walk skipped something");
+    let inc =
+        hcore::hmemoizer::downcast_chain_ref::<heph::commands::errors::IncompleteSelection>(&err)
+            .expect("an incomplete selection");
+    Ok((
+        ran.len(),
+        inc.render_to_string(false, &heph::tui::text::WorkspaceRel::default()),
+    ))
+}
+
+/// STAGE-04: a run whose only package could not be listed matched nothing,
+/// so nothing ran, and its block says so, not that the targets that matched
+/// were still processed. A run that matched one keeps that sentence.
+#[tokio::test]
+async fn list_error_with_zero_matched_says_nothing_ran() -> anyhow::Result<()> {
+    let ws = workspace_with(
+        vec![
+            bash("//f:t", "echo t > $OUT", &[], &[]),
+            bash("//g:ok", "echo ok > $OUT", &[], &[]),
+        ],
+        Faults {
+            fail_list: vec!["f".to_string()],
+            ..Default::default()
+        },
+    )?;
+    let still = "Targets that matched were still processed";
+    let nothing = "  No target matched, so nothing ran.\n";
+
+    let (ran, block) =
+        run_incomplete(&ws, Matcher::PackagePrefix(PkgBuf::from("f")), "//f/...").await?;
+    assert_eq!(ran, 0, "{block}");
+    assert!(block.contains(nothing), "{block}");
+    assert!(!block.contains(still), "{block}");
+    assert!(block.contains("--fail-fast"), "what to do stays: {block}");
+
+    let (ran, block) =
+        run_incomplete(&ws, Matcher::PackagePrefix(PkgBuf::from("")), "//...").await?;
+    assert_eq!(ran, 1, "{block}");
+    assert!(block.contains(still), "{block}");
+    assert!(!block.contains("No target matched"), "{block}");
     Ok(())
 }
