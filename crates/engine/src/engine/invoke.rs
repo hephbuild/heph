@@ -607,6 +607,7 @@ impl Engine {
                 material: false,
                 fixes: None,
                 keep_log: false,
+                scrub: Default::default(),
             })
             .await;
         let out_error = slot.out_error.clone();
