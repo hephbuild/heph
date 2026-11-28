@@ -83,7 +83,12 @@ RUN = '''{run}'''
 
     /// A fresh workspace holding the package.
     pub fn workspace(&self) -> super::Workspace {
-        let ws = super::Workspace::new();
+        self.workspace_with_parallelism(None)
+    }
+
+    /// [`Self::workspace`], running at most `parallelism` targets at once.
+    pub fn workspace_with_parallelism(&self, parallelism: Option<usize>) -> super::Workspace {
+        let ws = super::Workspace::with_parallelism(parallelism);
         ws.write_build_file(PKG, &self.build_file());
         ws
     }

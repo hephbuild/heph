@@ -670,6 +670,62 @@ mod tests {
         assert_eq!(out, format!("{TAIL_CUT_MARK}{}", "z".repeat(16)).as_bytes());
     }
 
+    /// I8: [`read_tail_at`] holds the tail, never the log. Over a 4 MiB log,
+    /// with the line cap binding (64-byte lines) and with the byte cap
+    /// binding (1 KiB lines): the backward pass reads at most
+    /// [`TAIL_MAX_BYTES`] + one [`TAIL_CHUNK`] from the end, the count pass
+    /// reads the head before the tail once, and no read asks for more than
+    /// [`COUNT_CHUNK`] at a time — so what is in memory at once is bounded
+    /// by the caps, whatever the log's size.
+    #[test]
+    fn read_tail_at_holds_the_tail_not_the_log() {
+        const LOG_BYTES: usize = 4 * 1024 * 1024;
+        for line_len in [64, 1024] {
+            let line = format!("{}\n", "x".repeat(line_len - 1));
+            let log = line.repeat(LOG_BYTES / line_len);
+            let len = log.len() as u64;
+            // (offset, length) of every read, in order.
+            let mut reads: Vec<(u64, usize)> = Vec::new();
+            let tail = read_tail_at(
+                len,
+                |buf, off| {
+                    let start = usize::try_from(off).expect("offset");
+                    let k = buf.len().min(log.len() - start);
+                    buf[..k].copy_from_slice(&log.as_bytes()[start..start + k]);
+                    reads.push((off, k));
+                    Ok(k)
+                },
+                TAIL_LINES_CAP,
+            )
+            .expect("tail");
+            // The backward pass stops far short of the start of a 4 MiB log;
+            // the count pass starts at 0 and climbs.
+            let back = reads.iter().position(|r| r.0 == 0).expect("a count pass");
+            let (backward, count) = reads.split_at(back);
+            let backward_bytes: usize = backward.iter().map(|r| r.1).sum();
+            let count_bytes: usize = count.iter().map(|r| r.1).sum();
+            assert!(
+                backward_bytes <= TAIL_MAX_BYTES + TAIL_CHUNK as usize,
+                "{line_len}-byte lines: read {backward_bytes} B back from the end"
+            );
+            assert!(
+                reads.iter().all(|r| r.1 <= COUNT_CHUNK),
+                "{line_len}-byte lines: a read over {COUNT_CHUNK} B"
+            );
+            assert!(tail.text.len() <= TAIL_MAX_BYTES, "{line_len}-byte lines");
+            let lines_before = tail.start_line - 1;
+            assert_eq!(
+                count_bytes,
+                lines_before * line_len,
+                "{line_len}-byte lines: the head is read once, to count its lines"
+            );
+            assert!(
+                log.trim_end_matches('\n').ends_with(&tail.text),
+                "{line_len}-byte lines: the tail is the log's end"
+            );
+        }
+    }
+
     /// The streamed tail is the text [`read_tail_at`] gives, for logs at the
     /// edges: empty, no final break, one line, blank lines.
     #[test]
