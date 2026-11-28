@@ -1267,6 +1267,11 @@ impl Engine {
                 .acquire_declared(rs, &rc.addr, &rc.def, &Chain::root())
                 .await
                 .with_context(|| format!("{consumer} needs credential {}", rc.addr))?;
+            // The consumer's recorded failure is scrubbed of the material from
+            // the moment it is held (I7, H-M2): a failure presenting it, or
+            // acquiring the next credential, is recorded scrubbed. Every field,
+            // as `present_material`'s `redact`, whose floor `add_scrub` applies.
+            rs.add_scrub(consumer, acquired.material.secrets().map(str::to_owned));
             held.push((rc, acquired));
         }
         Ok(HeldCredentials { held })

@@ -289,3 +289,52 @@ async fn no_secret_in_diagnostic_json() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// H-M2: a consumer's failure is scrubbed of a credential's material from
+/// the moment it is held, not only once every credential is presented. The
+/// consumer's second credential fails to acquire, and its command's stderr,
+/// which the error quotes, prints the first one's material.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn held_material_scrubs_a_later_credential_failure() -> anyhow::Result<()> {
+    const HELD: &str = "CRED-HELD-SECRET-7";
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "auth",
+        &format!(
+            r#"
+target(name = "a", driver = "auth.credential",
+       sources = [heph.auth.exec(["sh", "-c", "printf '{{\"token\":\"{HELD}\"}}'"],
+           fields = {{"token": "token"}})],
+       present = {{"env": {{"A": "${{token}}"}}}})
+target(name = "b", driver = "auth.credential",
+       sources = [heph.auth.exec(["sh", "-c", "echo 'denied for {HELD}' >&2; exit 1"],
+           fields = {{"token": "token"}})],
+       present = {{"env": {{"B": "${{token}}"}}}})
+"#
+        ),
+    );
+    ws.write_build_file(
+        "app",
+        r#"
+target(name = "two", driver = "bash", out = "o.txt", credentials = ["//auth:a", "//auth:b"],
+       run = "true > o.txt")
+"#,
+    );
+    let m = Matcher::Addr(parse_addr("//app:two")?);
+    let run = run_json(&ws.engine, &m, &["--json"], None).await;
+    assert!(run.res.is_err(), "//app:two must fail");
+    ws.engine.failure_slots().writes_drained().await;
+    let entries = serde_json::to_string(&run.entries)?;
+    // The fixture has teeth: the failure quotes //auth:b's stderr.
+    assert!(
+        entries.contains("denied for [redacted]"),
+        "run --json: {entries}"
+    );
+    assert_no([HELD], "run --json", &entries);
+    assert_no([HELD], "the CI boxes", &run.boxes);
+    assert_no([HELD], "the report", &run.report);
+    let json = inspect_json(&ws.engine, "//app:two")?;
+    assert_ne!(json.trim(), "null", "//app:two has a record");
+    assert_no([HELD], "inspect failure --json //app:two", &json);
+    Ok(())
+}
