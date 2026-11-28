@@ -340,6 +340,63 @@ target(name = "two", driver = "bash", out = "o.txt", credentials = ["//auth:a", 
     Ok(())
 }
 
+/// U20: a source's own credential is material, so the consumer's failure is
+/// scrubbed of it too. `//auth:outer`'s source needs `//auth:inner`, presented
+/// to its command, and the command fails printing the inner token on stderr,
+/// which the consumer's error quotes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn source_credential_material_is_scrubbed() -> anyhow::Result<()> {
+    const INNER: &str = "CRED-SOURCE-SECRET-8";
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "auth",
+        &format!(
+            r#"
+target(name = "inner", driver = "auth.credential",
+       sources = [heph.auth.exec(["sh", "-c", "printf '{{\"token\":\"{INNER}\"}}'"],
+           fields = {{"token": "token"}})],
+       present = {{"env": {{"INNER": "${{token}}"}}}})
+target(name = "outer", driver = "auth.credential",
+       sources = [heph.auth.exec(["sh", "-c", "echo \"vault denied $INNER\" >&2; exit 1"],
+           fields = {{"token": "token"}}, credentials = [":inner"])],
+       present = {{"env": {{"OUTER": "${{token}}"}}}})
+"#
+        ),
+    );
+    ws.write_build_file(
+        "app",
+        r#"
+target(name = "use", driver = "bash", out = "o.txt", credentials = ["//auth:outer"],
+       run = "true > o.txt")
+"#,
+    );
+    let m = Matcher::Addr(parse_addr("//app:use")?);
+    let run = run_json(&ws.engine, &m, &["--json"], None).await;
+    assert!(run.res.is_err(), "//app:use must fail");
+    ws.engine.failure_slots().writes_drained().await;
+    let error = run.entry("//app:use")["error"].to_string();
+    // The fixture has teeth: the failure quotes //auth:outer's stderr, which
+    // was handed //auth:inner's material.
+    assert!(
+        error.contains("vault denied [redacted]"),
+        "run --json error: {error}"
+    );
+    assert_no([INNER], "run --json error", &error);
+    assert_no([INNER], "run --json", &serde_json::to_string(&run.entries)?);
+    assert!(
+        run.boxes.contains("//app:use"),
+        "//app:use has a box:\n{}",
+        run.boxes
+    );
+    assert_no([INNER], "the CI boxes", &run.boxes);
+    assert_no([INNER], "the report", &run.report);
+    let json = inspect_json(&ws.engine, "//app:use")?;
+    assert_ne!(json.trim(), "null", "//app:use has a record");
+    assert_no([INNER], "inspect failure --json //app:use", &json);
+    assert_no_held_in_events(&run, [INNER], "//app:");
+    Ok(())
+}
+
 /// No event of `run`, as JSON, and not the spotlight folded from them,
 /// holds any of `secrets` (HERM r2, as [`no_secret_in_events`] checks).
 /// The spotlight names `culprit_prefix`, so the fold saw the failure.
