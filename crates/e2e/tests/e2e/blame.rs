@@ -1564,9 +1564,11 @@ async fn deep_chain_error_size_is_constant() -> anyhow::Result<()> {
 }
 
 /// I5: the path and the roots live for one request. On the same engine, a
-/// second request whose graph no longer holds the culprit (the engine has no
-/// in-process way to re-read a fixed BUILD file mid-test, so the "fix" is
-/// asking for the healthy side) reports nothing from the first request.
+/// second request reaches the same culprit through a different, longer path
+/// (the engine has no in-process way to re-read a fixed BUILD file
+/// mid-test, so the change is asking for another target): its records carry
+/// only that path. A path or a requested root kept from the first request
+/// would show here, since `//a:top → //a:c` is the shorter way in.
 #[tokio::test]
 async fn second_request_after_fix_has_no_stale_path() -> anyhow::Result<()> {
     let ws = build_ws(&[(
@@ -1575,17 +1577,24 @@ async fn second_request_after_fix_has_no_stale_path() -> anyhow::Result<()> {
 target(name = "c", driver = "bash", run = "exit 1", out = "o.txt")
 target(name = "ok", driver = "bash", run = "echo ok > $OUT", out = "o.txt")
 target(name = "top", driver = "bash", run = "echo ok > $OUT", out = "o.txt", deps = [":c", ":ok"])
-target(name = "fixed", driver = "bash", run = "echo ok > $OUT", out = "o.txt", deps = [":ok"])
+target(name = "mid", driver = "bash", run = "echo ok > $OUT", out = "o.txt", deps = [":c"])
+target(name = "other", driver = "bash", run = "echo ok > $OUT", out = "o.txt", deps = [":mid", ":ok"])
 "#,
     )]);
     let first = run(&ws.engine, "//a:top").await;
     assert_eq!(first.path("//a:c"), ["//a:top", "//a:c"]);
     assert_eq!(first.skipped("//a:top").0, "//a:c");
 
-    let second = run_matcher(&ws.engine, &Matcher::Addr(addr("//a:fixed"))).await;
-    assert!(second.err.is_none(), "fixed: {:?}", second.err);
-    assert!(second.failures.is_empty(), "{}", second.describe());
-    assert!(second.skipped.is_empty());
+    let second = run(&ws.engine, "//a:other").await;
+    assert_eq!(second.culprits(), ["//a:c"], "{}", second.describe());
+    assert_eq!(second.path("//a:c"), ["//a:other", "//a:mid", "//a:c"]);
+    let (root, path, _) = second.skipped("//a:other");
+    assert_eq!(root, "//a:c");
+    assert_eq!(path, ["//a:other", "//a:mid", "//a:c"]);
+    assert!(
+        second.skipped.get(&addr("//a:top")).is_none(),
+        "no root kept from the first request"
+    );
     for ev in &second.events {
         if let BuildEventKind::ResultEnd {
             addr,
@@ -1594,8 +1603,14 @@ target(name = "fixed", driver = "bash", run = "echo ok > $OUT", out = "o.txt", d
             ..
         } = &ev.kind
         {
-            assert_eq!(*upstream_of, None, "{addr}");
-            assert!(path.is_empty(), "{addr}: {path:?}");
+            assert_ne!(addr, "//a:top", "nothing of the first request ends again");
+            assert!(
+                !path.iter().any(|p| p == "//a:top"),
+                "{addr}: a path through the first request's root: {path:?}"
+            );
+            if addr == "//a:other" {
+                assert_eq!(upstream_of.as_deref(), Some("//a:c"));
+            }
         }
     }
     Ok(())
