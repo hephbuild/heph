@@ -213,6 +213,10 @@ struct Fold {
     /// Skipped records, written at request end.
     held: Vec<Held>,
     matched_complete: bool,
+    /// A target ended `cancelled`: the run stopped it before it finished (a
+    /// cancel, or `--fail-fast` after a failure), so the list is not whole
+    /// however many records it has (RUN-24, JSON_OUTPUT.md).
+    cut: bool,
     /// What a culprit's `error` line is scrubbed with, as the failure box
     /// is.
     redact: Redact,
@@ -372,6 +376,7 @@ impl Fold {
                     (None, _) if live.ran => Outcome::Ran,
                     (None, _) => Outcome::Cached,
                 };
+                self.cut |= outcome == Outcome::Cancelled;
                 // Past the matched set, only a failure can still be a record:
                 // a culprit's.
                 if self.matched_complete
@@ -570,9 +575,10 @@ impl Fold {
         ready
     }
 
-    /// Every matched target has its entry, and the matched set is final.
+    /// Every matched target has its entry, the matched set is final, and
+    /// none of them was stopped.
     fn whole(&self) -> bool {
-        self.matched_complete && self.pending.is_empty()
+        self.matched_complete && self.pending.is_empty() && !self.cut
     }
 }
 
@@ -1363,7 +1369,7 @@ mod tests {
                 abandoned: false,
             });
         }
-        let (entries, _) = fold(vec![
+        let (entries, whole) = fold(vec![
             ev(0, matched(&["//p:c", "//p:r", "//p:t"], true)),
             ev(1, stop),
             ev(2, outcome("//p:r", CacheOutcomeKind::LocalHit)),
@@ -1379,6 +1385,7 @@ mod tests {
             ev(6, late),
         ]);
         assert_eq!(entries[0].outcome, Outcome::Cancelled);
+        assert!(!whole, "a stopped target leaves the list open (RUN-24)");
         assert_eq!(entries[0].exit_code, None);
         assert_eq!(
             (entries[1].outcome, entries[1].cache),
