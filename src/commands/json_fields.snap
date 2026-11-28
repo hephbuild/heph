@@ -113,6 +113,7 @@ run	outcome	"skipped"	free	default
 run	outcome	string	free	default
 run	outputs	[string]?	free	opt-in
 run	path	[string]?	free	default
+run	path_elided	number?	free	default
 run	remote	string?	free	default
 run	root	string?	free	default
 run	root_file	string?	free	default

@@ -252,7 +252,8 @@ Each record is output contract 2 (`heph version --json` reports
 | `root` | yes | the culprit, when it is a target: on a failed culprit, the record itself; on `skipped`, the nearest culprit it depends on. Always an address. Null when the culprit is a file (`root_file` names it), and for `ran`, `cached` and `cancelled` |
 | `root_file` | yes | the culprit, when it is a BUILD or `.bzl` file that did not evaluate: on the file's own record, its `file`; on `skipped`, the nearest culprit it depends on. Always a workspace-relative path. Null when the culprit is a target, and for `ran`, `cached` and `cancelled`. Exactly one of `root` and `root_file` is set on a `failed` or `skipped` record that has a culprit, as `addr` and `file` are on every record |
 | `more` | yes | on `skipped`: how many culprits other than its own it also reaches; null elsewhere |
-| `path` | yes | on a failed culprit: a shortest chain of addresses from a requested target down to it (see below for when it can differ between runs). On `skipped`: from this target down to the address its culprit was recorded at. Inclusive at both ends and never elided; null elsewhere |
+| `path` | yes | on a failed culprit: a shortest chain of addresses from a requested target down to it (see below for when it can differ between runs). On `skipped`: from this target down to the address its culprit was recorded at. Inclusive at both ends; a culprit's is never elided, a skipped record's is elided as the text box elides one (see below); null elsewhere |
+| `path_elided` | yes | on a `skipped` record whose `path` was elided: how many addresses were left out of its middle; absent otherwise |
 | `selected` | yes | the selector matched it. False only on a culprit written because something selected depends on it; a `file` record is never selected |
 | `failure` | yes | `{log, out, fixes}`, as `heph inspect failure`; null unless it failed running |
 | `stage` | yes | on a failed culprit (a target or a file record): the stage of the build that raised it, `eval`, `spec`, `parse`, `link`, `run`, `cache`, `config` or `cli`; null elsewhere |
@@ -308,9 +309,13 @@ the last edge: `//c:y depends on //d:t, which this file defines`. Its wording,
 the elided middle of a long path included (`… 3 more (--json has the full
 path) …`), is not contract: read `path` here, not the box.
 
-Skipped records arrive only at request end, and a skipped record's `path` is
-the full chain, so the output grows with chain depth × skipped count: for one
-deep selected chain, with the square of its depth.
+Skipped records arrive only at request end. A skipped record's `path` is
+elided by the box's rule: a path of more than five addresses keeps this
+target, the first hop and the last two, and `path_elided` says how many it
+left out (`["//a:n000", "//a:n001", "//a:n499", "//a:leaf"]` with
+`path_elided: 497`). So the output grows with the skipped count, not with
+chain depth × skipped count. The culprit's own record carries its path
+whole, which is the one to read for the full chain.
 
 **A broken BUILD file reached by address.** A selection of addresses only
 (`heph run //d:t1 //d:t2`) whose BUILD file does not evaluate gets the file's

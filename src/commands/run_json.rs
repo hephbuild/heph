@@ -134,10 +134,15 @@ pub struct RunEntry {
     pub more: Option<u64>,
     /// On a failed culprit: a shortest path from a requested target to it,
     /// the one known when it failed (it can differ between runs in rare
-    /// cases). On `skipped`: from this target to where its culprit was
-    /// recorded, over the final graph. Inclusive and never elided; null
-    /// elsewhere.
+    /// cases), inclusive and never elided. On `skipped`: from this target to
+    /// where its culprit was recorded, over the final graph, inclusive and
+    /// elided as text elides a path (this target, the first hop, the last
+    /// two; `path_elided` counts the rest). Null elsewhere.
     pub path: Option<Vec<String>>,
+    /// On a `skipped` record whose `path` was elided: how many targets were
+    /// dropped from its middle. Absent otherwise (U23).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path_elided: Option<u64>,
     /// The selection named it. A culprit outside the selection is written
     /// too, with false; a file record is never selected.
     pub selected: bool,
@@ -277,6 +282,7 @@ fn blank(addr: Option<String>, outcome: Outcome) -> RunEntry {
         root_file: None,
         more: None,
         path: None,
+        path_elided: None,
         selected: false,
         failure: None,
         stage: None,
@@ -627,8 +633,9 @@ impl Fold {
     /// was written before this, so a culprit precedes its skipped records.
     ///
     /// The skipped records are made one at a time, as the writer asks for
-    /// them: each one's `path` is the full chain to its culprit, so holding
-    /// them all would cost the square of a deep chain's depth.
+    /// them: each one's path is walked as the full chain to its culprit
+    /// (then elided, U23), so holding them all would cost the square of a
+    /// deep chain's depth.
     fn finish(&mut self, rs: &RequestState) -> Finish {
         let early = if self.matched_complete {
             Vec::new()
@@ -696,7 +703,11 @@ impl Iterator for Finish {
                     Culprit::Target(a) => entry.root = Some(a.format()),
                     Culprit::File(f) => entry.root_file = Some(f.to_string()),
                 }
-                entry.path = Some(rec.path.iter().map(Addr::format).collect());
+                // Elided by the text's rule (U23): a skipped record's path
+                // can be as deep as the graph, once per skipped target.
+                let (head, hidden, tail) = crate::tui::failure_rows::path_elision(&rec.path);
+                entry.path = Some(head.iter().chain(tail).map(Addr::format).collect());
+                entry.path_elided = (hidden > 0).then(|| u64::try_from(hidden).unwrap_or(u64::MAX));
                 entry.more = Some(u64::try_from(rec.more).unwrap_or(u64::MAX));
             }
             // Not in the graph the pass walks: what the end named.
@@ -1173,6 +1184,7 @@ mod tests {
             root_file: Some("p/BUILD".to_string()),
             more: Some(1),
             path: Some(vec!["//p:t".to_string()]),
+            path_elided: Some(2),
             selected: true,
             failure: Some(RunFailure {
                 log: Some(PathBuf::from("/h/log.txt")),
@@ -1691,11 +1703,11 @@ mod tests {
         fold_with(events, &Known::default()).1
     }
 
-    /// FQ-4: a pure chain of 1000 selected targets, all skipped under the
-    /// one culprit at its foot. Every node is asked for its record, and each
-    /// record carries the whole path down: the output is quadratic in the
-    /// chain's depth, 501,500 path entries for 1000 records, made by one
-    /// pass over the graph.
+    /// FQ-4, U23: a pure chain of 1000 selected targets, all skipped under
+    /// the one culprit at its foot, made by one pass over the graph. Each
+    /// record's path down is elided as text elides it, so the output is
+    /// linear in the chain's depth: at most 4 entries a record, 3,998 for
+    /// 1000 records, `path_elided` counting the 497,502 left out.
     #[tokio::test]
     async fn finish_pure_chain_output_size() {
         const N: usize = 1_000;
@@ -1704,18 +1716,31 @@ mod tests {
             Arc::new(Engine::new(crate::engine::Config::for_tests(dir.path())).expect("engine"));
         let rs = engine.new_state_with_events(false, None);
         let mut f = skipped_chain(&rs, N);
-        let paths: Vec<usize> = f
+        let paths: Vec<(usize, u64)> = f
             .finish(&rs)
-            .map(|e| e.path.as_ref().map_or(0, Vec::len))
+            .map(|e| {
+                (
+                    e.path.as_ref().map_or(0, Vec::len),
+                    e.path_elided.unwrap_or(0),
+                )
+            })
             .collect();
         assert_eq!(rs.report_passes(), 1);
         assert_eq!(paths.len(), N, "one record per skipped target");
-        // `n_i`'s path is `n_i … n_999, c`: N - i + 1 entries.
-        assert_eq!(paths.first(), Some(&(N + 1)));
-        assert_eq!(paths.last(), Some(&2));
-        let total: usize = paths.iter().sum();
-        assert_eq!(total, N * (N + 1) / 2 + N);
-        assert_eq!(total, 501_500);
+        // `n_i`'s path is `n_i … n_999, c`: N - i + 1 entries, 4 of them
+        // kept once it is longer than 5.
+        assert_eq!(paths.first(), Some(&(4, u64::try_from(N - 3).expect("n"))));
+        assert_eq!(paths.get(N - 5), Some(&(4, 2)), "6 entries: 2 left out");
+        assert_eq!(paths.get(N - 4), Some(&(5, 0)), "5 entries: whole");
+        assert_eq!(paths.last(), Some(&(2, 0)));
+        let kept: usize = paths.iter().map(|(k, _)| k).sum();
+        assert_eq!(kept, 3_998);
+        let left_out: u64 = paths.iter().map(|(_, e)| e).sum();
+        assert_eq!(
+            u64::try_from(kept).expect("kept") + left_out,
+            501_500,
+            "the whole chain, counted"
+        );
     }
 
     /// FQ round 2: `finish` streams. Each skipped record's path is built
