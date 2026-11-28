@@ -27,7 +27,7 @@ use hplugin::error::{
     RevisionChangedError, TargetFailure,
 };
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// The secret values a failure's text is scrubbed of before it is recorded:
 /// the credential material a run was handed, and nothing else: only what heph
@@ -36,35 +36,48 @@ use std::sync::Arc;
 ///
 /// Its `Debug` says how many values it holds, never what they are.
 #[derive(Clone, Default)]
-pub struct Scrub(Vec<String>);
+pub struct Scrub {
+    values: Vec<String>,
+    /// The scrubber over `values`, built on first use and dropped by every
+    /// change (FQ-15), so a `Scrub` used more than once builds it once: the
+    /// request's union, which every failure event's text is scrubbed with
+    /// ([`RequestStateData::scrub_event_text`](crate::engine::request_state::RequestStateData::scrub_event_text)).
+    needles: OnceLock<Option<Arc<Needles>>>,
+}
 
 impl Scrub {
     /// The values in `values`.
     #[cfg(test)]
     pub fn new(values: impl IntoIterator<Item = String>) -> Self {
-        Self(values.into_iter().collect())
+        Self {
+            values: values.into_iter().collect(),
+            needles: OnceLock::new(),
+        }
     }
 
     /// Also scrub `values`.
     pub fn extend(&mut self, values: impl IntoIterator<Item = String>) {
-        self.0.extend(values);
+        self.values.extend(values);
+        self.needles = OnceLock::new();
     }
 
     /// Also scrub what `other` scrubs.
     pub fn extend_from(&mut self, other: &Self) {
-        self.0.extend(other.0.iter().cloned());
+        self.extend(other.values.iter().cloned());
     }
 
     /// Whether there is nothing to scrub.
     #[cfg(test)]
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.values.is_empty()
     }
 
     /// The scrubber over these values; `None` when none is long enough to be
     /// scrubbed ([`REDACT_MIN_LEN`](hplugin::driver::REDACT_MIN_LEN)).
     fn needles(&self) -> Option<Arc<Needles>> {
-        Needles::new(&self.0)
+        self.needles
+            .get_or_init(|| Needles::new(&self.values))
+            .clone()
     }
 
     /// `s` with every value replaced.
@@ -75,7 +88,7 @@ impl Scrub {
 
 impl fmt::Debug for Scrub {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Scrub({} values)", self.0.len())
+        write!(f, "Scrub({} values)", self.values.len())
     }
 }
 
@@ -1232,6 +1245,21 @@ mod tests {
         let all = format!("{rec:?}");
         assert!(!all.contains(secret), "{all}");
         assert_eq!(all.matches("[redacted]").count(), planted, "{all}");
+    }
+
+    /// FQ-15: the scrubber is built once per `Scrub`, and again after a
+    /// change, which it then covers.
+    #[test]
+    fn needles_built_once_and_rebuilt_on_change() {
+        let mut s = Scrub::new(["hunter2-hunter2".to_owned()]);
+        let first = s.needles().expect("needles");
+        assert!(Arc::ptr_eq(&first, &s.needles().expect("needles")));
+        s.extend(["another-secret".to_owned()]);
+        assert!(!Arc::ptr_eq(&first, &s.needles().expect("needles")));
+        assert_eq!(
+            s.apply("another-secret hunter2-hunter2"),
+            "[redacted] [redacted]"
+        );
     }
 
     #[test]
