@@ -69,7 +69,7 @@ pub fn failure_view(slots: &FailureSlots, addr: &Addr) -> anyhow::Result<Option<
     };
     Ok(Some(FailureView {
         addr: Some(manifest.addr),
-        hashin: Some(manifest.hashin),
+        hashin: manifest.hashin,
         failed_at: Some(manifest.failed_at),
         log: part(LOG, std::path::Path::is_file),
         out: part(OUT, std::path::Path::is_dir),

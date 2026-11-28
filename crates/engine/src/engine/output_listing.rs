@@ -88,8 +88,9 @@ pub enum ListedKind {
 /// What a failed run kept, from its failure slot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FailureOutputs {
-    /// The input hash of the run that failed.
-    pub hashin: String,
+    /// The input hash of the run that failed; `None` for a failure before
+    /// the run.
+    pub hashin: Option<String>,
     /// When it failed, in milliseconds since the Unix epoch.
     pub failed_at: u64,
     /// Its `failure_out` matches, workspace-relative, in path order.
