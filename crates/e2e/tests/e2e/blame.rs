@@ -1384,8 +1384,10 @@ target(name = "top", driver = "bash", run = "echo ok > $OUT", out = "o.txt", dep
 /// D1.e / P18: 20k targets, ~100k edges, 20k skipped under 5 culprits. The
 /// graph is built straight into a request's `DepDag` (`add_dep_for_test`),
 /// as resolution would commit it, rather than by running 20k targets: the
-/// cost under test is the request-end pass, not the build. One pass, done
-/// well within 2 s in a debug build.
+/// cost under test is the request-end pass, not the build. One pass for the
+/// skipped records and one for the culprits' paths, counted; the clock only
+/// catches a hang. The pure chain, where the output itself is quadratic,
+/// is `run_json`'s `finish_pure_chain_output_size`.
 #[tokio::test]
 async fn failure_report_cost_20k() -> anyhow::Result<()> {
     const N: usize = 20_000;
@@ -1425,13 +1427,18 @@ async fn failure_report_cost_20k() -> anyhow::Result<()> {
             Arc::new(TargetFailure::new(c.clone(), None, anyhow::anyhow!("boom"))),
         );
     }
-    let failures = rs.take_failures();
     let started = std::time::Instant::now();
+    let failures = rs.take_failures();
+    assert_eq!(rs.path_passes(), 1, "one pass for every culprit's path");
     let report = rs.skipped_report(failures.iter().map(|f| &**f), &nodes);
     let took = started.elapsed();
     assert_eq!(rs.report_passes(), 1, "one request-end pass");
     assert_eq!(report.len(), N, "every skipped target has a root");
-    assert!(took < std::time::Duration::from_secs(2), "took {took:?}");
+    assert_eq!(report.bitset_words(), N + 5, "5 culprits: one word a node");
+    assert!(
+        took < std::time::Duration::from_secs(60),
+        "a hang, not a cost: {took:?}"
+    );
     // The spine reaches every culprit from the top; the last stretch only
     // the last culprit.
     let top = report.get(&nodes[0]).expect("top");
