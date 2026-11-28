@@ -1265,7 +1265,19 @@ async fn two_entries_into_one_broken_file_blame_the_file() -> anyhow::Result<()>
     assert_eq!(f.addr.format(), "//e:a", "{}", r.describe());
     assert_eq!(r.path("e/BUILD"), ["//top:t", "//d:x", "//e:a"]);
     assert_eq!(r.skipped("//top:t").0, "e/BUILD");
+    assert_file_diagnostic_once(f);
     Ok(())
+}
+
+/// CQ round 2: a file culprit reached through several entries records its
+/// first member only, so the box and `--json`'s `error` say the file's
+/// diagnostic once, not once per entry under the consumer's frame.
+fn assert_file_diagnostic_once(f: &TargetFailure) {
+    let text = format!("{:#}", f.source);
+    assert_eq!(text.matches("fail: boom").count(), 1, "{text}");
+    assert!(!text.contains("errors:"), "{text}");
+    let frames = hplugin::diagnostic::cause_frames(&f.source).join(": ");
+    assert_eq!(frames.matches("fail: boom").count(), 1, "{frames}");
 }
 
 /// D1.f: `//top:t`'s two inputs live in one `d/BUILD` that fails at
@@ -1287,6 +1299,7 @@ async fn two_inputs_in_one_broken_file_blame_the_file() -> anyhow::Result<()> {
     assert_eq!(f.addr.format(), "//d:x", "{}", r.describe());
     assert_eq!(r.path("d/BUILD"), ["//top:t", "//d:x"]);
     assert_eq!(r.skipped("//top:t").0, "d/BUILD");
+    assert_file_diagnostic_once(f);
     Ok(())
 }
 

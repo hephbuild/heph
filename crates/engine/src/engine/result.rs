@@ -2224,7 +2224,69 @@ fn classify_failure_fresh(
         } => return classify_each(rs, addr, members, culprit),
         FailureFate::Blame { culprit, entry } => (culprit, entry.clone()),
     };
+    let e = match culprit {
+        Culprit::File(_) => first_member(e),
+        Culprit::Target(_) => e,
+    };
     record_culprit(rs, addr, e, culprit, entry)
+}
+
+/// A keep-going fan-out's aggregate with each member shared, as an
+/// expansion's are (D1.f): the classifier can then hand a member on owned,
+/// recording each against its own culprit, or a broken file's diagnostic
+/// once ([`first_member`]). Anything but a bare aggregate (a sole error,
+/// whatever it wraps) is unchanged.
+fn shared_members(e: anyhow::Error) -> anyhow::Error {
+    // A context over an aggregate is a chain of two: downcasting it by value
+    // would drop the context.
+    if e.chain().nth(1).is_some() {
+        return e;
+    }
+    match e.downcast::<MultiError>() {
+        Ok(multi) => MultiError(
+            multi
+                .0
+                .into_iter()
+                .map(|m| {
+                    if hcore::hmemoizer::is_shared(&m) {
+                        m
+                    } else {
+                        hcore::hmemoizer::nest(m)
+                    }
+                })
+                .collect(),
+        )
+        .into(),
+        Err(e) => e,
+    }
+}
+
+/// A file culprit's error as one member: when `e` aggregates several, every
+/// one blames the file (else [`failure_fate`] would not have), each through
+/// its own entry, and each says the same evaluation error. Recording them all
+/// printed the file's diagnostic once per entry; the first one says it once,
+/// as the record's entry is the first member's. `e` itself when it holds no
+/// aggregate, or when no member can be had owned.
+fn first_member(e: anyhow::Error) -> anyhow::Error {
+    let Some(multi) = downcast_chain_ref::<MultiError>(&e) else {
+        return e;
+    };
+    if let Some(first) = unrecorded(multi).next().and_then(hcore::hmemoizer::share) {
+        return first;
+    }
+    match e.downcast::<MultiError>() {
+        Ok(multi) => {
+            let mut members = multi.0;
+            match members
+                .iter()
+                .position(|m| downcast_chain_ref::<UpstreamFailed>(m).is_none())
+            {
+                Some(i) => members.swap_remove(i),
+                None => MultiError(members).into(),
+            }
+        }
+        Err(e) => e,
+    }
 }
 
 /// Records `e` against `culprit`, entered through `entry`, and returns the
@@ -2324,6 +2386,12 @@ fn classify_each(
     for (culprit, entry, mut errs) in by_culprit {
         let recorded = match errs.pop() {
             Some(sole) if errs.is_empty() => classify_failure_fresh(rs, addr, sole).1,
+            // A file says its evaluation error once, through its first
+            // member's entry (see `first_member`).
+            Some(last) if matches!(culprit, Culprit::File(_)) => {
+                let first = errs.into_iter().next().unwrap_or(last);
+                record_culprit(rs, addr, first, culprit.clone(), entry).1
+            }
             last => {
                 errs.extend(last);
                 record_culprit(rs, addr, MultiError(errs).into(), culprit.clone(), entry).1
@@ -7001,7 +7069,9 @@ impl Engine {
                 })
             });
 
-        let results = crate::engine::fanout::join_all_failable(futures, rs.fail_fast()).await?;
+        let results = crate::engine::fanout::join_all_failable(futures, rs.fail_fast())
+            .await
+            .map_err(shared_members)?;
 
         let mut sb = Sandbox::default();
         for (id, transitive) in results.into_iter().flatten() {
