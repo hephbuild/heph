@@ -734,7 +734,7 @@ mod tests {
 
     /// Contract 2 (error reporting, D5): `run` lost `blocked_by` and the
     /// `"blocked"` outcome, gained `"skipped"`, and the fields a culprit
-    /// carries are nullable where a record may lack them (a BUILD file that
+    /// carries are nullable where a record may lack them (a source file that
     /// did not evaluate has no `addr`; a target with no requested root above
     /// it has no `root`, `more` or `path`; `root` and `root_file` are each
     /// null when the culprit is the other kind). `inspect failure` describes a slot

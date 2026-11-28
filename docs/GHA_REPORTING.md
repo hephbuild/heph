@@ -219,7 +219,7 @@ Rules:
    culprit (one box per culprit): it closes the target's row and nothing else. One with
    `upstream_file` set and no `upstream_of` is a target of that broken file, skipped because of
    its own file; the file's root already stands for it.
-6. **A `FileFailed` is a root**: a BUILD or `.bzl` file that did not evaluate, announced once per
+6. **A `FileFailed` is a root**: a source file that did not evaluate (as its provider reported it, e.g. `d/BUILD`), announced once per
    file. Its `entry` is the address that led into it and its `file` is what a reader is shown.
    The ends of the targets it took down carry `upstream_of: <entry>` and
    `upstream_file: <file>`.
@@ -509,7 +509,7 @@ empty, plus one event kind:
 ```rust
 ResultEnd {
     // …the fields above…
-    #[serde(default)] upstream_file: Option<String>, // the BUILD/.bzl file that did not evaluate
+    #[serde(default)] upstream_file: Option<String>, // the source file that did not evaluate
     #[serde(default)] path: Vec<String>,             // on a culprit's own end: requested → culprit
     #[serde(default)] duplicate: bool,               // this culprit was already announced
 }
@@ -787,7 +787,7 @@ line of a colon-joined chain serves it badly. Three surfaces, in priority order:
    API and has no filesystem access. The marker machinery already exists.
 
 A `failures[]` entry's `addr` is always an address: the entry it was reached through. For a target
-culprit that is the culprit; for a BUILD or `.bzl` file that did not evaluate (`file` set) it is
+culprit that is the culprit; for a source file that did not evaluate (`file` set) it is
 the address that led into the file, a target the file would have defined. **`file`, when set, is
 what to show**: the thing that broke. Read `.file // .addr` for a name.
 

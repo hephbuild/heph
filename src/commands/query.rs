@@ -224,7 +224,7 @@ async fn execute_async(
         move |engine, rs, ctx| async move {
             // What matched goes to stdout as it is found; what the walk could not
             // resolve is reported on stderr at the end, and fails the command.
-            // One address whose BUILD file did not evaluate: the file's box
+            // One address whose source file did not evaluate: the file's box
             // and exit 1, as `run` gives, not a gap; `--json` prints `[]`,
             // since nothing matched (D5).
             if !candidates

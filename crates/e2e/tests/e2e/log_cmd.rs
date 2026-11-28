@@ -304,7 +304,7 @@ async fn log_before_run_says_it_never_ran() -> anyhow::Result<()> {
         r#"target(name = "t", driver = "bash", run = "true", timeout = "not-a-duration")"#,
     );
     let cases = [
-        ("//d:t", "while its BUILD file was evaluated"),
+        ("//d:t", "while d/BUILD was evaluated"),
         ("//p:t", "while its driver parsed its definition"),
     ];
     for (addr, _) in cases {

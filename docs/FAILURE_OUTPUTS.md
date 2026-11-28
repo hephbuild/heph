@@ -79,8 +79,9 @@ it.
 
 **A failure before the run** keeps a slot too: no log, no `out/`, a manifest
 with no revision and `diagnostic.json`. That covers a def that does not
-parse, a missing dependency, a run that failed and kept nothing, and a BUILD
-file that did not evaluate. A BUILD file's slot is keyed by the file, not by
+parse, a missing dependency, a run that failed and kept nothing, and a source
+file that did not evaluate: a file its provider reported, such as the
+buildfile provider's `d/BUILD`. A file's slot is keyed by the file, not by
 a target: `<home>/failures/file_<path>-<digest>/`, its manifest's `addr` is
 `file:<path>` (workspace-relative), and it lists the packages whose targets
 were reached through the file. It is cleared when a target of any package it
@@ -351,12 +352,12 @@ keys and `--jq` filters it, as on every command (`docs/JSON_OUTPUT.md`):
   a slot written by an older heph, with no `diagnostic.json`, gets `run` (or
   `eval` for a file's slot) and a message that says so. The message and the
   hints' wording are not contract.
-- `location` is where in a BUILD or `.bzl` file it was raised, the file
+- `location` is where in a source file it was raised, the file
   workspace-relative. `truncated` says a cap cut something from the record.
 - `failed_at` is in milliseconds since the Unix epoch. `hashin` is the input
   hash of the run that failed, which may no longer be the target's. Both are
   `null` for every failure before the run (a def that does not parse, a
-  missing dependency, a BUILD file that did not evaluate). So are `log` and
+  missing dependency, a source file that did not evaluate). So are `log` and
   `log_lines`.
 - `log_lines` counts the lines of `log`: `0` for a run that printed nothing,
   whose empty `log.txt` is still kept. `log_replaced` is true when a newer
@@ -364,7 +365,7 @@ keys and `--jq` filters it, as on every command (`docs/JSON_OUTPUT.md`):
 - The message is scrubbed as `run --json`'s `error` is: heph's home redacted,
   workspace paths made relative.
 
-**A target in a BUILD file that did not evaluate** has no slot of its own:
+**A target in a source file that did not evaluate** has no slot of its own:
 `heph inspect failure //d:t` answers with the file's slot instead. Then
 `addr` is `null`, `file` is the file (`d/BUILD`), `stage` is `eval`, and the
 text form's first line names the file.
@@ -391,17 +392,20 @@ rerun:
 
 ```
 $ heph log //d:t
-heph: //d:t failed while its BUILD file was evaluated; it never ran. See `heph inspect failure //d:t`
+heph: //d:t failed while d/BUILD was evaluated; it never ran. See `heph inspect failure //d:t`
 ```
+
+An evaluation names the file its provider reported (here the buildfile
+provider's `d/BUILD`), or `its source file` when the slot holds none.
 
 The clause names the stage: `while its driver parsed its definition`, `while
 its inputs were linked`, and so on.
 
 ### A failed package probe
 
-A failure is recorded under its culprit: a target, or a BUILD file that did
+A failure is recorded under its culprit: a target, or a source file that did
 not evaluate. No culprit is a package. When the provider's probe of a package
-fails (it cannot list it, for a reason other than a BUILD file that does not
+fails (it cannot list it, for a reason other than a source file that does not
 evaluate), the failure is recorded under the target that was being resolved
 in that package. The failure report, `run --json` and the event stream name
 that target, not the package. The targets that depend on it are not blamed.

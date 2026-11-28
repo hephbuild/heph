@@ -34,11 +34,12 @@ pub struct Args {
 /// target skipped because a dependency failed keeps no record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, output::Record)]
 pub struct FailureView {
-    /// The target's address; null when the failure is a BUILD or `.bzl`
-    /// file's (`file`).
+    /// The target's address; null when the failure is a source file's
+    /// (`file`).
     pub addr: Option<String>,
-    /// The BUILD or `.bzl` file that did not evaluate, workspace-relative;
-    /// null when the failure is a target's.
+    /// The source file that did not evaluate, workspace-relative, as its
+    /// provider reported it (e.g. `d/BUILD`); null when the failure is a
+    /// target's.
     pub file: Option<String>,
     /// The failure slot's directory.
     #[serde(serialize_with = "output::ser::path")]
@@ -48,7 +49,7 @@ pub struct FailureView {
     pub stage: Stage,
     /// What went wrong, on one line. Its wording is not contract.
     pub message: String,
-    /// Where in a BUILD or `.bzl` file it was raised, the file
+    /// Where in a source file it was raised, the file
     /// workspace-relative; null when it names no place.
     pub location: Option<SourceLoc>,
     /// What the user can do about it, each with its kind. A hint's wording
@@ -121,7 +122,7 @@ pub fn failure_view(slots: &FailureSlots, addr: &Addr) -> anyhow::Result<Option<
 }
 
 /// What `heph inspect failure <addr>` reports: `addr`'s own slot, else the
-/// slot of the BUILD file its package did not evaluate in (D5, Q5). `None`
+/// slot of the source file its package did not evaluate in (D5, Q5). `None`
 /// for a target with neither: it never failed, passed since, or was skipped.
 pub fn inspect_view(engine: &Engine, addr: &Addr) -> anyhow::Result<Option<FailureView>> {
     let slots = engine.failure_slots();
