@@ -20,14 +20,18 @@ use std::sync::Arc;
 /// would print: `took_down`, `was_cancelled` and the home all from the
 /// request, as `finalize` gathers them.
 async fn run_report(engine: &Arc<Engine>, addr: &str) -> anyhow::Result<String> {
+    run_report_with(engine, addr, &ResultOptions::default()).await
+}
+
+/// [`run_report`] under `opts`.
+async fn run_report_with(
+    engine: &Arc<Engine>,
+    addr: &str,
+    opts: &ResultOptions,
+) -> anyhow::Result<String> {
     let rs = engine.new_state();
     let res = Arc::clone(engine)
-        .result_addr(
-            rs.clone(),
-            &parse_addr(addr)?,
-            OutputMatcher::All,
-            &ResultOptions::default(),
-        )
+        .result_addr(rs.clone(), &parse_addr(addr)?, OutputMatcher::All, opts)
         .await;
     assert!(res.is_err(), "{addr} must fail");
     let failures = rs.take_failures_with_logs().await;
@@ -402,6 +406,82 @@ async fn streamed_then_missing_output_box_without_log() -> anyhow::Result<()> {
     );
     assert!(!report.contains("streamed-line"), "{report}");
     ends_with_log(&report, "//p:t");
+    Ok(())
+}
+
+/// Options whose wrapper lends the run a terminal: its output streams, as
+/// the sole selected target's does.
+fn streaming() -> ResultOptions {
+    let wrapper: heph::engine::InteractiveWrapper =
+        Arc::new(move |inner: heph::engine::InteractiveInner| {
+            Box::pin(async move {
+                let (mut out, mut err) = (tokio::io::sink(), tokio::io::sink());
+                inner(None, Some(&mut out), Some(&mut err), None).await?;
+                Ok(heph::engine::TerminalUse { streamed: true })
+            })
+        });
+    ResultOptions {
+        interactive: Some(wrapper),
+        ..ResultOptions::default()
+    }
+}
+
+/// CQ r2: a streamed `in_place` run that wrote fixes and exited 1. Its
+/// streamed line (`✗ //fix:upper · exit status 1 · heph log`) was told
+/// before the write-back, so it cannot name the fixes: the failure gets its
+/// box, with the fixes and the restore row, and without the streamed log.
+#[tokio::test]
+async fn streamed_in_place_fixes_get_their_box() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file("fix", &in_place_then("exit 1"));
+    ws.write_file("fix/src.txt", "hello");
+
+    let addr = "//fix:upper";
+    let report = run_report_with(&ws.engine, addr, &streaming()).await?;
+    assert!(
+        report.contains(&format!("✗ {addr} · exit status 1")),
+        "{report}"
+    );
+    assert_eq!(
+        listed(&report, "fixes written,"),
+        ["fix/src.txt"],
+        "{report}"
+    );
+    let restore = listed(&report, "restore with");
+    assert!(
+        matches!(restore.as_slice(), [git] if git.ends_with("checkout -- fix/src.txt")),
+        "{report}"
+    );
+    assert!(
+        !report.contains(" │ fixed"),
+        "the streamed output is not repeated:\n{report}"
+    );
+    Ok(())
+}
+
+/// CQ r2: a streamed `in_place` run whose source moved while it ran. The
+/// guard's refusal joins the error after the streamed line was told, so
+/// the failure gets its box, saying why nothing was written.
+#[tokio::test]
+async fn streamed_in_place_moved_source_gets_its_box() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    let src = ws.dir.path().join("fix/src.txt");
+    ws.write_build_file(
+        "fix",
+        &in_place_then(&format!(
+            "printf 'edited by someone else' > {}; exit 1",
+            src.display()
+        )),
+    );
+    ws.write_file("fix/src.txt", "hello");
+
+    let addr = "//fix:upper";
+    let report = run_report_with(&ws.engine, addr, &streaming()).await?;
+    assert_eq!(std::fs::read_to_string(&src)?, "edited by someone else");
+    assert!(report.contains(&format!("✗ {addr}")), "{report}");
+    assert!(report.contains("changed while it ran"), "{report}");
+    assert!(report.contains("fixes not written:"), "{report}");
+    assert!(!report.contains("restore with"), "{report}");
     Ok(())
 }
 

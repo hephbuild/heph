@@ -167,8 +167,16 @@ impl FailureRecord {
     /// //t`, D6.1c) right after that output. Every renderer leaves its box
     /// out; `--json` still carries it. A failure after a streamed run (its
     /// outputs, the cache store) is not: it gets its box, without the log.
+    ///
+    /// Nor is an `in_place` run's write-back on failure (CQ r2): the line was
+    /// told before it, so it cannot name the fixes written, their restore,
+    /// or why none were (the moved-source guard's refusal among them). A
+    /// record that carries `left_behind.fixes` gets its box, without the log.
     pub fn told_streamed(&self) -> bool {
-        self.streamed && self.failed_in == FailedIn::Exec && !self.cancelled
+        self.streamed
+            && self.failed_in == FailedIn::Exec
+            && !self.cancelled
+            && self.left_behind.as_ref().is_none_or(|l| l.fixes.is_none())
     }
 
     /// The bytes of text the record holds, as [`RECORD_CAP`] counts them:
@@ -441,6 +449,25 @@ mod tests {
         assert!(json.contains(r#""failed_in":"exec""#), "{json}");
         let back: FailureRecord = serde_json::from_str(&json).expect("decode");
         assert_eq!(back, full);
+    }
+
+    /// A streamed exec failure is told in its line, unless its write-back
+    /// on failure left something the line could not say (CQ r2).
+    #[test]
+    fn told_streamed_unless_fixes_were_reported() {
+        let mut rec = FailureRecord::new(Diagnostic::new(Stage::Run, "exit status 1"));
+        rec.failed_in = FailedIn::Exec;
+        rec.streamed = true;
+        assert!(rec.told_streamed());
+        rec.left_behind = Some(crate::events::LeftBehindData::default());
+        assert!(rec.told_streamed(), "nothing about fixes");
+        rec.left_behind = Some(crate::events::LeftBehindData {
+            fixes: Some(crate::events::FixesData::NotWritten {
+                reason: "the source changed while it ran".to_owned(),
+            }),
+            ..Default::default()
+        });
+        assert!(!rec.told_streamed());
     }
 
     /// A newer host's `failed_in` decodes: an older plugin-gh's event stream
