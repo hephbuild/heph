@@ -1,7 +1,7 @@
-//! The slice of engine behaviour the BUILD-file LSP needs, abstracted behind a
-//! trait so the LSP can live in the buildfile plugin crate without depending on
-//! the concrete `Engine`. The engine implements this; the LSP takes
-//! `Arc<dyn LspEngine>`.
+//! The slice of engine behaviour a plugin's language server needs (e.g. the
+//! buildfile plugin's BUILD-file LSP), abstracted behind a trait so the server
+//! can live in its plugin's crate without depending on the concrete `Engine`.
+//! The engine implements this; the server takes `Arc<dyn LspEngine>`.
 
 use crate::config::Options;
 use crate::driver::{DriverSchema, DriverSchemas};
@@ -11,7 +11,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 pub trait LspEngine: Send + Sync {
-    /// Workspace root, for resolving BUILD-file paths.
+    /// Workspace root, for resolving a provider's source-file paths (e.g.
+    /// BUILD files).
     fn root(&self) -> &Path;
     /// The engine's sealed plugin-function registry (for completion/hover on
     /// `heph.<plugin>.<fn>`).
