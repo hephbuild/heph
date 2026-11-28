@@ -40,6 +40,50 @@ mod rename;
 // so those expansions resolve wherever the macro is used.
 pub use crate::driver::{DriverField, DriverSchema};
 
+/// Context the `Spec` derive puts on a field's parse error: which option of
+/// the spec's config failed, so a diagnostic can point at it (D3).
+/// Displays as the derive always has, ``parse `key` ``.
+#[derive(Debug, Clone, Copy)]
+pub struct OptionContext {
+    pub key: &'static str,
+}
+
+impl std::fmt::Display for OptionContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "parse `{}`", self.key)
+    }
+}
+
+impl std::error::Error for OptionContext {}
+
+/// The error the `Spec` derive gives a config holding options it does not
+/// know, sorted. Displays as the derive always has,
+/// `unknown entries found: ["a", "b"]`.
+#[derive(Debug, Clone)]
+pub struct UnknownOptions {
+    pub keys: Vec<String>,
+}
+
+impl std::fmt::Display for UnknownOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "unknown entries found: {:?}", self.keys)
+    }
+}
+
+impl std::error::Error for UnknownOptions {}
+
+/// The option a spec error is about, outermost first: the option whose
+/// parse failed, or the first unknown one. `None` for any other error.
+pub fn error_option(e: &anyhow::Error) -> Option<&str> {
+    if let Some(c) = hcore::hmemoizer::downcast_chain_ref::<OptionContext>(e) {
+        return Some(c.key);
+    }
+    hcore::hmemoizer::downcast_chain_ref::<UnknownOptions>(e)?
+        .keys
+        .first()
+        .map(String::as_str)
+}
+
 /// What a `#[derive(Spec)]` struct knows about its own fields, for code that
 /// must name them as `'static` strings (a function signature's
 /// [`Param`](hcore::htvalue::signature::Param) borrows its name for

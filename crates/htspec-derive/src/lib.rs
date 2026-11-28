@@ -266,7 +266,7 @@ fn field_codegen(
             let #var: #fty = match __m.get(#key) {
                 ::core::option::Option::Some(__v) => {
                     __hits += 1;
-                    (#parse_call).with_context(|| ::std::format!("parse `{}`", #key))?
+                    (#parse_call).context(crate::htspec::OptionContext { key: #key })?
                 }
                 #absent_arm
             };
@@ -305,13 +305,13 @@ fn parse_body(cg: &FieldCodegen) -> proc_macro2::TokenStream {
         #(#parse_stmts)*
         if __hits != __m.len() {
             const __KNOWN: &[&str] = &[ #(#keys),* ];
-            let mut __unknown: ::std::vec::Vec<&str> = __m
+            let mut __unknown: ::std::vec::Vec<::std::string::String> = __m
                 .keys()
-                .map(::std::string::String::as_str)
-                .filter(|__k| !__KNOWN.contains(__k))
+                .filter(|__k| !__KNOWN.contains(&__k.as_str()))
+                .cloned()
                 .collect();
             __unknown.sort_unstable();
-            ::anyhow::bail!("unknown entries found: {:?}", __unknown);
+            ::anyhow::bail!(crate::htspec::UnknownOptions { keys: __unknown });
         }
     }
 }

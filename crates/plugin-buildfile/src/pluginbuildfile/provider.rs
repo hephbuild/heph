@@ -840,6 +840,12 @@ impl EProvider for Provider {
             })
         })
     }
+
+    /// The file parsed again, never evaluated: a spec's config keys are its
+    /// `target()` call's keyword arguments, so an option is found by name.
+    fn source_index(&self, file: &str) -> Option<Arc<dyn hplugin::provider::SourceIndex>> {
+        crate::pluginbuildfile::source_index::index(&self.root, file)
+    }
 }
 
 /// Where a buildfile provider reads the `heph.<plugin>.<fn>` namespace from.
