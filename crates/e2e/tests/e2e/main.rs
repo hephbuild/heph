@@ -87,4 +87,5 @@ mod scratch;
 mod source_location;
 mod suggestions;
 mod tool_env;
+mod validate;
 mod workspace_cleanup;

@@ -41,10 +41,10 @@ pub struct ValidateArgs {
 #[derive(Debug, Default, serde::Serialize, output::Record)]
 pub struct ValidateView {
     /// One message per problem that fails validation; empty when it passed.
-    problems: Vec<String>,
+    pub problems: Vec<String>,
     /// Findings that do not fail it: generated files local to this checkout,
     /// and a check skipped because validation is scoped.
-    warnings: Vec<String>,
+    pub warnings: Vec<String>,
 }
 
 impl ValidateView {
@@ -344,6 +344,12 @@ pub async fn codegen_findings(
             .codegen_copy_gitignore_patterns(rs.clone(), &Matcher::TreeOutputTo(PkgBuf::from("")))
             .await?;
         let existing = crate::commands::tool::codegen::read_gitignore(root)?;
+        // No codegen target and no section to keep fresh: a workspace that
+        // never used codegen passes without a `.gitignore` (CLI-17). A section
+        // left behind by targets that are gone is still checked.
+        if entries.is_empty() && !gitignore::has_markers(&existing) {
+            return Ok(Vec::new());
+        }
         Ok(stale_messages(
             &gitignore::diff_section(&existing, &entries).reasons,
         ))
@@ -361,13 +367,16 @@ pub async fn codegen_findings(
 }
 
 /// The warnings `validate` prints for findings local to this checkout: every
-/// item `codegen status` lists except a stale section, which fails instead.
-/// One line per item, then one pointing at `heph tool codegen status`.
+/// item `codegen status` lists except a stale section, which fails instead,
+/// and a target or package that did not resolve, which the link check
+/// already fails on (CLI-17/STAGE-21: each cause once, and not as a codegen
+/// finding). One line per item, then one pointing at `heph tool codegen
+/// status`.
 fn local_findings_warnings(report: &StatusReport) -> Vec<String> {
     let mut out: Vec<String> = report
         .items
         .iter()
-        .filter(|i| i.kind != ItemKind::SectionStale)
+        .filter(|i| !matches!(i.kind, ItemKind::SectionStale | ItemKind::Unresolved))
         .map(|i| {
             let head = i.path.as_deref().or(i.package.as_deref()).unwrap_or("");
             format!(
@@ -403,7 +412,8 @@ fn shadowed_check_problems(shadowed: &ShadowedChecks, matcher: &Matcher) -> Vec<
 /// contributes either a list of human-readable problem strings (`Ok`) or a hard
 /// error (`Err`); a check's `Err` that is itself a [`MultiError`] is flattened
 /// so its inner errors surface individually. The point is exhaustiveness: nothing
-/// short-circuits, so the user sees *all* the problems, not just the first.
+/// short-circuits, so the user sees *all* the problems, not just the first —
+/// each once ([`dedupe_by_cause`]).
 fn finish(checks: Vec<anyhow::Result<Vec<String>>>) -> anyhow::Result<()> {
     let mut errs: Vec<anyhow::Error> = Vec::new();
     for check in checks {
@@ -415,12 +425,78 @@ fn finish(checks: Vec<anyhow::Result<Vec<String>>>) -> anyhow::Result<()> {
             },
         }
     }
+    let mut errs = dedupe_by_cause(errs);
     let combined = match errs.len() {
         0 => return Ok(()),
         1 => errs.pop().expect("len == 1"),
         _ => MultiError(errs).into(),
     };
     Err(combined).context("validation failed")
+}
+
+/// One error per (root, cause) (error-reporting D8, CLI-17/STAGE-21). The
+/// link walk reaches a broken target from each target that depends on it,
+/// and the other checks walk the workspace again, so one cause arrives once
+/// per path. The root is the culprit the engine blames
+/// ([`crate::engine::culprit_on_chain`]) and the cause its innermost frame;
+/// an error that names no culprit is keyed by its whole text. Each cause
+/// keeps the place of its first arrival and the shortest chain it arrived
+/// with, which is the culprit's own error when the walk reached it.
+fn dedupe_by_cause(errs: Vec<anyhow::Error>) -> Vec<anyhow::Error> {
+    type Key = (Option<hplugin::error::Culprit>, String);
+    let mut out: Vec<(anyhow::Error, usize)> = Vec::with_capacity(errs.len());
+    let mut seen: std::collections::HashMap<Key, usize> = std::collections::HashMap::new();
+    for e in errs {
+        let frames = crate::hmemoizer::frames(&e);
+        let depth = frames.len();
+        let key = match crate::engine::culprit_on_chain(&e) {
+            Some(culprit) => {
+                let cause = frames.last().map(|f| f.error().to_string());
+                (Some(culprit), cause.unwrap_or_default())
+            }
+            None => (None, format!("{e:#}")),
+        };
+        drop(frames);
+        match seen.get(&key).and_then(|&i| out.get_mut(i)) {
+            Some(kept) if depth < kept.1 => *kept = (e, depth),
+            Some(_) => {}
+            None => {
+                seen.insert(key, out.len());
+                out.push((e, depth));
+            }
+        }
+    }
+    out.into_iter().map(|(e, _)| e).collect()
+}
+
+/// Every check `heph validate` runs on the whole workspace at `root`, with
+/// the engine `heph validate` builds there: the problems that fail it and the
+/// warnings it printed, as `--json` reports them. For tests.
+pub async fn validate_workspace_at(root: &Path) -> anyhow::Result<ValidateView> {
+    let (engine, _shutdown, shadowed) =
+        bootstrap::new_validate_engine_at(root, &GlobalOptions::default(), None)?;
+    let validate = Validate {
+        engine: Arc::clone(&engine),
+        matcher: Matcher::PackagePrefix(PkgBuf::from("")),
+        scoped: false,
+        root: root.to_path_buf(),
+        shadowed,
+    };
+    let gaps = Gaps::new(crate::htquery::format(&validate.matcher));
+    let warnings = std::sync::Mutex::new(Vec::new());
+    let checked = validate
+        .check(
+            &engine.new_state(),
+            Discovery::keep_going_unless(false, &gaps),
+            &|line: &str| {
+                if let Ok(mut w) = warnings.lock() {
+                    w.push(line.to_owned());
+                }
+            },
+        )
+        .await;
+    let warnings = warnings.into_inner().unwrap_or_default();
+    Ok(ValidateView::new(&checked, warnings))
 }
 
 pub fn execute(
@@ -519,11 +595,13 @@ mod tests {
 
     #[test]
     fn local_findings_skip_the_stale_section_and_point_at_status() {
+        // An unresolved target is the link check's to report (CLI-17).
         let report = StatusReport {
             check: false,
             items: vec![
                 item(ItemKind::SectionStale, ".gitignore"),
                 item(ItemKind::NoLongerGenerated, "p/a.go"),
+                item(ItemKind::Unresolved, "//r:t"),
                 item(ItemKind::ForeignLine, "/q/b.go"),
             ],
             hint: None,
