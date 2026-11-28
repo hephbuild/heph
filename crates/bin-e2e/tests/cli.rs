@@ -227,6 +227,58 @@ fn fail_fast_after_failure_exits_1() {
     }
 }
 
+/// U6 non-TUI: with no terminal, a failure's box is printed as it happens,
+/// while a sibling is still running, and the end of the run does not print
+/// it again: one header, then only the totals.
+#[test]
+fn non_tui_box_before_slow_sibling_not_repeated() {
+    let dist = Dist::locate();
+    let ws = Workspace::new().expect("workspace");
+    ws.write(
+        "pkg/BUILD",
+        concat!(
+            "target(name = \"slow\", driver = \"bash\", run = \"sleep 10\", cache = False)\n",
+            "target(name = \"bad\", driver = \"bash\", run = [\"echo bad-line\", \"exit 1\"],",
+            " cache = False)\n",
+        ),
+    )
+    .expect("write BUILD");
+    let mut run = Bg::spawn(&ws, &dist, &["run", "-e", "//pkg:slow || //pkg:bad"]);
+    let header = "✗ //pkg:bad · exit status 1";
+    common::wait_until("//pkg:bad's box", SHORT, || run.stderr().contains(header));
+    assert!(
+        !recorded(&run.dir, "ResultEnd", "//pkg:slow"),
+        "the box waited for the slow sibling\n{}",
+        run.stderr()
+    );
+    assert!(
+        run.stderr().contains("│ bad-line"),
+        "the box carries the tail\n{}",
+        run.stderr()
+    );
+    let status = run.wait();
+    let stderr = run.stderr();
+    assert_eq!(status.code(), Some(1), "{stderr}");
+    assert!(
+        recorded(&run.dir, "ResultEnd", "//pkg:slow"),
+        "the sibling ran to its end\n{stderr}"
+    );
+    assert_eq!(
+        stderr.matches(header).count(),
+        1,
+        "the box is printed once\n{stderr}"
+    );
+    assert_eq!(
+        stderr.matches("│ bad-line").count(),
+        1,
+        "the tail is printed once\n{stderr}"
+    );
+    assert!(
+        stderr.lines().any(|l| l == "1 failed: //pkg:bad"),
+        "the end adds the totals\n{stderr}"
+    );
+}
+
 /// SIGTERM is a cancel, as Ctrl-C is: heph stops the build and exits 130,
 /// rather than dying of the signal.
 #[test]

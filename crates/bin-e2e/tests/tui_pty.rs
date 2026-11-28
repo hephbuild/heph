@@ -3037,6 +3037,251 @@ fn tty_printed_nothing() {
     );
 }
 
+/// U6, D6.1c "execution went fine, then a later step failed": a requested
+/// target streams its line, exits 0, and never writes the `out` it declared.
+/// Its process did not fail, so there is no one-liner; it gets its box, with
+/// the pointer in place of the tail it already printed. The in-process form
+/// is `crates/e2e` `failure_report::streamed_then_missing_output_box_without_log`.
+#[test]
+fn streamed_then_missing_output_box_without_log() {
+    let build = concat!(
+        "target(name = \"noout\", driver = \"bash\", cache = False,",
+        " out = \"never.txt\", run = [\"echo noout-line\"])\n",
+    );
+    let b = boxed(build, r#""$HEPH" run //pkg:noout"#);
+    b.assert_failed();
+    assert!(b.tui_engaged(), "the TUI never engaged\n{}", b.report());
+    let rows = b.rows();
+    assert!(
+        has_bare_row(&rows, "noout-line"),
+        "the target's own line should be on the terminal\n{}",
+        b.report()
+    );
+    assert!(
+        !rows.iter().any(|r| r.starts_with("✗ //pkg:noout · exit")),
+        "the process went fine, yet it was told as a failed exit\n{}",
+        b.report()
+    );
+    let seen = b.pty.seen();
+    assert!(
+        rows.iter().any(|r| r.trim_end() == "✗ //pkg:noout"),
+        "a failure past the run gets its box\n{}",
+        b.report()
+    );
+    assert!(
+        seen.contains("never.txt"),
+        "the box names the missing output\n{}",
+        b.report()
+    );
+    assert!(
+        seen.contains("(output not shown here: 1 line · heph log //pkg:noout)"),
+        "the box points at the log it does not repeat\n{}",
+        b.report()
+    );
+    assert!(
+        !has_tail_row(&seen, "noout-line"),
+        "the streamed line is repeated in the box\n{}",
+        b.report()
+    );
+}
+
+/// U6, D6.1c "failed before it ran": a requested target whose option the
+/// driver refuses never runs, so nothing of it reached the terminal and it
+/// gets the full box: the refusal, no pointer, no one-liner and no `log:`
+/// row (it never had a log). In-process: `crates/e2e`
+/// `failure_report::streamed_target_bad_option_full_box`.
+#[test]
+fn streamed_target_bad_option_full_box() {
+    let build = concat!(
+        "target(name = \"badopt\", driver = \"bash\", cache = False,",
+        " timeout = \"banana\", run = [\"echo badopt-line\"])\n",
+    );
+    let b = boxed(build, r#""$HEPH" run //pkg:badopt"#);
+    b.assert_failed();
+    assert!(b.tui_engaged(), "the TUI never engaged\n{}", b.report());
+    let rows = b.rows();
+    let seen = b.pty.seen();
+    let header = rows
+        .iter()
+        .position(|r| r.trim_end() == "✗ //pkg:badopt")
+        .unwrap_or_else(|| panic!("no box for //pkg:badopt\n{}", b.report()));
+    assert!(
+        rows.get(header + 1)
+            .is_some_and(|r| r.contains("\"banana\" is not a duration")),
+        "the box's next row is the refusal\n{}",
+        b.report()
+    );
+    assert!(
+        !seen.contains("badopt-line"),
+        "a target that never ran printed\n{}",
+        b.report()
+    );
+    assert_no_pointer_ever(&b);
+    assert!(
+        !rows.iter().any(|r| r.trim_start().starts_with("log:")),
+        "a failure before the run has no log row\n{}",
+        b.report()
+    );
+}
+
+/// GRAPH-07: a target that depends on itself fails, and the TUI never draws
+/// it green: no `✓` on any screen, the end line counts it failed, the box
+/// names the cycle, and heph exits 1. In-process: `crates/e2e`
+/// `run_json::self_cycle_counts_as_failed`.
+#[test]
+fn self_cycle_never_drawn_green() {
+    let build = concat!(
+        "target(name = \"cyc\", driver = \"bash\", cache = False,",
+        " run = [\"echo cyc\"], deps = {\"a\": [\"//pkg:cyc\"]})\n",
+    );
+    let b = boxed(build, r#""$HEPH" run //pkg:cyc"#);
+    assert_eq!(
+        b.ended,
+        common::pty::Ended::Code(1),
+        "a cycle exits 1\n{}",
+        b.report()
+    );
+    assert!(b.tui_engaged(), "the TUI never engaged\n{}", b.report());
+    let seen = b.pty.seen();
+    assert!(
+        !seen.contains('✓'),
+        "a cycle was drawn green\n{}",
+        b.report()
+    );
+    let rows = b.rows();
+    assert!(
+        rows.iter()
+            .any(|r| r.starts_with("✗ ") && r.contains("1 failed (1 root)")),
+        "the end line counts the cycle failed\n{}",
+        b.report()
+    );
+    assert!(
+        seen.contains("cyclic dependency detected: //pkg:cyc → //pkg:cyc"),
+        "the box names the cycle\n{}",
+        b.report()
+    );
+}
+
+/// EVAL-02 / CLI-14 / STAGE-22: a message wider than the terminal wraps
+/// inside the box instead of being cut at its edge, so its end, where the
+/// cause sits, is on screen. heph wraps it, not the terminal: the row that
+/// holds the end carries the box's continuation indent. In-process:
+/// `report_wraps_instead_of_cutting` (`src/commands/errors/report.rs`).
+#[test]
+fn tui_error_row_wraps_cause_visible() {
+    let words: Vec<String> = (0..40).map(|i| format!("wordy{i:02}")).collect();
+    let build = format!(
+        "fail(\"{} the-cause-at-the-end\")\n\
+         target(name = \"t\", driver = \"bash\", run = [\"echo\"])\n",
+        words.join(" ")
+    );
+    assert!(
+        build.len() > 2 * usize::from(common::pty::COLS),
+        "the message must be wider than the terminal"
+    );
+    let b = boxed(&build, r#""$HEPH" run //pkg:t"#);
+    b.assert_failed();
+    assert!(b.tui_engaged(), "the TUI never engaged\n{}", b.report());
+    let rows = b.rows();
+    let first = rows
+        .iter()
+        .position(|r| r.starts_with("  fail: wordy00"))
+        .unwrap_or_else(|| panic!("no message row\n{}", b.report()));
+    let end = rows
+        .iter()
+        .skip(first)
+        .position(|r| r.contains("the-cause-at-the-end"))
+        .map(|i| i + first)
+        .unwrap_or_else(|| panic!("the cause was cut\n{}", b.report()));
+    assert!(end > first, "the message did not wrap\n{}", b.report());
+    for row in rows.iter().take(end + 1).skip(first + 1) {
+        assert!(
+            row.starts_with("    wordy"),
+            "a message row wrapped by the terminal, not by heph: {row:?}\n{}",
+            b.report()
+        );
+    }
+    assert!(
+        !rows
+            .iter()
+            .take(end + 1)
+            .skip(first)
+            .any(|r| r.ends_with('…')),
+        "a message row was cut\n{}",
+        b.report()
+    );
+}
+
+/// The status line's clock: the first `Ns` or `N.NNNs` before ` · `, in
+/// milliseconds, on the row that has the line's `done` count.
+fn status_clock_ms(rows: &[String]) -> Option<(u128, String)> {
+    rows.iter().find(|r| r.contains(" done ·")).and_then(|r| {
+        let (head, _) = r.split_once("s ·")?;
+        let secs: f64 = head.rsplit(' ').next()?.parse().ok()?;
+        let ms = Duration::try_from_secs_f64(secs).ok()?.as_millis();
+        Some((ms, r.clone()))
+    })
+}
+
+/// STAGE-18: the clock ticks while the requested target's BUILD file is
+/// still evaluating, before any target event. `run` of one address asks
+/// whether it is an entrypoint first; the request's `RequestConfig` now
+/// comes before that lookup, so the clock counts from the request's start,
+/// not from the first target event, and the end line's time covers the
+/// evaluation too. In-process: `tui` `elapsed_ticks_from_request_config`.
+///
+/// The BUILD file loops long enough to take seconds in a release build.
+#[test]
+fn tui_clock_ticks_during_slow_get() {
+    let dist = Dist::locate();
+    let ws = common::Workspace::new().expect("workspace");
+    ws.write(
+        "pkg/BUILD",
+        concat!(
+            "def slow():\n",
+            "    x = 0\n",
+            "    for i in range(40000000):\n",
+            "        x += i\n",
+            "    return x\n",
+            "\n",
+            "slow()\n",
+            "target(name = \"t\", driver = \"bash\", cache = False, run = [\"echo ran\"])\n",
+        ),
+    )
+    .expect("write BUILD");
+    let home = ws.home().to_string_lossy().into_owned();
+    let started = Instant::now();
+    let mut pty = common::pty::Pty::script_at_cursor(
+        &dist,
+        ws.root(),
+        r#""$HEPH" run //pkg:t"#,
+        &[("HOME", &home)],
+    );
+    pty.wait_screen("the clock past 0s before anything ran", DEADLINE, |s| {
+        let rows: Vec<String> = common::pty::screen_rows(s).collect();
+        status_clock_ms(&rows).is_some_and(|(ms, row)| ms >= 1000 && row.contains(" 0 done"))
+    });
+    let ended = pty.wait_exit(DEADLINE);
+    let wall = started.elapsed();
+    assert_eq!(
+        ended,
+        common::pty::Ended::Code(0),
+        "--- screen ---\n{}",
+        pty.screen()
+    );
+    let rows = pty.rows();
+    let (ms, row) = status_clock_ms(&rows)
+        .unwrap_or_else(|| panic!("no end line\n--- screen ---\n{}", pty.screen()));
+    assert!(row.starts_with('✓'), "{row}");
+    // The run took at least the second the clock showed, so the end line
+    // must too: before, it counted from the first target event and said
+    // a few milliseconds.
+    assert!(
+        ms >= 1000 && ms <= wall.as_millis(),
+        "the end line's time ({ms}ms) does not cover the evaluation (wall {wall:?}): {row}"
+    );
+}
+
 /// D6.3: a requested target whose last byte on the terminal is not a line
 /// break leaves the line open. The CLI ends it, so heph's summary starts on
 /// its own line and the TUI coming back does not paint over the target's
