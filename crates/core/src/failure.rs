@@ -184,6 +184,31 @@ impl FailureRecord {
             (None, None) => exit.status.trim().to_owned(),
         })
     }
+
+    /// The message a process failure whose driver raised no diagnostic is
+    /// recorded with: [`process_end`](Self::process_end), and for an
+    /// abandoned timeout [`ABANDONED`] after it. `None` when the failure is
+    /// not a process that ended.
+    pub fn process_end_message(&self) -> Option<String> {
+        let end = self.process_end()?;
+        Some(match &self.timed_out {
+            Some(t) if t.abandoned => format!("{end}; {ABANDONED}"),
+            _ => end,
+        })
+    }
+
+    /// The message says only how the process ended (the record's message
+    /// was replaced by [`process_end_message`](Self::process_end_message)),
+    /// or nothing: a renderer whose header says the status leaves it out.
+    /// A driver's own diagnostic beside an exit (`go vet found 2 issues`,
+    /// a cdylib's `--- FAIL` lines) is not, and is shown.
+    pub fn message_is_status(&self) -> bool {
+        let m = self.diagnostic.message.trim();
+        m.is_empty()
+            || self
+                .process_end_message()
+                .is_some_and(|end| end.trim() == m)
+    }
 }
 
 /// What a box adds under a timeout whose run was abandoned, and what the

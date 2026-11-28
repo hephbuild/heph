@@ -79,7 +79,7 @@ fn fixtures(ws: &Path) -> Vec<FailureRecord> {
             log_readable: Some(true),
             ..LeftBehindData::default()
         }),
-        ..target("//p:t", Diagnostic::new(Stage::Run, "exit status: 1"))
+        ..target("//p:t", Diagnostic::new(Stage::Run, "exit status 1"))
     };
     let file = FailureRecord {
         addr: None,
@@ -769,6 +769,56 @@ fn log_lines_escaped_and_home_redacted() {
 }
 
 #[test]
+/// A driver's own diagnostic beside an exit (CQ-1) is shown by the box, the
+/// report's overflow line and the streamed line, hints too. A message that
+/// only says how the process ended (compact's `process_end_message`) is not
+/// repeated under a header that says it.
+fn raised_diagnostic_with_exit_is_shown() {
+    let exit = |rec: FailureRecord| FailureRecord {
+        exit: Some(ExitData {
+            code: Some(1),
+            signal: None,
+            status: "exit status: 1".into(),
+        }),
+        failed_in: FailedIn::Exec,
+        ..rec
+    };
+    let raised = exit(target(
+        "//p:vet",
+        Diagnostic::new(Stage::Run, "go vet found 2 issues")
+            .with_hint(Hint::new(HintKind::Other, "run go vet ./... locally")),
+    ));
+    let ctx = RenderCtx::default();
+    let b = render_box(&raised, &ctx);
+    assert!(b.starts_with("✗ //p:vet · exit status 1\n"), "{b}");
+    assert!(b.contains("go vet found 2 issues"), "{b}");
+    assert!(b.contains("run go vet ./... locally"), "{b}");
+    assert_eq!(
+        one_line(&raised, &ctx),
+        "✗ //p:vet · exit status 1 · go vet found 2 issues"
+    );
+    assert_eq!(
+        streamed_exec_line(&raised, false),
+        "✗ //p:vet · exit status 1 · heph log //p:vet\n  \
+         go vet found 2 issues\n  \
+         run go vet ./... locally"
+    );
+
+    // Said only by the header: no row, no second line.
+    let status_only = exit(target(
+        "//p:t",
+        Diagnostic::new(Stage::Run, "exit status 1"),
+    ));
+    let b = render_box(&status_only, &ctx);
+    assert_eq!(b.matches("exit status 1").count(), 1, "{b}");
+    assert_eq!(one_line(&status_only, &ctx), "✗ //p:t · exit status 1");
+    assert_eq!(
+        streamed_exec_line(&status_only, false),
+        "✗ //p:t · exit status 1 · heph log //p:t"
+    );
+}
+
+#[test]
 fn header_names_exit_signal_timeout_and_diff() {
     let with = |f: fn(&mut FailureRecord)| {
         let mut rec = target("//p:t", Diagnostic::new(Stage::Run, "m"));
@@ -878,7 +928,8 @@ fn totals_skipped_fail_fast_and_streamed_lines() {
             signal: None,
             status: "exit status: 1".into(),
         }),
-        ..target("//p:a b", Diagnostic::new(Stage::Run, "m"))
+        // As compact records a process failure with no diagnostic.
+        ..target("//p:a b", Diagnostic::new(Stage::Run, "exit status 1"))
     };
     assert_eq!(
         streamed_exec_line(&rec, false),

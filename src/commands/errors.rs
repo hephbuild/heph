@@ -1037,7 +1037,8 @@ mod tests {
             lines.iter().map(|l| format!("{l}\n")).collect::<String>(),
         )
         .expect("log");
-        let mut r = rec(addr, "process failed");
+        // As compact records a process failure with no diagnostic.
+        let mut r = rec(addr, "exit status 1");
         r.failed_in = FailedIn::Exec;
         r.exit = Some(ExitData {
             code: Some(1),

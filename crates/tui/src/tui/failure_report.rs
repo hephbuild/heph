@@ -177,6 +177,18 @@ fn status(rec: &FailureRecord) -> Option<String> {
         .map(|_| "generated output differs from tree".to_owned())
 }
 
+/// The message is said by the header's [`status`], so a renderer leaves it
+/// out: compact replaced it with how the process ended
+/// ([`FailureRecord::message_is_status`]), or it is a `--frozen` check's,
+/// whose diff the box draws. A driver's own diagnostic beside an exit is
+/// not, and is shown.
+fn message_in_header(rec: &FailureRecord) -> bool {
+    match rec.process_end() {
+        Some(_) => rec.message_is_status(),
+        None => rec.frozen_diff.is_some(),
+    }
+}
+
 /// A hint as a row: a near-miss name as the question it answers, any other
 /// kind as its own sentence.
 fn hint_text(h: &Hint, ctx: &RenderCtx) -> String {
@@ -191,7 +203,8 @@ fn hint_text(h: &Hint, ctx: &RenderCtx) -> String {
 /// layout:
 /// 1. the header, `✗ //t · exit status 1` (or `✗ d/BUILD`);
 /// 2. the message, wrapped, and an aggregate's causes; left out when the
-///    header's status says it (a process's exit, a timeout, a diff);
+///    header's status says it (a process's exit or timeout with no
+///    diagnostic of its driver's, a diff);
 /// 3. the location's excerpt (`╭─[p/BUILD:4:5]`) with a marker under the
 ///    span, the near-miss hint at its end; `at p/BUILD:4` when the file
 ///    cannot frame it;
@@ -205,7 +218,7 @@ pub fn render_box(rec: &FailureRecord, ctx: &RenderCtx) -> String {
     let status = status(rec);
     b.header(&culprit_name(rec, ctx), status.as_deref());
 
-    if status.is_none() {
+    if !message_in_header(rec) {
         let msg = message(&d.message, &ctx.redact, &ctx.rel);
         for line in msg.lines() {
             b.row(line);
@@ -309,20 +322,18 @@ pub fn render_report<'a>(
 }
 
 /// A failure past the report's cap: its header, and its message's first
-/// line when the header has no status, cut to the width.
+/// line unless the header's status says it, cut to the width.
 pub fn one_line(rec: &FailureRecord, ctx: &RenderCtx) -> String {
     let mut line = format!("✗ {}", culprit_name(rec, ctx));
-    match status(rec) {
-        Some(status) => {
+    if let Some(status) = status(rec) {
+        line.push_str(" · ");
+        line.push_str(&status);
+    }
+    if !message_in_header(rec) {
+        let msg = message(&rec.diagnostic.message, &ctx.redact, &ctx.rel);
+        if let Some(first) = msg.lines().next().filter(|l| !l.is_empty()) {
             line.push_str(" · ");
-            line.push_str(&status);
-        }
-        None => {
-            let msg = message(&rec.diagnostic.message, &ctx.redact, &ctx.rel);
-            if let Some(first) = msg.lines().next().filter(|l| !l.is_empty()) {
-                line.push_str(" · ");
-                line.push_str(first);
-            }
+            line.push_str(first);
         }
     }
     let line = match ctx.width {
@@ -334,7 +345,10 @@ pub fn one_line(rec: &FailureRecord, ctx: &RenderCtx) -> String {
 
 /// The one line a target whose output streamed to the terminal gets when
 /// its process fails (D6.1c, U6): `✗ //t · exit status 1 · heph log //t`,
-/// right after its output; the header's red bold under `color`. No newline.
+/// right after its output; the header's red bold under `color`. A driver's
+/// own diagnostic is never hidden by it: its message's lines, then its
+/// hints, each follow on a line of its own, indented, as the box would show
+/// them (CQ-1). No newline after the last.
 pub fn streamed_exec_line(rec: &FailureRecord, color: bool) -> String {
     let addr = log_addr(rec);
     let mut line = format!("✗ {}", clean_inline(addr));
@@ -345,6 +359,20 @@ pub fn streamed_exec_line(rec: &FailureRecord, color: bool) -> String {
     let mut line = paint(&line, Tone::RedBold, color);
     let pointer = format!(" · heph log {}", shell_quote(addr));
     line.push_str(&paint(&pointer, Tone::Dim, color));
+    // As the CI box words it: heph's home and the workspace as it does.
+    let ctx = RenderCtx::default();
+    let d = &rec.diagnostic;
+    if !message_in_header(rec) {
+        let msg = message(&d.message, &ctx.redact, &ctx.rel);
+        for l in msg.lines().filter(|l| !l.trim().is_empty()) {
+            line.push_str("\n  ");
+            line.push_str(l);
+        }
+    }
+    for h in &d.hints {
+        line.push_str("\n  ");
+        line.push_str(&hint_text(h, &ctx));
+    }
     line
 }
 
