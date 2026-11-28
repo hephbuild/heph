@@ -795,7 +795,7 @@ impl EProvider for Provider {
                         labels: p.labels.clone(),
                         transitive: p.transitive.clone(),
                         approval: p.approval.clone(),
-                        source: None,
+                        source: p.site.source.clone(),
                     },
                 });
             }
@@ -1348,6 +1348,56 @@ mod tests {
         let ctoken = StdCancellationToken::new();
         let res = provider.get(get_req("p", "t"), &ctoken).await.expect("get");
         assert_eq!(res.target_spec.driver, "exec");
+    }
+
+    /// D3: a spec reports where it was declared, as a workspace-relative file
+    /// and the declaring call's span: the BUILD file's own `target()` call, or
+    /// the `target()` call inside the loaded file a macro made it in. A file's
+    /// specs share one file `Arc`.
+    #[tokio::test]
+    async fn get_reports_the_declaring_call() {
+        let tmp_dir = tempdir().unwrap();
+        let root = tmp_dir.path();
+        fs::create_dir_all(root.join("p")).unwrap();
+        fs::create_dir_all(root.join("lib")).unwrap();
+        fs::write(
+            root.join("lib/defs.star"),
+            "def mk(name):\n    target(\n        name = name,\n    )\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("p/BUILD"),
+            "load(\"//lib/defs.star\", \"mk\")\n\ntarget(name = \"a\")\n  # pad\ntarget(\n    name = \"b\",\n)\nmk(\"m\")\n",
+        )
+        .unwrap();
+        let provider = Provider {
+            root: root.to_path_buf(),
+            default_driver: Some("exec".to_string()),
+            ..Provider::default()
+        };
+        let ctoken = StdCancellationToken::new();
+        let source = |name: &'static str| {
+            let provider = &provider;
+            let ctoken = &ctoken;
+            async move {
+                provider
+                    .get(get_req("p", name), ctoken)
+                    .await
+                    .expect("get")
+                    .target_spec
+                    .source
+                    .unwrap_or_else(|| panic!("{name} has a source"))
+            }
+        };
+        let (a, b, m) = (source("a").await, source("b").await, source("m").await);
+        let span = |s: &hplugin::provider::SpecSource| {
+            let c = s.call();
+            (c.start_line, c.start_col, c.end_line, c.end_col)
+        };
+        assert_eq!((a.file(), span(&a)), ("p/BUILD", (3, 1, 3, 19)));
+        assert_eq!((b.file(), span(&b)), ("p/BUILD", (5, 1, 7, 2)));
+        assert_eq!((m.file(), span(&m)), ("lib/defs.star", (2, 5, 4, 6)));
+        assert!(Arc::ptr_eq(a.file_arc(), b.file_arc()), "one Arc per file");
     }
 
     #[tokio::test]
