@@ -93,6 +93,13 @@ details.layer[open] > summary { margin-bottom: 1rem; }
 details.item[data-state="settled"] { opacity: 0.8; }
 details.item[data-state="change"] { border-color: var(--t-scrutinize); box-shadow: inset 3px 0 0 var(--t-scrutinize); }
 .card-title { font-size: 1.1rem; font-weight: 600; line-height: 1.35; max-width: 70ch; }
+[hidden] { display: none !important; }
+.card-body { display: grid; gap: 0.9rem; min-width: 0; }
+.card-head { display: flex; gap: 0.8rem; align-items: baseline; justify-content: space-between; min-width: 0; }
+.card-head button.fold { flex: none; }
+.answer-line { font-size: 0.9rem; color: var(--muted); max-width: 70ch; overflow-wrap: anywhere; }
+.card.folded { padding-block: 0.7rem; gap: 0.45rem; }
+.card.folded .card-title { font-size: 1rem; }
 .prose { max-width: 70ch; line-height: 1.65; overflow-wrap: anywhere; }
 .decision { background: var(--callout-bg); border-left: 3px solid var(--t-scrutinize); border-radius: 0 6px 6px 0; padding: 0.7rem 0.9rem; display: grid; gap: 0.6rem; }
 .decision .question { font-weight: 500; max-width: 70ch; line-height: 1.55; }
@@ -299,7 +306,7 @@ textarea#review-text { width: 100%; min-height: 8rem; font: 0.8rem var(--mono); 
     const openLine = el("strong", { id: "open-count" });
     const update = () => {
       let open = 0;
-      for (const l of stack.layers) for (const c of layers[l.pr].cards) if (c.tier === "scrutinize" && cardState(stack, c).state === "open") open++;
+      for (const l of stack.layers) for (const c of layers[l.pr].cards) if (c.tier === "scrutinize" && shownState(stack, c) === "open") open++;
       openLine.textContent = open + (open === 1 ? " card open" : " cards open");
     };
     update();
@@ -384,7 +391,7 @@ textarea#review-text { width: 100%; min-height: 8rem; font: 0.8rem var(--mono); 
       let open = 0;
       for (const { d, li, chip } of rows) {
         const c = byId[d.layer + "/" + d.card];
-        const s = c ? cardState(stack, c).state : "open";
+        const s = c ? shownState(stack, c) : "open";
         if (s === "open") open++;
         li.dataset.state = s;
         setStateChip(chip, s);
@@ -638,7 +645,7 @@ textarea#review-text { width: 100%; min-height: 8rem; font: 0.8rem var(--mono); 
   // answerControls draws the answers and the note of a card or an item, and
   // keeps its data-state, its state chips and its buttons in step with what
   // is stored. Picking the selected answer again clears it.
-  function answerControls(stack, c, answers, host, chips, optionClass) {
+  function answerControls(stack, c, answers, host, chips, optionClass, onPick) {
     const hint = el("p", { class: "note-hint", hidden: true,
       text: "This asks for a change without saying which: write it in your note, or whoever makes the change has nothing to go on." });
     const buttons = answers.map((a) => el("button", {
@@ -647,6 +654,7 @@ textarea#review-text { width: 100%; min-height: 8rem; font: 0.8rem var(--mono); 
         const again = cardState(stack, c).choice === a.choice;
         setCardReview(stack, c, again ? { choice: null, change: null } : { choice: a.choice, change: a.change });
         refresh(); changed();
+        if (onPick) onPick(again ? null : a);
       },
     }, optionClass ? [
       el("span", { class: "answer" }, el("span", { class: "choice", text: a.choice }),
@@ -657,8 +665,8 @@ textarea#review-text { width: 100%; min-height: 8rem; font: 0.8rem var(--mono); 
     noteBox.value = cardState(stack, c).note || "";
     const refresh = () => {
       const st = cardState(stack, c);
-      host.dataset.state = st.state;
-      for (const ch of chips) setStateChip(ch, st.state);
+      host.dataset.state = shownState(stack, c);
+      for (const ch of chips) setStateChip(ch, shownState(stack, c));
       for (const b of buttons) b.setAttribute("aria-pressed", String(st.state !== "open" && b.dataset.choice === st.choice));
       hint.hidden = !(st.state === "change" && !(c.options || []).some((o) => o.choice === st.choice) && !st.note.trim());
     };
@@ -682,19 +690,53 @@ textarea#review-text { width: 100%; min-height: 8rem; font: 0.8rem var(--mono); 
   }
 
   const notDone = (c) => !!c.earlier_round && c.earlier_round.decision === "change" && c.earlier_round.code === "unchanged";
+  // shownState is a card's state as the page counts and shows it: a change
+  // asked for in an earlier round is a decision already made, even with no
+  // answer in this browser and the change not yet in the code.
+  function shownState(stack, c) {
+    const s = cardState(stack, c).state;
+    return s === "open" && notDone(c) ? "change" : s;
+  }
 
   function drawCard(stack, l, manifest, c) {
     const st = cardState(stack, c);
     const card = el("article", { class: "card", id: "card-" + l.pr + "-" + c.id, "data-state": st.state });
     const chip = el("span", { class: "chip state" });
-    const ctl = answerControls(stack, c, answersOf(c), card, [chip], "option");
+    // A decided card folds to its title and the answer: what still needs the
+    // user stays in view. "Keeps the code" folds at once; a change stays
+    // open for its note until the user folds it.
+    const answerLine = el("p", { class: "answer-line" });
+    const toggle = el("button", { type: "button", class: "fold", onclick: () => fold(!body.hidden) });
+    const fold = (v) => {
+      body.hidden = v;
+      card.classList.toggle("folded", v);
+      const decided = shownState(stack, c) !== "open";
+      toggle.textContent = v ? "Show card" : "Fold";
+      toggle.hidden = !v && !decided;
+      answerLine.hidden = !decided;
+      const s = cardState(stack, c);
+      const e = c.earlier_round;
+      const choice = s.choice || (s.state === "open" && e ? e.choice : null);
+      answerLine.textContent = !decided ? "" :
+        (shownState(stack, c) === "settled" ? "You settled it" : "You asked for a change") +
+        (choice ? ": " + choice : "") + (s.state === "open" && notDone(c) ? " (in an earlier round; not done yet)" : "") +
+        (s.note ? " · " + s.note.split("\n")[0].slice(0, 140) : "");
+    };
+    const ctl = answerControls(stack, c, answersOf(c), card, [chip], "option", (a) => {
+      if (a && !a.change) { fold(true); if (card.getBoundingClientRect().top < 0) card.scrollIntoView({ block: "start" }); }
+      else fold(false);
+    });
+    const body = el("div", { class: "card-body" });
     add(card,
       el("div", { class: "row" }, chip,
         c.reason_title ? el("span", { class: "chip reason", text: c.reason_title }) : null,
         notDone(c) ? el("span", { class: "chip reopened", text: "you asked for a change here: not done yet" }) : null,
         st.reopened ? el("span", { class: "chip reopened", text: "changed since you reviewed it" }) : null,
         st.surroundings ? el("span", { class: "chip", text: "surroundings changed" }) : null),
-      el("h4", { class: "card-title", text: c.title || c.claim }),
+      el("div", { class: "card-head" }, el("h4", { class: "card-title", text: c.title || c.claim }), toggle),
+      answerLine,
+      body);
+    add(body,
       el("div", { class: "decision" },
         c.question ? el("p", { class: "question", text: c.question }) : null,
         el("ul", { class: "options", "aria-label": "Your answer; each says whether it keeps the code or asks for a change" },
@@ -711,6 +753,8 @@ textarea#review-text { width: 100%; min-height: 8rem; font: 0.8rem var(--mono); 
       cardFoot(c),
       st.earlier.length ? el("div", { class: "earlier-notes" }, el("span", { class: "label", text: "Your notes on the earlier code here" }),
         st.earlier.map((n) => el("p", { class: "prose muted", text: n }))) : null);
+    fold(shownState(stack, c) !== "open");
+    ctl.noteBox.addEventListener("input", () => { if (!body.hidden) fold(false); });
     return card;
   }
 
@@ -773,7 +817,7 @@ textarea#review-text { width: 100%; min-height: 8rem; font: 0.8rem var(--mono); 
     const progress = el("span", { class: "muted" });
     // A card is closed once its answer settles it or requests a change.
     const update = () => {
-      const closed = cards.filter((c) => cardState(stack, c).state !== "open").length;
+      const closed = cards.filter((c) => shownState(stack, c) !== "open").length;
       progress.textContent = cards.length === 0 ? "No cards in this layer." :
         closed === cards.length ? "All " + cards.length + " cards closed: this layer has none left." : closed + " of " + cards.length + " cards closed.";
     };
@@ -791,10 +835,13 @@ textarea#review-text { width: 100%; min-height: 8rem; font: 0.8rem var(--mono); 
       if (filled) return; filled = true;
       if (data.overflow) body.append(el("p", { class: "banner", text: fmt(data.used.cards) + " changes in this layer need you, over its budget of " + fmt(data.budget.cards) + " cards and " + fmt(data.budget.lines) + " lines. Every one is shown: the layer is too large to review in less." }));
       if (data.confirmation) body.append(el("p", { class: "muted", text: data.confirmation }));
+      // What still needs the user comes first. The order is set once, when
+      // the layer is drawn, so nothing moves under the user while answering.
+      const openFirst = (xs) => [...xs.filter((c) => shownState(stack, c) === "open"), ...xs.filter((c) => shownState(stack, c) !== "open")];
       body.append(el("div", { class: "stack" }, el("h3", { text: "Scrutinize" }),
-        cards.length ? cards.map((c) => drawCard(stack, l, manifest, c)) : el("p", { class: "muted", text: "No change in this layer needs your judgment." })));
-      if (glance.length) body.append(el("div", { class: "stack" }, el("h3", { text: "Glance" }), el("div", { class: "items" }, glance.map((c) => drawItem(stack, l, manifest, c)))));
-      if (cleared.length) body.append(el("div", { class: "stack" }, el("h3", { text: "AI-cleared" }), el("div", { class: "items" }, cleared.map((c) => drawItem(stack, l, manifest, c)))));
+        cards.length ? openFirst(cards).map((c) => drawCard(stack, l, manifest, c)) : el("p", { class: "muted", text: "No change in this layer needs your judgment." })));
+      if (glance.length) body.append(el("div", { class: "stack" }, el("h3", { text: "Glance" }), el("div", { class: "items" }, openFirst(glance).map((c) => drawItem(stack, l, manifest, c)))));
+      if (cleared.length) body.append(el("div", { class: "stack" }, el("h3", { text: "AI-cleared" }), el("div", { class: "items" }, openFirst(cleared).map((c) => drawItem(stack, l, manifest, c)))));
       const settled = data.settled || [];
       if (settled.length) body.append(el("details", { class: "item settled-earlier", id: "settled-" + l.pr },
         el("summary", {}, el("strong", { text: "Settled earlier" }),

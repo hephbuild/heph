@@ -93,7 +93,8 @@ func servedBrief(t *testing.T, api func(w http.ResponseWriter, head string)) (di
 
 // briefOpts vary the served brief.
 type briefOpts struct {
-	glance bool // the second item is Glance, not AI-cleared
+	glance   bool // the second item is Glance, not AI-cleared
+	twoCards bool // the second item is a second Scrutinize card
 	// earlier are answers from an earlier round's page, by item id: the
 	// brief is rendered with them as its decisions file.
 	earlier map[string]UserDecision
@@ -140,6 +141,10 @@ func serveBrief(t *testing.T, api func(w http.ResponseWriter, head string), o br
 		it.Tests = []TestRef{{Name: "pins_a"}}
 		if o.glance {
 			tr.Items[1].Tier = TierGlance
+		}
+		if o.twoCards {
+			tr.Items[1].Tier, tr.Items[1].Reason = TierScrutinize, "security"
+			cardText(&tr.Items[1])
 		}
 		cited := LayerRef{Layer: 1, RangeRef: RangeRef{Path: "src/a.rs", Start: 2, End: 2}}
 		audit := &Audit{Format: auditFormat, Assessment: Assessment{Text: "Hangs together.", Refs: []LayerRef{cited, cited}}}
@@ -573,6 +578,47 @@ start(() => {}, (c) => {
 	}
 }
 
+// A decided card folds to its title and answer, so what still needs the user
+// stays in view: a card settled on an earlier visit loads folded and after
+// the open one, "Show card" unfolds it, a keep answer folds at once, and a
+// change answer stays open for its note until folded.
+func Test_a_decided_card_folds(t *testing.T) {
+	s := serveBrief(t, apiDown, briefOpts{twoCards: true})
+	field := driveBrief(t, s.dir, s.url, `
+const cards = () => [...doc().querySelectorAll("article.card")];
+const read = (c) => [c.id, c.classList.contains("folded"), c.querySelector(".card-body").hidden, c.querySelector("button.fold").hidden ? "-" : c.querySelector("button.fold").textContent, c.querySelector(".answer-line").textContent].join("|");
+start((stack, layer) => {
+  const r = layer.cards.find((c) => c.id === "c1-0").ranges[0];
+  localStorage.setItem(key(stack, r.hash), JSON.stringify({ choice: "Keep the constant", change: false, note: "fine by me\nsecond line", context: r.context }));
+}, () => {
+  const [first, second] = cards();
+  put("load", read(first) + "\n" + read(second));
+  button("Show card", second).click();
+  put("shown", read(second));
+  answer(second, "Keep the constant").click();
+  put("cleared", read(second));
+  answer(second, "Keep the constant").click();
+  put("kept", read(second));
+  answer(first, "No").click();
+  put("change", read(first));
+  button("Fold", first).click();
+  put("folded", read(first));
+});`)
+	for id, want := range map[string]string{
+		"load": "card-1-c1-1|false|false|-|\n" +
+			"card-1-c1-0|true|true|Show card|You settled it: Keep the constant · fine by me",
+		"shown":   "card-1-c1-0|false|false|Fold|You settled it: Keep the constant · fine by me",
+		"cleared": "card-1-c1-0|false|false|-|",
+		"kept":    "card-1-c1-0|true|true|Show card|You settled it: Keep the constant · fine by me",
+		"change":  "card-1-c1-1|false|false|Fold|You asked for a change: No",
+		"folded":  "card-1-c1-1|true|true|Show card|You asked for a change: No",
+	} {
+		if got := field(id); got != want {
+			t.Errorf("%s:\n got %q\nwant %q", id, got, want)
+		}
+	}
+}
+
 // A brief rendered with the decisions of an earlier round shows what was
 // settled under "Settled earlier", with the earlier answer and note, the
 // ledger counts it and still verifies, and a change request whose code is
@@ -592,7 +638,8 @@ func Test_settled_earlier_brief(t *testing.T) {
 	}
 	for _, want := range []string{`id="ledger"`, `data-state="verified"`, `class="seg-settled"`, " settled earlier · ",
 		`id="settled-1"`, "<strong>Settled earlier</strong>", "fine, said earlier", "You settled this in an earlier round: ",
-		"you asked for a change here: not done yet", "drop it, said earlier", "1 card open"} {
+		"you asked for a change here: not done yet", "drop it, said earlier", "0 cards open",
+		`class="card folded"`, "You asked for a change: Drop it (in an earlier round; not done yet)"} {
 		if !strings.Contains(dom, want) {
 			t.Errorf("page DOM lacks %q", want)
 		}

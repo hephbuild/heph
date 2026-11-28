@@ -318,7 +318,10 @@ A card's answer is its decision. Under the question are the card's options, each
 "keeps the code" or "asks for a change", then "Something else", which asks for a change the note
 describes, and the note box. A keeping answer settles the card (dimmed); a change answer
 requests the change (outlined). Either closes the card in the layer's count and the top line;
-picking the selected answer again reopens it. A Glance or AI-cleared item has "Fine" and "Needs a
+picking the selected answer again reopens it. A decided card folds to its title and the answer
+(a keeping answer at once, a change answer when the user folds it after the note), and it loads
+folded, after the open cards in its layer. That includes a change asked for in an earlier
+round that is not done yet. "Show card" unfolds it. A Glance or AI-cleared item has "Fine" and "Needs a
 change" and a note. Each layer ends with "Settled earlier": what the user settled on an earlier
 page whose code has not changed, with that answer, out of the budget and not asked again. A card
 whose code still holds a change the user asked for says "not done yet"; one whose code changed
