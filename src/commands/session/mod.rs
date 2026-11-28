@@ -9,11 +9,12 @@
 //! The commands run against `&[&dyn SessionSource]` and merge what the sources
 //! say, so a test (and later a daemon) is just another source.
 //!
-//! Exit codes: 125 for this command's own failures (no such session, an
-//! ambiguous id, a format this heph cannot read, a lost session on attach, an
-//! in-flight request that went unanswered); `attach` otherwise exits with the
-//! session's exit code, and 0 on detach. A session can exit 125 too, so
-//! `attach` names a mirrored 125 on stderr. See [`SessionExit`].
+//! Exit codes are heph's (U15): 1 for this command's own failures (no such
+//! session, an ambiguous id, a format this heph cannot read, a lost session
+//! on attach, an in-flight request that went unanswered), 130 for a cancel.
+//! `attach` mirrors the session's end as 0, 1 or 130, and exits 0 on detach;
+//! a session that recorded another code (an older heph's) mirrors as 1, and
+//! `attach` names the code on stderr. See [`SessionExit`].
 
 mod attach;
 pub(crate) mod list;
@@ -91,9 +92,9 @@ pub enum SessionCommands {
     Show(ShowArgs),
     /// Follow a session live, until it ends or you detach
     ///
-    /// `q` (or Ctrl-C) detaches and leaves the session running. Exits with the
-    /// session's exit code once it ends, 0 on detach, and 125 when heph cannot
-    /// follow it. A 125 that is the session's own is named on stderr.
+    /// `q` (or Ctrl-C) detaches and leaves the session running. Once the
+    /// session ends, exits as it did: 0, 1 or 130. Exits 0 on detach, and 1
+    /// when heph cannot follow it.
     ///
     /// Examples:
     ///
@@ -104,7 +105,7 @@ pub enum SessionCommands {
     /// Ask a running session for its in-flight report
     ///
     /// The same report `SIGQUIT` writes, without sending any signal: the
-    /// session answers through its own directory within 5s, or this exits 125.
+    /// session answers through its own directory within 5s, or this exits 1.
     ///
     /// Examples:
     ///
@@ -179,22 +180,8 @@ impl SessionArgs {
         session: &Arc<SessionSlot>,
         global: &GlobalOptions,
     ) -> anyhow::Result<()> {
-        wrap_exit(execute(&self.command, sink, session, global))
+        execute(&self.command, sink, session, global)
     }
-}
-
-/// Every error that is not already a [`SessionExit`] is this command's own:
-/// exit 125, so it is never read as an exit code `attach` mirrored. A `--jq`
-/// failure keeps the output layer's code (2, or 130 when cancelled), as on
-/// every command.
-pub(crate) fn wrap_exit(res: anyhow::Result<()>) -> anyhow::Result<()> {
-    res.map_err(|e| {
-        if e.downcast_ref::<SessionExit>().is_some() || output::exit_code(&e).is_some() {
-            e
-        } else {
-            SessionExit::own(e).into()
-        }
-    })
 }
 
 fn execute(
@@ -253,42 +240,33 @@ fn execute(
     }
 }
 
-/// How a `heph session` command ended, when not with 0. `main.rs` exits with
-/// `code`, rendering `error` first when there is one.
+/// `attach` mirroring how the session it followed ended, when not with 0.
+/// `main.rs` exits with `code` and renders nothing: the session's own output
+/// said what happened. This command's own failures are ordinary errors.
 #[derive(Debug)]
 pub struct SessionExit {
     pub code: u8,
-    pub error: Option<anyhow::Error>,
 }
 
 impl SessionExit {
-    /// The command's own failure (A14). A session can exit 125 as well;
-    /// `attach` says so on stderr when it mirrors one (`attach::exit_note`).
-    pub const OWN_FAILURE: u8 = 125;
-
-    pub fn own(error: anyhow::Error) -> Self {
-        Self {
-            code: Self::OWN_FAILURE,
-            error: Some(error),
-        }
-    }
-
-    /// `attach` mirroring the session's exit code; nothing to render.
+    /// The session's recorded exit code, mirrored as heph's: 0, 130 for a
+    /// cancel, 1 for anything else (U15). A code other than those three
+    /// (an older heph's, or not an exit status at all) is named on stderr
+    /// by `attach::exit_note`.
     pub fn mirrored(code: i32) -> Self {
         Self {
-            // An exit status is 0–255; anything else was not one.
-            code: u8::try_from(code).unwrap_or(Self::OWN_FAILURE),
-            error: None,
+            code: match code {
+                0 => 0,
+                130 => 130,
+                _ => 1,
+            },
         }
     }
 }
 
 impl std::fmt::Display for SessionExit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.error {
-            Some(e) => write!(f, "{e:#}"),
-            None => write!(f, "exit {}", self.code),
-        }
+        write!(f, "exit {}", self.code)
     }
 }
 

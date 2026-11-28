@@ -1453,49 +1453,45 @@ async fn older_viewer_warns_on_newer_heph() {
     );
 }
 
+/// `attach` mirrors a session's end as heph's own codes, 0, 1 or 130 (U15);
+/// its own failures are ordinary errors (exit 1 in `main`), never a
+/// [`SessionExit`].
 #[test]
 fn exit_code_mapping() {
-    let own: anyhow::Error = SessionExit::own(anyhow::anyhow!("no session x")).into();
-    assert_eq!(exit_code(&own), Some(125));
-    assert_eq!(exit_code(&SessionExit::mirrored(3).into()), Some(3));
-    assert_eq!(exit_code(&SessionExit::mirrored(300).into()), Some(125));
+    assert_eq!(exit_code(&SessionExit::mirrored(1).into()), Some(1));
+    assert_eq!(exit_code(&SessionExit::mirrored(130).into()), Some(130));
+    for other in [2, 3, 125, 255, 300, -1, i32::MIN] {
+        assert_eq!(
+            exit_code(&SessionExit::mirrored(other).into()),
+            Some(1),
+            "{other}"
+        );
+    }
     assert_eq!(exit_code(&anyhow::anyhow!("not ours")), None);
-
-    let wrapped = wrap_exit(Err(anyhow::anyhow!("ambiguous"))).expect_err("err");
-    assert_eq!(exit_code(&wrapped), Some(125));
-    let kept = wrap_exit(Err(SessionExit::mirrored(7).into())).expect_err("err");
-    assert_eq!(exit_code(&kept), Some(7));
-    assert!(wrap_exit(Ok(())).is_ok());
 
     let id = SessionId::new(T0, 1);
     assert!(outcome_result(id, Outcome::Detached).is_ok());
     assert!(outcome_result(id, Outcome::Ended(Some(0))).is_ok());
     let code = |o| outcome_result(id, o).map_err(|e| exit_code(&e));
-    assert_eq!(code(Outcome::Ended(Some(2))), Err(Some(2)));
-    assert_eq!(code(Outcome::Ended(None)), Err(Some(125)));
-    assert_eq!(code(Outcome::Lost), Err(Some(125)));
+    assert_eq!(code(Outcome::Ended(Some(1))), Err(Some(1)));
+    assert_eq!(code(Outcome::Ended(Some(130))), Err(Some(130)));
+    assert_eq!(code(Outcome::Ended(Some(2))), Err(Some(1)));
+    // Not a mirror: this command's own failure, rendered with its reason.
+    assert_eq!(code(Outcome::Ended(None)), Err(None));
+    assert_eq!(code(Outcome::Lost), Err(None));
 
-    // U1: a 125 that is not this command's own failure says why on stderr.
+    // U1: a code that does not mirror as itself is named on stderr.
     let note = |o| attach::exit_note(id, o);
-    assert_eq!(
-        note(Outcome::Ended(Some(125))),
-        Some(format!("heph: session {id} exited 125\n"))
-    );
-    assert_eq!(code(Outcome::Ended(Some(125))), Err(Some(125)));
-    for weird in [-1, 256, i32::MIN] {
+    for other in [2, 125, 255, -1, 256, i32::MIN] {
         assert_eq!(
-            note(Outcome::Ended(Some(weird))),
-            Some(format!(
-                "heph: session {id} exited {weird}, not an exit status (0-255); exiting 125\n"
-            )),
+            note(Outcome::Ended(Some(other))),
+            Some(format!("heph: session {id} exited {other}; exiting 1\n")),
         );
-        assert_eq!(code(Outcome::Ended(Some(weird))), Err(Some(125)));
     }
     for quiet in [
         Outcome::Ended(Some(0)),
-        Outcome::Ended(Some(2)),
-        Outcome::Ended(Some(124)),
-        Outcome::Ended(Some(255)),
+        Outcome::Ended(Some(1)),
+        Outcome::Ended(Some(130)),
         // These carry their reason in the error itself.
         Outcome::Ended(None),
         Outcome::Lost,
@@ -1506,7 +1502,7 @@ fn exit_code_mapping() {
 }
 
 /// `attach` on the line backend follows to the end and mirrors the exit code;
-/// a lost session is 125.
+/// a lost session is attach's own failure.
 #[tokio::test]
 async fn attach_mirrors_the_session_exit() {
     let done = SessionId::new(T0, 1);
@@ -1553,9 +1549,14 @@ async fn attach_mirrors_the_session_exit() {
         }
     };
     let err = run(done).await.expect_err("exit 3");
-    assert_eq!(exit_code(&err), Some(3));
+    assert_eq!(exit_code(&err), Some(1), "an exit 3 mirrors as 1");
     let err = run(lost).await.expect_err("lost");
-    assert_eq!(exit_code(&err), Some(125));
+    assert_eq!(
+        exit_code(&err),
+        None,
+        "a lost session is attach's own error"
+    );
+    assert!(format!("{err:#}").contains("was lost"), "{err:#}");
 }
 
 /// The detach listener is armed when `trigger_on` returns, not when its task
@@ -2202,15 +2203,4 @@ fn inflight_record_keys_subset_of_fields() -> anyhow::Result<()> {
         id: "id".to_owned(),
         report: "report",
     })
-}
-
-/// A `--jq` failure keeps the output layer's exit code instead of becoming
-/// this command's own 125.
-#[test]
-fn jq_failure_keeps_its_exit_code() {
-    let e = wrap_exit(Err(output::OutputError::JqRuntime("boom".to_owned()).into()))
-        .expect_err("still an error");
-    assert_eq!(output::exit_code(&e), Some(2));
-    let e = wrap_exit(Err(anyhow::anyhow!("no such session"))).expect_err("an error");
-    assert_eq!(exit_code(&e), Some(SessionExit::OWN_FAILURE));
 }

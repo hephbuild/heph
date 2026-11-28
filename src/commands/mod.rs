@@ -139,7 +139,7 @@ pub enum Commands {
     /// Every heph run records what it is doing under `~/.heph/sessions`.
     /// These commands list those sessions, print one, follow one live, and ask
     /// one for its in-flight report. They only read: nothing here cancels,
-    /// signals or cleans up a session. Their own failures exit 125.
+    /// signals or cleans up a session. Their own failures exit 1.
     ///
     /// Examples:
     ///

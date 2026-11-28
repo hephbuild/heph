@@ -390,16 +390,10 @@ fn exit_code_for(
     {
         return 1;
     }
-    // `heph session`: 125 for its own failures, else the code `attach`
-    // mirrors from the session it followed. The code comes from
-    // `session::exit_code`, the mapping its tests pin.
+    // `heph session attach` mirroring the session it followed: 1 or 130,
+    // nothing to render (`session::exit_code`, the mapping its tests pin).
+    // The command's own failures are ordinary errors, below.
     if let Some(code) = commands::session::exit_code(e) {
-        if let Some(err) = e
-            .downcast_ref::<commands::session::SessionExit>()
-            .and_then(|exit| exit.error.as_ref())
-        {
-            report(err, session);
-        }
         return code;
     }
     // `heph log` found no log: its status line already said so.

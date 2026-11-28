@@ -11,17 +11,16 @@ mod common;
 use common::session::{Bg, SHORT, id_in, last_end, list_entry, lock_free, sessions_dir};
 use common::{Dist, Workspace, describe, signal, wait_until};
 
-/// `exit3` is an entrypoint, so heph exits with its tool's code — 3, which no
-/// failure of heph's own produces; `exit125` exits with the code heph's own
-/// failures use, which `attach` must say is the session's. `long` is killed or interrupted before it
-/// ends; `held` is built by two
+/// `exit3` is an entrypoint whose tool exits 3; heph exits 1 for it (U15).
+/// `slowok` and `slowfail` last long enough to attach to. `long` is killed
+/// or interrupted before it ends; `held` is built by two
 /// runs at once, the second waiting on the first's result lock, which it
 /// announces only past the engine's 5s notice.
 const BUILD: &str = r#"
 target(name = "ok", driver = "bash", run = "true", cache = False)
 target(name = "fail", driver = "bash", run = "exit 1", cache = False)
 target(name = "exit3", driver = "bash", entrypoint = True, run = "sleep 2; exit 3")
-target(name = "exit125", driver = "bash", entrypoint = True, run = "sleep 2; exit 125")
+target(name = "slowok", driver = "bash", run = "sleep 2", cache = False)
 target(name = "slowfail", driver = "bash", run = "sleep 4; exit 1", cache = False)
 target(name = "long", driver = "bash", run = "sleep 60", cache = False)
 target(name = "held", driver = "bash", run = "sleep 12")
@@ -129,44 +128,72 @@ fn lock_wait_names_the_holding_session() {
     assert!(waiter.wait().success(), "{}", waiter.stderr());
 }
 
-/// `attach` without a terminal follows in line form and exits as the session
-/// did; an unknown id and a lost session are its own errors, 125.
+/// `attach` of a session that succeeded exits 0.
 #[test]
-fn attach_exit_codes() {
+fn session_attach_mirrors_0() {
     let dist = Dist::locate();
     let ws = workspace();
-
-    let mut run = Bg::spawn(&ws, &dist, &["run", "//pkg:exit3"]);
+    let mut run = Bg::spawn(&ws, &dist, &["run", "//pkg:slowok"]);
     let out = ws
         .run(&dist, &["session", "attach", &run.id])
         .expect("attach");
-    assert_eq!(out.status.code(), Some(3), "{}", describe(&out));
-    assert_eq!(run.wait().code(), Some(3), "{}", run.stderr());
+    assert_eq!(out.status.code(), Some(0), "{}", describe(&out));
+    assert_eq!(run.wait().code(), Some(0), "{}", run.stderr());
+}
 
-    // A mirrored 125 reads like attach's own failure, so attach says whose it
-    // is — on stderr, leaving stdout clean.
-    let mut run = Bg::spawn(&ws, &dist, &["run", "//pkg:exit125"]);
+/// `attach` without a terminal follows in line form and exits as the session
+/// did: a failed run, 1. An entrypoint whose tool exited 3 exits 1 as well
+/// (U15), so attach mirrors 1 with nothing more to say.
+#[test]
+fn session_attach_mirrors_1() {
+    let dist = Dist::locate();
+    let ws = workspace();
+    for addr in ["//pkg:slowfail", "//pkg:exit3"] {
+        let mut run = Bg::spawn(&ws, &dist, &["run", addr]);
+        let out = ws
+            .run(&dist, &["session", "attach", &run.id])
+            .expect("attach");
+        assert_eq!(out.status.code(), Some(1), "{addr}: {}", describe(&out));
+        assert_eq!(run.wait().code(), Some(1), "{addr}: {}", run.stderr());
+        assert!(
+            !String::from_utf8_lossy(&out.stderr).contains("exiting 1"),
+            "a 1 mirrors as itself, no note\n{}",
+            describe(&out)
+        );
+        assert!(
+            out.stdout.is_empty(),
+            "stdout not clean\n{}",
+            describe(&out)
+        );
+    }
+}
+
+/// `attach` of a session the user cancelled exits 130, as the run did.
+#[test]
+fn session_attach_mirrors_130() {
+    let dist = Dist::locate();
+    let ws = workspace();
+    let mut run = Bg::spawn(&ws, &dist, &["run", "//pkg:long"]);
+    run.wait_executing("//pkg:long");
+    signal(run.pid(), libc::SIGINT);
+    assert_eq!(run.wait().code(), Some(130), "{}", run.stderr());
     let out = ws
         .run(&dist, &["session", "attach", &run.id])
         .expect("attach");
-    assert_eq!(out.status.code(), Some(125), "{}", describe(&out));
-    assert_eq!(run.wait().code(), Some(125), "{}", run.stderr());
-    let note = format!("heph: session {} exited 125\n", run.id);
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains(&note),
-        "no {note:?} on stderr\n{}",
-        describe(&out)
-    );
-    assert!(
-        out.stdout.is_empty(),
-        "stdout not clean\n{}",
-        describe(&out)
-    );
+    assert_eq!(out.status.code(), Some(130), "{}", describe(&out));
+}
+
+/// `heph session`'s own errors exit 1 (U15): an unknown id, a lost session
+/// on `attach`, an `inflight` of an ended session (in `inflight_round_trip`).
+#[test]
+fn session_error_exits_1() {
+    let dist = Dist::locate();
+    let ws = workspace();
 
     let out = ws
         .run(&dist, &["session", "attach", "zzzzzzzzzz"])
         .expect("attach");
-    assert_eq!(out.status.code(), Some(125), "{}", describe(&out));
+    assert_eq!(out.status.code(), Some(1), "{}", describe(&out));
 
     let mut run = Bg::spawn(&ws, &dist, &["run", "//pkg:long"]);
     run.wait_executing("//pkg:long");
@@ -175,12 +202,17 @@ fn attach_exit_codes() {
     let out = ws
         .run(&dist, &["session", "attach", &run.id])
         .expect("attach");
-    assert_eq!(out.status.code(), Some(125), "{}", describe(&out));
+    assert_eq!(out.status.code(), Some(1), "{}", describe(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("was lost"),
+        "{}",
+        describe(&out)
+    );
 }
 
 /// `inflight` gets the live run's in-flight report through the session
 /// directory — no signal — and the run goes on to exit with its own code; an
-/// ended session cannot answer, 125.
+/// ended session cannot answer, exit 1.
 #[test]
 fn inflight_round_trip() {
     let dist = Dist::locate();
@@ -207,7 +239,7 @@ fn inflight_round_trip() {
     let out = ws
         .run(&dist, &["session", "inflight", &run.id])
         .expect("inflight");
-    assert_eq!(out.status.code(), Some(125), "{}", describe(&out));
+    assert_eq!(out.status.code(), Some(1), "{}", describe(&out));
 }
 
 /// `HEPH_NO_SESSION=1`: no directory, no start line.

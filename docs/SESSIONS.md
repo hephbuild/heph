@@ -32,21 +32,24 @@ prefix.
 | --- | --- | --- |
 | `list` | One row per session of this workspace (`--all`: every workspace; outside a workspace, every one, with a note on stderr), live first: ID, WORKTREE, COMMAND, STATE, EXIT, PROGRESS, NOW. Reads `meta.json` and `status.json` only. | 0 |
 | `show <id>` | The TUI's frame printed once as text, then a "Stuck on" block: lock waits naming the session that holds the lock (followed to the root of the chain, falling back to the pid), admission waits, targets running over 30s, and one `Next:` line. | 0 |
-| `attach <id>` | The interactive TUI on the session, following it until it ends; `q` or Ctrl-C detaches and never cancels it. Without a terminal it follows in line form. | the session's exit code; 0 on detach |
+| `attach <id>` | The interactive TUI on the session, following it until it ends; `q` or Ctrl-C detaches and never cancels it. Without a terminal it follows in line form. | the session's end: 0, 1 or 130; 0 on detach |
 | `inflight <id>` | The session's in-flight report (what the `SIGQUIT` dump carries), asked for through the session directory; waits 5s. | 0 |
 
-Every error of `heph session` itself exits **125**: no such session, an
-ambiguous id, a directory format newer than this heph, a lost session for
-`attach`, a session whose `End` carries no exit code, an `inflight` that is
-not answered or is asked of an ended session. By code alone 125 is ambiguous:
-a session can exit 125 itself (an entrypoint whose heph-side setup failed, or
-a tool that exits 125), and `attach` mirrors it. So whenever `attach` exits
-125 for a reason other than its own error, it says so on stderr: `heph:
-session <id> exited 125` for a mirrored 125, `heph: session <id> exited N, not
-an exit status (0-255); exiting 125` for a recorded code outside 0-255. A
-session whose `End` carries no code (killed by a signal, or it panicked) is
-reported as an error with that reason. An agent tells "the run failed" from
-"the wait failed" by that line, or by `heph session show <id> --json`.
+Every error of `heph session` itself exits **1**, as every heph command's
+does (130 for a cancel): no such session, an ambiguous id, a directory format
+newer than this heph, a lost session for `attach`, a session whose `End`
+carries no exit code, an `inflight` that is not answered or is asked of an
+ended session. Each prints its reason on stderr.
+
+`attach` mirrors how the session ended as heph's own codes: **0**, **1** for
+a failure, **130** for a cancel. A session that recorded any other code (one
+recorded by an older heph, which used 125 and passed an entrypoint's code
+through, or a value that is not an exit status) mirrors as 1, and `attach`
+names the recorded code on stderr: `heph: session <id> exited N; exiting 1`.
+A session whose `End` carries no code (killed by a signal, or it panicked)
+is reported as an error with that reason. An agent tells "the run failed"
+from "the wait failed" by stderr (an error message, or nothing for a mirrored
+code), or by `heph session show <id> --json`.
 
 STATE is computed by the viewer, never stored: `running`; `waiting` (every
 open target is in a lock or admission wait); `quiet` (no event for longer

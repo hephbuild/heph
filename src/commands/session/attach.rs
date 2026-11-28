@@ -113,19 +113,17 @@ pub(crate) fn trigger_on(
 }
 
 /// The stderr line saying why `attach` exits as it does, when the code alone
-/// would mislead (U1): a mirrored 125 reads like this command's own failure,
-/// and a code outside 0–255 is not an exit status, so 125 stands in for it.
-/// An `End` with no code is an error of its own, rendered with its reason.
+/// would mislead (U1): a session that recorded a code other than 0, 1 or 130
+/// (an older heph's, or not an exit status at all) mirrors as 1, and this
+/// names the code it recorded. An `End` with no code is an error of its own,
+/// rendered with its reason.
 pub(crate) fn exit_note(id: SessionId, outcome: Outcome) -> Option<String> {
     let Outcome::Ended(Some(code)) = outcome else {
         return None;
     };
-    match u8::try_from(code) {
-        Ok(SessionExit::OWN_FAILURE) => Some(format!("heph: session {id} exited 125\n")),
-        Ok(_) => None,
-        Err(_) => Some(format!(
-            "heph: session {id} exited {code}, not an exit status (0-255); exiting 125\n"
-        )),
+    match code {
+        0 | 1 | 130 => None,
+        _ => Some(format!("heph: session {id} exited {code}; exiting 1\n")),
     }
 }
 
@@ -134,14 +132,12 @@ pub(crate) fn outcome_result(id: SessionId, outcome: Outcome) -> anyhow::Result<
     match outcome {
         Outcome::Detached | Outcome::Ended(Some(0)) => Ok(()),
         Outcome::Ended(Some(code)) => Err(SessionExit::mirrored(code).into()),
-        Outcome::Ended(None) => Err(SessionExit::own(anyhow::anyhow!(
+        Outcome::Ended(None) => Err(anyhow::anyhow!(
             "session {id} ended without an exit code (killed by a signal, or it panicked)"
-        ))
-        .into()),
-        Outcome::Lost => Err(SessionExit::own(anyhow::anyhow!(
+        )),
+        Outcome::Lost => Err(anyhow::anyhow!(
             "session {id} was lost: its process went away without recording its end"
-        ))
-        .into()),
+        )),
     }
 }
 
