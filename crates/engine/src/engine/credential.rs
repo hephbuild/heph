@@ -2030,8 +2030,8 @@ fn render(
             ctx.deferred.get(&want.format()).cloned().ok_or_else(|| {
                 anyhow::anyhow!(
                     "the host did not resolve `{}` — a deferred value is read before the \
-                     presentation is rendered, so this is a bug in heph rather than in the BUILD \
-                     file",
+                     presentation is rendered, so this is a bug in heph rather than in the \
+                     target's definition",
                     r.raw
                 )
             })
