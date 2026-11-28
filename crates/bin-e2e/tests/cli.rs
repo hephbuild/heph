@@ -261,17 +261,26 @@ fn fail_fast_after_failure_exits_1() {
 
 /// U6 non-TUI: with no terminal, a failure's box is printed as it happens,
 /// while a sibling is still running, and the end of the run does not print
-/// it again: one header, then only the totals.
+/// it again: one header, then only the totals. The sibling runs until the
+/// test opens its gate, after the box is seen.
 #[test]
 fn non_tui_box_before_slow_sibling_not_repeated() {
     let dist = Dist::locate();
     let ws = Workspace::new().expect("workspace");
+    let gate = ws.root().join("gate-open");
     ws.write(
         "pkg/BUILD",
-        concat!(
-            "target(name = \"slow\", driver = \"bash\", run = \"sleep 10\", cache = False)\n",
-            "target(name = \"bad\", driver = \"bash\", run = [\"echo bad-line\", \"exit 1\"],",
-            " cache = False)\n",
+        &format!(
+            concat!(
+                "target(name = \"slow\", driver = \"bash\", cache = False,",
+                // Bounded, so a test that fails before opening the gate
+                // leaves no loop behind its killed heph.
+                " run = \"i=0; while [ ! -e {gate} ] && [ $i -lt 1200 ]; do sleep 0.05;",
+                " i=$((i+1)); done\")\n",
+                "target(name = \"bad\", driver = \"bash\", run = [\"echo bad-line\", \"exit 1\"],",
+                " cache = False)\n",
+            ),
+            gate = gate.display(),
         ),
     )
     .expect("write BUILD");
@@ -288,6 +297,7 @@ fn non_tui_box_before_slow_sibling_not_repeated() {
         "the box carries the tail\n{}",
         run.stderr()
     );
+    std::fs::write(&gate, b"").expect("open the gate");
     let status = run.wait();
     let stderr = run.stderr();
     assert_eq!(status.code(), Some(1), "{stderr}");
