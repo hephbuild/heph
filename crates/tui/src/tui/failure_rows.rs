@@ -25,18 +25,41 @@ pub fn shell_quote(s: &str) -> std::borrow::Cow<'_, str> {
 /// can open one; "none kept" when it cannot. A failure nobody asked the
 /// engine about points at `heph log` only beside `full log:`.
 pub fn left_behind_rows(addr: &str, left: &LeftBehindData) -> String {
+    left_behind_rows_in(addr, left, true, true)
+}
+
+/// [`left_behind_rows`], for a screen that may not show the paths into
+/// heph's home (the report after the TUI, I9) when `paths` is false: no
+/// `full log:` row (the `log:` row names the command), and `outputs:` points
+/// at `heph inspect failure` instead of the slot's `out/`. A kept sandbox is
+/// named in both: the user asked for it. Without `log_row`, no `log:` row at
+/// all: a failure before the run has no log to name, or to say none of.
+pub fn left_behind_rows_in(
+    addr: &str,
+    left: &LeftBehindData,
+    paths: bool,
+    log_row: bool,
+) -> String {
     let mut out = String::new();
-    if let Some(path) = &left.log_path {
+    if paths && let Some(path) = &left.log_path {
         out.push_str(&format!("  full log: {path}\n"));
     }
     if let Some(sandbox) = &left.sandbox {
         out.push_str(&format!("  sandbox: {sandbox}\n"));
     }
-    if let Some(outputs) = &left.outputs {
-        out.push_str(&format!("  outputs: {outputs}\n"));
+    match &left.outputs {
+        Some(outputs) if paths => out.push_str(&format!("  outputs: {outputs}\n")),
+        Some(_) => out.push_str(&format!(
+            "  outputs: kept · heph inspect failure {}\n",
+            shell_quote(addr)
+        )),
+        None => {}
     }
     if let Some(fixes) = &left.fixes {
         fixes_rows(&mut out, fixes);
+    }
+    if !log_row {
+        return out;
     }
     if log_readable(left) {
         out.push_str(&format!("  log: heph log {}\n", shell_quote(addr)));

@@ -24,6 +24,11 @@ use std::borrow::Cow;
 
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+/// heph's own text with every control but newline and tab escaped
+/// (`\x1b`): what [`message`] ends with, for text that has no paths to
+/// rewrite (a source line, a diff).
+pub use hcore::diagnostic::escape_control;
+
 /// Columns between tab stops when [`expand_tabs`] lays a line out.
 pub const TAB_STOP: usize = 8;
 
@@ -113,7 +118,7 @@ fn strip_controls(s: &str, out: &mut String) {
 /// params digits and `;` only, at most [`SGR_PARAMS_MAX`] of them; `None`
 /// when `s` does not start with one. An SGR is ASCII, so its length in bytes
 /// is its length in chars.
-fn sgr_len(s: &str) -> Option<usize> {
+pub(crate) fn sgr_len(s: &str) -> Option<usize> {
     let rest = s.strip_prefix("\x1b[")?;
     let params = rest
         .bytes()
