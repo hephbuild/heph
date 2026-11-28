@@ -12,6 +12,7 @@ use async_recursion::async_recursion;
 use enclose::enclose;
 use hcore::hartifactcontent::PathFilter;
 use hmodel::htaddr::Addr;
+use hplugin::diagnostic::{Boundary, StageContext, with_stage};
 use std::sync::Arc;
 
 /// How [`Engine::execute`] runs a target, beyond the target itself.
@@ -97,11 +98,11 @@ impl Engine {
         let resolved_scratch = self
             .resolve_scratch(&rs, addr, &def.target.inputs)
             .await
-            .with_context(|| format!("resolve scratch for {addr}"))?;
+            .stage(Boundary::ResolveScratch, addr)?;
         let (scratch_mounts, _scratch_guards) = self
             .acquire_scratch(&rs, addr, &resolved_scratch, no_scratch)
             .await
-            .with_context(|| format!("acquire scratch for {addr}"))?;
+            .stage(Boundary::AcquireScratch, addr)?;
 
         // Deferred option values. The producers are already built — they are
         // `hashed` inputs, so `hashin` waited on them — and what is left here is
@@ -113,7 +114,7 @@ impl Engine {
         let deferred_reads = self
             .read_deferred(&rs, &def.target, &deferred_refs)
             .await
-            .with_context(|| format!("resolve deferred values for {addr}"))?;
+            .stage(Boundary::ResolveDeferred, addr)?;
 
         // Resolution (which declaration does each reference name, and is the
         // set coherent?) already happened at `get_def`; this repeats it on the
@@ -121,7 +122,7 @@ impl Engine {
         let resolved_credentials = self
             .resolve_credentials(&rs, addr, &def.target.inputs)
             .await
-            .with_context(|| format!("resolve credentials for {addr}"))?;
+            .stage(Boundary::ResolveCredentials, addr)?;
 
         let Admitted {
             credentials,
@@ -147,7 +148,7 @@ impl Engine {
             &deferred_reads,
             Some(&allotment),
         )
-        .with_context(|| format!("resolve deferred values for {addr}"))?;
+        .stage(Boundary::ResolveDeferred, addr)?;
 
         let addr_str = addr.format();
         // Telemetry: per-target execute wall time. This path runs only on a real
@@ -290,7 +291,7 @@ impl Engine {
                 // Past it the driver was called, and a managed one has made
                 // its tree.
                 let had_sandbox = managed && ran.is_ok();
-                let run = ran.and_then(|ran| ran.context("run"));
+                let run = ran.and_then(|ran| ran.stage(Boundary::Run, addr));
                 // End the live log while the sandbox still exists: a log the
                 // driver returned as an artifact is read from it.
                 let (run, live) = match live {
@@ -430,7 +431,9 @@ impl Engine {
                         };
                         // Past the reclaim: it reads no sandbox, and a lookup
                         // of the generator must not hold the `sandbox` slot.
-                        let err = Arc::clone(&self).reword_removed_generator(&rs, err).await;
+                        let err = Arc::clone(&self)
+                            .reword_removed_generator(&rs, addr, err)
+                            .await;
                         let out_error = slot.out_error.clone();
                         let err = err.context(slot);
                         // I7: the keep failed, the failure did not.
@@ -617,6 +620,7 @@ impl Engine {
     async fn reword_removed_generator(
         self: Arc<Self>,
         rs: &Arc<RequestState>,
+        addr: &Addr,
         err: anyhow::Error,
     ) -> anyhow::Error {
         use hbuiltins::pluginfs::{CodegenFileError, CodegenFileErrorKind};
@@ -636,11 +640,11 @@ impl Engine {
                 >(&e)
                 .is_some() =>
             {
-                anyhow::Error::new(CodegenFileError {
+                let removed = anyhow::Error::new(CodegenFileError {
                     kind: CodegenFileErrorKind::TargetRemoved,
                     ..cg.clone()
-                })
-                .context("run")
+                });
+                with_stage(removed, Boundary::Run, addr)
             }
             Ok(_) | Err(_) => err,
         }
@@ -742,7 +746,7 @@ impl Engine {
         let (credential_mounts, _credential_teardown) = self
             .present_credentials(rs, addr, &sandbox_dir, &credentials)
             .await
-            .with_context(|| format!("credentials for {addr}"))?;
+            .stage(Boundary::Credentials, addr)?;
         // The secrets the log is scrubbed of are known only once presented.
         // Set before the run, so its first byte is scrubbed.
         if let Some(log) = &log {
@@ -865,7 +869,7 @@ impl Engine {
         ));
 
         hcore::hmemoizer::set_phase("execute:driver_run");
-        exec_wrapper(inner).await.with_context(|| "run")?;
+        exec_wrapper(inner).await.stage(Boundary::Run, addr)?;
 
         hcore::hmemoizer::set_phase("execute:oneshot_rx");
         rx.await
@@ -986,7 +990,7 @@ impl Engine {
             let credentials = self
                 .acquire_credentials(rs, addr, resolved)
                 .await
-                .with_context(|| format!("credentials for {addr}"))?;
+                .stage(Boundary::Credentials, addr)?;
 
             // One run of this target at a time, in any process: its sandbox
             // is per addr. After deps and credentials (holding it across a
@@ -1150,7 +1154,7 @@ impl Engine {
                 granted = wait => granted,
             }
         };
-        let reservation = granted.with_context(|| format!("admitting {addr}"))?;
+        let reservation = granted.stage(Boundary::Admit, addr)?;
         // What the run is allotted: the `sandbox` slot the caller splits off
         // is the engine's, never part of it, so the logs leave it out.
         let allotment = || {

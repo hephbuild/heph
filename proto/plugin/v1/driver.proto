@@ -368,6 +368,8 @@ message RunFailure {
   // diagnostics in `artifacts`, and never cached. Decoded leniently like
   // `artifacts`.
   repeated OutputArtifactRef write_back = 5;
+  // As Error.diagnostic (since 0.21.4).
+  Diagnostic diagnostic = 6;
 }
 
 message RunOutFrame {

@@ -30,7 +30,8 @@ use crate::engine::request_state::TookDown;
 use crate::hmemoizer::downcast_chain_ref;
 use crate::tui::failure_rows::{FIXES_SHOWN, shell_quote};
 use crate::tui::text::{
-    Redact, clean_inline, cut_right, expand_tabs, fit_styled, sanitize_log, sanitize_log_keep_sgr,
+    Redact, WorkspaceRel, clean_inline, cut_right, expand_tabs, fit_styled, message, sanitize_log,
+    sanitize_log_keep_sgr,
 };
 
 /// How many kept `failure_out` groups a block names before `+N more`.
@@ -46,6 +47,9 @@ pub struct ReportContext {
     blocks: Vec<Block>,
     /// heph's home, redacted from every error text and log line.
     redact: Redact,
+    /// The workspace, which error text names paths relative to; a log line
+    /// keeps the tool's own paths.
+    rel: WorkspaceRel,
     /// The terminal's width: a tail line is cut to it.
     width: usize,
 }
@@ -98,8 +102,16 @@ impl ReportContext {
         Self {
             blocks,
             redact: home.map(Redact::heph_home).unwrap_or_default(),
+            rel: WorkspaceRel::default(),
             width,
         }
+    }
+
+    /// Name paths under `root` relative to it in error text (D2). Reads the
+    /// filesystem once, as [`gather`](Self::gather) does: call it there.
+    pub fn with_workspace(mut self, root: Option<&Path>) -> Self {
+        self.rel = root.map(WorkspaceRel::workspace).unwrap_or_default();
+        self
     }
 
     /// Cut tail lines to `width` columns instead of the terminal's.
@@ -163,9 +175,11 @@ impl ReportContext {
         };
         if status.is_none() {
             // No status to name it: the error says what went wrong.
-            let cause = cause_chain(&f.source, &addr);
+            // heph's message, not the tool's output: controls escaped, not
+            // removed, and workspace paths relative (D2).
+            let cause = cause_chain(&f.source);
             body.extend(
-                sanitize_log(self.redact.apply(&cause).as_bytes())
+                message(&cause, &self.redact, &self.rel)
                     .lines()
                     .map(|l| self.cut_row(l)),
             );
@@ -672,11 +686,15 @@ mod tests {
             ],
             3,
         );
+        let web_gen = parse_addr("//web:gen").expect("addr");
         let second = TargetFailure::new(
-            parse_addr("//web:gen").expect("addr"),
+            web_gen.clone(),
             None,
-            anyhow::anyhow!("staging {HOME}/sandbox/ab/in: permission denied")
-                .context("execute //web:gen"),
+            hplugin::diagnostic::with_stage(
+                anyhow::anyhow!("staging {HOME}/sandbox/ab/in: permission denied"),
+                hplugin::diagnostic::Boundary::Execute,
+                &web_gen,
+            ),
         );
         let out = report(
             vec![first, second],
@@ -812,6 +830,58 @@ mod tests {
             "{out}"
         );
         assert_eq!(out.matches(HOME).count(), 1, "{out}");
+    }
+
+    /// D2 in the interactive report: the cause names workspace paths relative
+    /// and escapes control bytes, through a symlinked root too; the log tail
+    /// keeps its paths. Without a workspace, nothing is rewritten.
+    #[test]
+    fn report_cause_names_workspace_paths_relative() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(real.join("a")).expect("mkdir");
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        let real = std::fs::canonicalize(&real).expect("canonical");
+        let file = real.join("a/BUILD");
+        let failure = || {
+            TargetFailure::new(
+                parse_addr("//p:t").expect("addr"),
+                Some(LogTail {
+                    text: format!("{}:1: tool said so\n", file.display()),
+                    start_line: 1,
+                }),
+                anyhow::anyhow!("reading {}: denied\x1b[2J", file.display()),
+            )
+        };
+        let render = |root: Option<&Path>| {
+            ReportContext::gather(
+                &[Arc::new(failure())],
+                |_| TookDown::default(),
+                |_| false,
+                None,
+            )
+            .with_width(400)
+            .with_workspace(root)
+            .render(false)
+        };
+        for root in [real.as_path(), link.as_path()] {
+            let out = render(Some(root));
+            assert!(
+                out.contains("reading a/BUILD: denied\\x1b[2J"),
+                "{root:?}: {out}"
+            );
+            assert!(
+                out.contains(&format!("{}:1: tool said so", file.display())),
+                "the log keeps its path: {out}"
+            );
+            assert!(!out.contains('\x1b'), "{out:?}");
+        }
+        let out = render(None);
+        assert!(
+            out.contains(&format!("reading {}: denied", file.display())),
+            "{out}"
+        );
     }
 
     /// A timeout names its limit instead of an exit status; an abandoned one

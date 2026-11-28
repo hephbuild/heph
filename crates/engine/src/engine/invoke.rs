@@ -33,6 +33,7 @@ use crate::engine::result::{OutputMatcher, ResultOptions};
 use anyhow::Context;
 use hcore::process::Exit;
 use hmodel::htaddr::Addr;
+use hplugin::diagnostic::{Boundary, StageContext};
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -443,19 +444,19 @@ impl Engine {
         let deferred = self
             .resolve_deferred(rs, &target, &deferred_refs, Some(&allotment))
             .await
-            .with_context(|| format!("resolve deferred values for {addr}"))?;
+            .stage(Boundary::ResolveDeferred, addr)?;
         let resolved_scratch = self
             .resolve_scratch(rs, addr, &target.inputs)
             .await
-            .with_context(|| format!("resolve scratch for {addr}"))?;
+            .stage(Boundary::ResolveScratch, addr)?;
         let (scratch, _scratch_guards) = self
             .acquire_scratch(rs, addr, &resolved_scratch, false)
             .await
-            .with_context(|| format!("acquire scratch for {addr}"))?;
+            .stage(Boundary::AcquireScratch, addr)?;
         let credentials = self
             .resolve_credentials(rs, addr, &target.inputs)
             .await
-            .with_context(|| format!("resolve credentials for {addr}"))?;
+            .stage(Boundary::ResolveCredentials, addr)?;
         // Acquired before the sandbox exists, as a build's are; presented
         // inside it by `run_in_sandbox`. An invocation takes no admission (no
         // cpu, no `sandbox` slot), so there is no queue for the material to
@@ -463,7 +464,7 @@ impl Engine {
         let credentials = self
             .acquire_credentials(rs, addr, credentials)
             .await
-            .with_context(|| format!("credentials for {addr}"))?;
+            .stage(Boundary::Credentials, addr)?;
 
         // The invocation's own sandbox, created exclusively; then any sibling a
         // crashed heph left, swept off the request's path.

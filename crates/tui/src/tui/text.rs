@@ -27,15 +27,10 @@ pub const TAB_STOP: usize = 8;
 /// The ellipsis a cut puts where text was removed.
 pub const ELLIPSIS: &str = "…";
 
-/// Whether `c` is a control character a terminal could act on: C0 (but tab
-/// and newline), DEL, or C1; or a bidi embedding, override or isolate,
-/// which would make the terminal draw the text after it reordered (U+202E
-/// shows `exe.txt` for `txt.exe`).
+/// Whether `c` is a control or format character a terminal could act on:
+/// [`hcore::diagnostic::is_terminal_control`], the one set every escaper uses.
 fn is_control(c: char) -> bool {
-    matches!(
-        c,
-        '\0'..='\x08' | '\x0b'..='\x1f' | '\x7f'..='\u{9f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
-    )
+    hcore::diagnostic::is_terminal_control(c)
 }
 
 /// Whether a C1 character opens a string (DCS, SOS, OSC, PM, APC) that runs
@@ -433,6 +428,105 @@ impl Redact {
     }
 }
 
+/// The workspace root, as heph's own messages name paths under it: relative
+/// to it (`/ws/a/BUILD` reads `a/BUILD`, `/ws` reads `.`). Messages only —
+/// never a log tail or a target's output, which say what the tool printed
+/// (D2).
+#[derive(Debug, Clone, Default)]
+pub struct WorkspaceRel {
+    /// Longest first, so a root that extends another is matched whole.
+    roots: Vec<String>,
+}
+
+impl WorkspaceRel {
+    /// The root as given and as the filesystem resolves it (`/var` and
+    /// `/private/var` on macOS): an error can name either. Reads the
+    /// filesystem once, so it is built before the render, never in one.
+    pub fn workspace(root: &std::path::Path) -> Self {
+        let mut roots = vec![root.to_path_buf()];
+        if let Ok(canonical) = std::fs::canonicalize(root)
+            && canonical != root
+        {
+            roots.push(canonical);
+        }
+        Self::of(roots)
+    }
+
+    /// Rewrite paths under each of `roots`. `/` and empty roots are dropped:
+    /// every absolute path would become relative to them.
+    pub fn of(roots: impl IntoIterator<Item = std::path::PathBuf>) -> Self {
+        let Redact { roots } = Redact::of(roots);
+        Self { roots }
+    }
+
+    /// `s` with each path at or under a root, matched at a component
+    /// boundary, made relative to it: `/ws/a/` reads `a/` (a trailing slash
+    /// is kept as written), `/ws` reads `.`, and `/ws-other/a` or `/x/ws/a`
+    /// name other directories and are kept. Borrows when nothing matches.
+    pub fn apply<'a>(&self, s: &'a str) -> Cow<'a, str> {
+        let mut out = Cow::Borrowed(s);
+        for root in &self.roots {
+            if out.contains(root.as_str()) {
+                out = Cow::Owned(relativize(&out, root));
+            }
+        }
+        out
+    }
+}
+
+fn relativize(s: &str, root: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find(root) {
+        let (before, from) = rest.split_at(i);
+        let after = from.get(root.len()..).unwrap_or("");
+        out.push_str(before);
+        let starts = out.chars().next_back().is_none_or(|c| !is_path_char(c));
+        let mut tail = after.chars();
+        match tail.next() {
+            // `/ws/a`: the path below the root, without its leading `/`;
+            // `/ws/` alone is the root's own directory, `./`.
+            Some('/') if starts => {
+                let below = tail.as_str();
+                if below.chars().next().is_none_or(|c| !is_path_char(c)) {
+                    out.push_str("./");
+                }
+                rest = below;
+            }
+            // `/ws` itself, at the end or before a `:` or a space.
+            next if starts && next.is_none_or(|c| !is_path_char(c)) => {
+                out.push('.');
+                rest = after;
+            }
+            // `/ws-other`, `/x/ws`: another directory.
+            _ => {
+                out.push_str(root);
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// heph's own message — an error's text, a hint, a value — as a screen draws
+/// it: heph's home redacted (I9), paths under the workspace made relative
+/// ([`WorkspaceRel`]), and every control byte but newline and tab shown
+/// escaped (`\x1b`), so a message never moves the cursor (D2). Never for a
+/// log tail, which keeps its paths and has its controls removed
+/// ([`sanitize_log`]). Borrows when there is nothing to change.
+pub fn message<'a>(s: &'a str, redact: &Redact, rel: &WorkspaceRel) -> Cow<'a, str> {
+    let s = redact.apply(s);
+    let s = match rel.apply(&s) {
+        Cow::Borrowed(_) => s,
+        Cow::Owned(o) => Cow::Owned(o),
+    };
+    match hcore::diagnostic::escape_control(&s) {
+        Cow::Borrowed(_) => s,
+        Cow::Owned(o) => Cow::Owned(o),
+    }
+}
+
 /// A character that continues a path component: a root followed or
 /// preceded by one is part of a longer name.
 fn is_path_char(c: char) -> bool {
@@ -482,6 +576,113 @@ pub fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The workspace `/ws` of the spec's `relpath_<row>` table.
+    fn ws() -> WorkspaceRel {
+        WorkspaceRel::of(["/ws".into()])
+    }
+
+    fn rel(s: &str) -> String {
+        message(s, &Redact::default(), &ws()).into_owned()
+    }
+
+    #[test]
+    fn relpath_under_root() {
+        assert_eq!(rel("/ws/a/BUILD"), "a/BUILD");
+        assert_eq!(
+            rel("evaluating /ws/a/BUILD:4:5: \"/ws/b\""),
+            "evaluating a/BUILD:4:5: \"b\""
+        );
+    }
+
+    #[test]
+    fn relpath_sibling_prefix_unchanged() {
+        assert_eq!(rel("/ws-other/a/BUILD"), "/ws-other/a/BUILD");
+        assert_eq!(rel("/x/ws/a"), "/x/ws/a");
+        assert_eq!(rel("/wsx"), "/wsx");
+    }
+
+    #[test]
+    fn relpath_root_itself() {
+        assert_eq!(rel("/ws"), ".");
+        assert_eq!(rel("in /ws: denied"), "in .: denied");
+        assert_eq!(rel("/ws/"), "./");
+    }
+
+    #[test]
+    fn relpath_trailing_slash_kept() {
+        assert_eq!(rel("/ws/a/"), "a/");
+    }
+
+    /// macOS: the workspace is given as `/var/w`, the error names the path
+    /// the filesystem resolved, `/private/var/w/a`. [`WorkspaceRel::workspace`]
+    /// holds both; the shorter never matches inside the longer.
+    #[test]
+    fn relpath_canonical_root() {
+        let rel = WorkspaceRel::of(["/var/w".into(), "/private/var/w".into()]);
+        assert_eq!(rel.apply("/private/var/w/a"), "a");
+        assert_eq!(rel.apply("/var/w/a"), "a");
+        assert_eq!(rel.apply("/private/var/wx"), "/private/var/wx");
+    }
+
+    /// And the real thing: a root reached through a symlink is matched by
+    /// both spellings, as `workspace` reads the filesystem for the second.
+    #[test]
+    fn relpath_canonical_root_from_the_filesystem() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).expect("mkdir");
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        let rel = WorkspaceRel::workspace(&link);
+        let canonical = std::fs::canonicalize(&link).expect("canonicalize");
+        let named = format!("{}/a/BUILD", canonical.display());
+        assert_eq!(rel.apply(&named), "a/BUILD");
+        assert_eq!(rel.apply(&format!("{}/a", link.display())), "a");
+    }
+
+    #[test]
+    fn relpath_outside_unchanged() {
+        assert_eq!(rel("/etc/x"), "/etc/x");
+        assert!(matches!(ws().apply("/etc/x"), Cow::Borrowed(_)));
+        // `/` is no workspace: it would make every path relative.
+        assert_eq!(WorkspaceRel::of(["/".into()]).apply("/etc/x"), "/etc/x");
+    }
+
+    /// Messages only: a log tail goes through [`sanitize_log`], which keeps
+    /// the tool's own paths as it printed them.
+    #[test]
+    fn relpath_log_tail_unchanged() {
+        assert_eq!(sanitize_log(b"/ws/a/BUILD\n"), "/ws/a/BUILD\n");
+        assert_eq!(rel("/ws/a/BUILD"), "a/BUILD");
+    }
+
+    /// heph's home is redacted before the workspace is: `/ws/.heph` is the
+    /// home, not `.heph`.
+    #[test]
+    fn message_redacts_home_before_relativizing() {
+        let home = Redact::of(["/ws/.heph".into()]);
+        assert_eq!(
+            message("/ws/.heph/sandbox/x and /ws/a", &home, &ws()),
+            format!("{HOME_TOKEN}/sandbox/x and a")
+        );
+    }
+
+    /// A control byte in a message is shown, not obeyed: a clear-screen or a
+    /// cursor move arrives as text. Newline and tab stay.
+    #[test]
+    fn message_control_bytes_escaped() {
+        let shown = message(
+            "a\x1b[2Jb\rc\u{9b}d\n\te",
+            &Redact::default(),
+            &WorkspaceRel::default(),
+        );
+        assert_eq!(shown, "a\\x1b[2Jb\\x0dc\\u{9b}d\n\te");
+        assert!(matches!(
+            message("plain", &Redact::default(), &WorkspaceRel::default()),
+            Cow::Borrowed(_)
+        ));
+    }
 
     #[test]
     fn contains_folds_ascii_case_only() {

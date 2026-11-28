@@ -516,6 +516,13 @@ pub fn chain_frames(e: &anyhow::Error) -> Vec<String> {
         .map(|c| c.to_string())
         .filter(|s| !s.is_empty())
         .collect();
+    own_parts(frames)
+}
+
+/// Each of `frames` (outermost first) cut back to its own part when it ends
+/// with the next frame's text, and dropped when nothing of its own is left:
+/// [`chain_frames`]' rule, for a caller that picked its frames itself.
+pub fn own_parts(frames: Vec<String>) -> Vec<String> {
     frames
         .iter()
         .enumerate()
@@ -531,7 +538,7 @@ pub fn chain_frames(e: &anyhow::Error) -> Vec<String> {
 
 /// `frame` without a trailing copy of its source's text `next`, and without the
 /// separator before that copy. `frame` itself when it does not end that way.
-fn own_part<'a>(frame: &'a str, next: &str) -> &'a str {
+pub fn own_part<'a>(frame: &'a str, next: &str) -> &'a str {
     let Some(head) = frame.strip_suffix(next) else {
         return frame;
     };
@@ -595,6 +602,154 @@ pub fn downcast_chain_ref<T: std::error::Error + Send + Sync + 'static>(
         }
         cur = &cur.downcast_ref::<SharedAnyhow>()?.0;
     }
+}
+
+// ---- The error walker ----
+//
+// One walk over an error, which every classifier and renderer uses, so none of
+// them sees a memoizer-shared error as one flattened frame: the anyhow chain,
+// then into a `SharedAnyhow`'s inner error (it has no `source()`, see above),
+// then a `MultiError`'s members in input order.
+
+/// Errors from a concurrent fanout, kept apart when `RequestState::fail_fast`
+/// is disabled. Each inner error is rendered with anyhow's alternate `{:#}` so
+/// the full context chain shows up. The walker visits the members, in order.
+#[derive(Debug)]
+pub struct MultiError(pub Vec<anyhow::Error>);
+
+impl fmt::Display for MultiError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "{} errors:", self.0.len())?;
+        for (i, e) in self.0.iter().enumerate() {
+            writeln!(f, "  [{}] {:#}", i, e)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for MultiError {}
+
+/// `e` one level down, behind the same transparent adapter a shared memoizer
+/// error rides. A typed context added over the result is then the only context
+/// of its type on its level, which is what lets [`ErrorFrame::downcast_ref`] tell
+/// two of them apart (anyhow's own downcast finds only the outermost one of a
+/// type on a level). `Display` and `{:#}` read as before; typed lookups go
+/// through [`downcast_chain_ref`] or the walker, which both descend into it.
+pub fn nest(e: anyhow::Error) -> anyhow::Error {
+    anyhow::Error::new(SharedAnyhow(Arc::new(e)))
+}
+
+/// One error the walker visits: a frame of an anyhow chain (a context, the
+/// error it wraps, or one of that error's `source()`s).
+#[derive(Clone, Copy)]
+pub struct ErrorFrame<'a> {
+    /// The anyhow error whose chain holds `item`.
+    level: &'a anyhow::Error,
+    item: &'a (dyn std::error::Error + 'static),
+}
+
+impl<'a> ErrorFrame<'a> {
+    /// The frame as an error: its `Display` is the frame's own text.
+    pub fn error(&self) -> &'a (dyn std::error::Error + 'static) {
+        self.item
+    }
+
+    /// The frame as a `T`, whether `T` is the error itself, one of its
+    /// sources, or a context added with `.context(T)`.
+    ///
+    /// A context frame is a private anyhow type that std's downcast cannot see
+    /// through; anyhow's downcast on the frame's level can, but answers for
+    /// the outermost `T` on the level. So the answer counts only when it lies
+    /// inside this frame's own object, which is where anyhow stores a context.
+    /// A level holds at most one `T` the walker must tell apart when the code
+    /// that adds it goes through [`nest`] first (the engine's stage frames do).
+    pub fn downcast_ref<T: std::error::Error + Send + Sync + 'static>(&self) -> Option<&'a T> {
+        if let Some(t) = self.item.downcast_ref::<T>() {
+            return Some(t);
+        }
+        let t = self.level.downcast_ref::<T>()?;
+        let start = std::ptr::from_ref(self.item).cast::<u8>().addr();
+        let end = start + std::mem::size_of_val(self.item);
+        let at = std::ptr::from_ref(t).addr();
+        (at >= start && at + std::mem::size_of::<T>() <= end).then_some(t)
+    }
+}
+
+impl fmt::Debug for ErrorFrame<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("ErrorFrame")
+            .field(&self.item.to_string())
+            .finish()
+    }
+}
+
+/// `e`'s frames, outermost first, with each shared memoizer error replaced by
+/// its inner error's frames. A [`MultiError`] is one frame here (its members
+/// are not visited): the text a renderer joins.
+pub fn frames(e: &anyhow::Error) -> Vec<ErrorFrame<'_>> {
+    let mut out = Vec::new();
+    push_frames(e, &mut out);
+    out
+}
+
+fn push_frames<'a>(level: &'a anyhow::Error, out: &mut Vec<ErrorFrame<'a>>) {
+    for item in level.chain() {
+        match item.downcast_ref::<SharedAnyhow>() {
+            Some(shared) => push_frames(&shared.0, out),
+            None => out.push(ErrorFrame { level, item }),
+        }
+    }
+}
+
+/// Visit every frame of `e` in walk order: [`frames`]' order, and after a
+/// [`MultiError`] frame, each member's frames in the members' order. Stops at
+/// the first `Break`.
+///
+/// It descends into an anyhow error only where one is held by a
+/// [`SharedAnyhow`] or a [`MultiError`]. An anyhow error that rides as another
+/// error's std `source()` (a `TargetFailure`'s cause, starlark's wrapper) is
+/// walked as plain std frames: its root object is found, but a typed
+/// *context* in it is not. Look in such an error directly (a
+/// `TargetFailure`'s `source`).
+pub fn walk<'a, B>(
+    e: &'a anyhow::Error,
+    visit: &mut dyn FnMut(ErrorFrame<'a>) -> std::ops::ControlFlow<B>,
+) -> std::ops::ControlFlow<B> {
+    for item in e.chain() {
+        if let Some(shared) = item.downcast_ref::<SharedAnyhow>() {
+            walk(&shared.0, visit)?;
+            continue;
+        }
+        visit(ErrorFrame { level: e, item })?;
+        if let Some(multi) = item.downcast_ref::<MultiError>() {
+            for member in &multi.0 {
+                walk(member, visit)?;
+            }
+        }
+    }
+    std::ops::ControlFlow::Continue(())
+}
+
+/// The first `T` in walk order: the outermost one.
+pub fn find<T: std::error::Error + Send + Sync + 'static>(e: &anyhow::Error) -> Option<&T> {
+    walk(e, &mut |f| match f.downcast_ref::<T>() {
+        Some(t) => std::ops::ControlFlow::Break(t),
+        None => std::ops::ControlFlow::Continue(()),
+    })
+    .break_value()
+}
+
+/// The last `T` in walk order: the innermost one (within the last member of a
+/// [`MultiError`] that holds any).
+pub fn innermost<T: std::error::Error + Send + Sync + 'static>(e: &anyhow::Error) -> Option<&T> {
+    let mut found = None;
+    let std::ops::ControlFlow::Continue(()) = walk::<std::convert::Infallible>(e, &mut |f| {
+        if let Some(t) = f.downcast_ref::<T>() {
+            found = Some(t);
+        }
+        std::ops::ControlFlow::Continue(())
+    });
+    found
 }
 
 // ---- Stuck-cell inventory ----
@@ -2589,6 +2744,120 @@ mod tests {
         assert!(err.downcast_ref::<Marker>().is_none());
         assert!(err.downcast_ref::<SharedAnyhow>().is_some());
         assert!(downcast_chain_ref::<Marker>(&err).is_some());
+    }
+
+    /// A context the walker has to find: a `Display` that is not an error.
+    #[derive(Debug)]
+    struct Tag(&'static str);
+
+    impl std::fmt::Display for Tag {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+
+    impl std::error::Error for Tag {}
+
+    /// `e` as a memoizer hands it to a second waiter.
+    fn shared(e: anyhow::Error) -> anyhow::Error {
+        let arc = Arc::new(e);
+        let keep = Arc::clone(&arc);
+        let out = unwrap_arc_err(arc);
+        drop(keep);
+        out
+    }
+
+    #[test]
+    fn walker_visits_multierror_members_in_order() {
+        let multi = anyhow::Error::new(MultiError(vec![
+            anyhow::Error::new(Marker("first")).context(Tag("a")),
+            shared(anyhow::Error::new(Marker("second"))),
+            anyhow::anyhow!("third"),
+        ]))
+        .context("fanout");
+        let mut seen = Vec::new();
+        let std::ops::ControlFlow::Continue(()) =
+            walk::<std::convert::Infallible>(&multi, &mut |f| {
+                if f.downcast_ref::<MultiError>().is_none() {
+                    seen.push(f.error().to_string());
+                }
+                std::ops::ControlFlow::Continue(())
+            });
+        assert_eq!(
+            seen,
+            ["fanout", "a", "marker(first)", "marker(second)", "third"]
+        );
+        assert_eq!(find::<Marker>(&multi).map(|m| m.0), Some("first"));
+        assert_eq!(innermost::<Marker>(&multi).map(|m| m.0), Some("second"));
+        // `frames` keeps the members inside the one `MultiError` frame.
+        assert_eq!(frames(&multi).len(), 2);
+    }
+
+    #[test]
+    fn walker_tells_nested_contexts_of_one_type_apart() {
+        let e = nest(
+            nest(anyhow::Error::new(Marker("root")).context(Tag("inner"))).context(Tag("mid")),
+        )
+        .context(Tag("outer"));
+        let e = shared(e);
+        let tags: Vec<&str> = frames(&e)
+            .iter()
+            .filter_map(|f| f.downcast_ref::<Tag>().map(|t| t.0))
+            .collect();
+        assert_eq!(tags, ["outer", "mid", "inner"]);
+        assert_eq!(innermost::<Tag>(&e).map(|t| t.0), Some("inner"));
+        assert_eq!(find::<Tag>(&e).map(|t| t.0), Some("outer"));
+        // A string context is no `Tag`, though anyhow's downcast on its level
+        // finds the `Tag` under it.
+        let plain = anyhow::Error::new(Marker("r"))
+            .context(Tag("t"))
+            .context("text");
+        let first = frames(&plain).into_iter().next().expect("a frame");
+        assert!(first.downcast_ref::<Tag>().is_none());
+        // `{:#}` reads as it did without the nesting.
+        assert_eq!(format!("{e:#}"), "outer: mid: inner: marker(root)");
+    }
+
+    /// A second typed context, of another type than [`Tag`].
+    #[derive(Debug)]
+    struct Note(&'static str);
+
+    impl std::fmt::Display for Note {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+
+    impl std::error::Error for Note {}
+
+    /// U34: `ErrorFrame::downcast_ref`'s range check. On one anyhow level,
+    /// anyhow's own downcast finds the `.context(T)` from every frame of the
+    /// level; the walker answers only on the context's own frame, never on
+    /// the context above it or on the error it wraps, whether that error sits
+    /// behind its own pointer (an anyhow error) or inline (a std error).
+    #[test]
+    fn walker_finds_a_context_frame_and_not_its_siblings() {
+        let tagged = |e: &anyhow::Error| -> Vec<Option<&'static str>> {
+            frames(e)
+                .iter()
+                .map(|f| f.downcast_ref::<Tag>().map(|t| t.0))
+                .collect()
+        };
+
+        let boxed = anyhow::Error::new(Marker("root"))
+            .context(Tag("ctx"))
+            .context(Note("above"));
+        assert!(boxed.downcast_ref::<Tag>().is_some(), "anyhow sees it");
+        assert_eq!(tagged(&boxed), [None, Some("ctx"), None]);
+
+        use anyhow::Context as _;
+        let inline = Err::<(), _>(Marker("inline"))
+            .context(Tag("ctx"))
+            .expect_err("an error");
+        assert_eq!(tagged(&inline), [Some("ctx"), None]);
+        let below = frames(&inline);
+        assert_eq!(below[1].error().to_string(), "marker(inline)");
+        assert!(below[1].downcast_ref::<Marker>().is_some());
     }
 
     #[test]

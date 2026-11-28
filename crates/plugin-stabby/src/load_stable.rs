@@ -21,6 +21,7 @@ use hdriver_support::driver_managed::{
     ManagedDriver, ManagedRunInput, ManagedRunRequest, ManagedRunResponse,
 };
 use hmodel::htpkg::PkgBuf;
+use hplugin::diagnostic::Stage;
 use hplugin::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest as DriverConfigRequest,
     ConfigResponse as DriverConfigResponse, DriverSchema, ParseRequest, ParseResponse, RunStdio,
@@ -433,12 +434,6 @@ fn decode_unary(bytes: &[u8]) -> anyhow::Result<Body> {
     required(frame.body, "Frame.body")
 }
 
-/// The text of a wire `Error`. A missing message is an error with no text — an
-/// honest default, unlike a missing kind.
-fn error_text(e: pb::Error) -> String {
-    e.message.unwrap_or_default()
-}
-
 /// Host-side lazy adapter over a plugin response stream: each `next` pulls one
 /// frame across the seam (`StableItemStream::next`) and decodes it, so items flow
 /// incrementally and the full set is never buffered. `Send` (the stream handle is
@@ -478,15 +473,17 @@ impl<T, D: FnMut(&[u8]) -> anyhow::Result<T>> Iterator for ItemStreamIter<D> {
                     Some(Err(anyhow::anyhow!("missing field StreamItem.item")))
                 }
             },
+            // Only a provider's listings stream: a diagnostic that names no
+            // stage is a spec's.
             Some(Body::StreamEnd(se)) => {
                 self.done = true;
                 se.error
                     .into_option()
-                    .map(|e| Err(anyhow::anyhow!("{}", error_text(e))))
+                    .map(|e| Err(convert::error_from_pb(e, Stage::Spec)))
             }
             Some(Body::Error(e)) => {
                 self.done = true;
-                Some(Err(anyhow::anyhow!("{}", error_text(*e))))
+                Some(Err(convert::error_from_pb(*e, Stage::Spec)))
             }
             _ => {
                 self.done = true;
@@ -791,9 +788,10 @@ impl Provider for StableRemoteProvider {
                     Ok(pb::get_error::Kind::Cancelled) => Err(GetError::Other(anyhow::Error::new(
                         hplugin::error::CancelledError,
                     ))),
-                    Ok(_) => Err(GetError::Other(anyhow::anyhow!(
-                        "{}",
-                        ge.message.unwrap_or_default()
+                    Ok(_) => Err(GetError::Other(convert::plugin_error(
+                        ge.message.unwrap_or_default(),
+                        ge.diagnostic,
+                        Stage::Spec,
                     ))),
                     Err(kind) => Err(GetError::Other(
                         kind.context(ge.message.unwrap_or_default()),
@@ -827,7 +825,7 @@ impl Provider for StableRemoteProvider {
                 Body::ProbeResp(pr) => Ok(ProbeResponse {
                     states: convert::states_from_pb(pr.states)?,
                 }),
-                Body::Error(e) => anyhow::bail!("{}", error_text(*e)),
+                Body::Error(e) => Err(convert::error_from_pb(*e, Stage::Spec)),
                 other => anyhow::bail!("unexpected probe response: {other:?}"),
             }
         })
@@ -873,7 +871,7 @@ impl PluginFn for StableRemoteFn {
             .await;
         match decode_unary(&bytes)? {
             Body::CallFunctionResp(r) => convert::fn_outcome_from_pb(*r),
-            Body::Error(e) => anyhow::bail!("{}", error_text(*e)),
+            Body::Error(e) => Err(convert::error_from_pb(*e, Stage::Eval)),
             other => anyhow::bail!("unexpected call_function response: {other:?}"),
         }
     }
@@ -1021,7 +1019,7 @@ impl ManagedDriver for StableRemoteManagedDriver {
                     "ParseResponse.target_def",
                 )?)?,
             }),
-            Body::Error(e) => anyhow::bail!("{}", error_text(*e)),
+            Body::Error(e) => Err(convert::error_from_pb(*e, Stage::Parse)),
             other => anyhow::bail!("unexpected parse response: {other:?}"),
         }
     }
@@ -1052,7 +1050,7 @@ impl ManagedDriver for StableRemoteManagedDriver {
                     "ApplyTransitiveResponse.target_def",
                 )?)?,
             }),
-            Body::Error(e) => anyhow::bail!("{}", error_text(*e)),
+            Body::Error(e) => Err(convert::error_from_pb(*e, Stage::Link)),
             other => anyhow::bail!("unexpected apply_transitive response: {other:?}"),
         }
     }

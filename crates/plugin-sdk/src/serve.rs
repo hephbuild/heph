@@ -231,7 +231,7 @@ fn frame_iter<T: 'static>(
             }))),
             Some(Err(e)) => {
                 done = true;
-                Some(frame_bytes(stream_err(err_message(&e))))
+                Some(frame_bytes(stream_err(&e)))
             }
             None => {
                 done = true;
@@ -241,9 +241,18 @@ fn frame_iter<T: 'static>(
     })
 }
 
-/// A response stream that fails immediately with `msg` (one `StreamEnd{error}`).
+/// A response stream that fails immediately with `msg` (one `StreamEnd{error}`):
+/// a panic's text.
 fn error_item_stream(msg: String) -> DynItemStream {
-    item_stream(std::iter::once(frame_bytes(stream_err(msg))))
+    item_stream(std::iter::once(frame_bytes(Body::from(pb::StreamEnd {
+        error: wire_error(pb::error::Kind::Other, msg).into(),
+        ..Default::default()
+    }))))
+}
+
+/// A response stream that fails immediately with `e` (one `StreamEnd{error}`).
+fn err_item_stream(e: &anyhow::Error) -> DynItemStream {
+    item_stream(std::iter::once(frame_bytes(stream_err(e))))
 }
 
 /// A response stream for an unimplemented streaming method — the stream-shaped
@@ -607,7 +616,7 @@ async fn provider_list_stream(
     })();
     let lreq = match lreq {
         Ok(r) => r,
-        Err(e) => return error_item_stream(err_message(&e)),
+        Err(e) => return err_item_stream(&e),
     };
     match provider.list(lreq, &tok).await {
         Ok(iter) => item_stream(frame_iter(iter, |lr| {
@@ -618,7 +627,7 @@ async fn provider_list_stream(
             }
             .encode_to_vec()
         })),
-        Err(e) => error_item_stream(err_message(&e)),
+        Err(e) => err_item_stream(&e),
     }
 }
 
@@ -629,7 +638,7 @@ async fn provider_list_packages_stream(
     let tok = StdCancellationToken::new();
     let prefix = match required(req.prefix, "ListPackagesRequest.prefix") {
         Ok(p) => p,
-        Err(e) => return error_item_stream(err_message(&e)),
+        Err(e) => return err_item_stream(&e),
     };
     let lreq = ListPackagesRequest {
         prefix: PkgBuf::from(prefix),
@@ -642,7 +651,7 @@ async fn provider_list_packages_stream(
             }
             .encode_to_vec()
         })),
-        Err(e) => error_item_stream(err_message(&e)),
+        Err(e) => err_item_stream(&e),
     }
 }
 
@@ -672,17 +681,24 @@ async fn provider_get(
             ..Default::default()
         }),
         Err(GetError::NotFound) => get_err(pb::get_error::Kind::NotFound, String::new()),
-        Err(GetError::Other(e)) => get_err(get_error_kind(&e), err_message(&e)),
+        Err(GetError::Other(e)) => Body::from(pb::GetError {
+            diagnostic: convert::diagnostic_to_pb(&e),
+            ..get_error(get_error_kind(&e), err_message(&e))
+        }),
     };
     frame_bytes(body)
 }
 
-fn get_err(kind: pb::get_error::Kind, message: String) -> Body {
-    Body::from(pb::GetError {
+fn get_error(kind: pb::get_error::Kind, message: String) -> pb::GetError {
+    pb::GetError {
         kind: Some(kind.into()),
         message: Some(message),
         ..Default::default()
-    })
+    }
+}
+
+fn get_err(kind: pb::get_error::Kind, message: String) -> Body {
+    Body::from(get_error(kind, message))
 }
 
 async fn provider_probe(
@@ -698,7 +714,7 @@ async fn provider_probe(
     })();
     let preq = match preq {
         Ok(r) => r,
-        Err(e) => return frame_bytes(error_body(err_message(&e))),
+        Err(e) => return frame_bytes(err_body(&e)),
     };
     let guard = cancels.enter(&preq.request_id);
     let body = match provider.probe(preq, guard.token()).await {
@@ -706,7 +722,7 @@ async fn provider_probe(
             states: pr.states.iter().map(convert::state_to_pb).collect(),
             ..Default::default()
         }),
-        Err(e) => error_body(err_message(&e)),
+        Err(e) => err_body(&e),
     };
     frame_bytes(body)
 }
@@ -721,9 +737,9 @@ async fn plugin_call_function(
     let call = match FunctionCall::from_pb(req) {
         Ok(c) => c,
         Err(e) => {
-            return frame_bytes(error_body(err_message(
+            return frame_bytes(err_body(
                 &e.context(format!("the call of plugin function {name:?}")),
-            )));
+            ));
         }
     };
     let ctx = FnCallContext {
@@ -755,7 +771,7 @@ async fn plugin_call_function(
     };
     let body = match res {
         Ok(resp) => Body::from(resp),
-        Err(e) => error_body(err_message(&e)),
+        Err(e) => err_body(&e),
     };
     frame_bytes(body)
 }
@@ -934,7 +950,7 @@ impl StableProvider for StableProviderImpl {
                 let req = match decode_req::<pb::ProbeRequest>(&req[..], "ProbeRequest") {
                     Ok(r) => r,
                     Err(e) => {
-                        let body = frame_bytes(error_body(err_message(&e)));
+                        let body = frame_bytes(err_body(&e));
                         return ready(body);
                     }
                 };
@@ -964,7 +980,7 @@ impl StableProvider for StableProviderImpl {
                     match decode_req::<pb::ListPackagesRequest>(&req[..], "ListPackagesRequest") {
                         Ok(r) => r,
                         Err(e) => {
-                            let stream = error_item_stream(err_message(&e));
+                            let stream = err_item_stream(&e);
                             return ready(stream);
                         }
                     };
@@ -993,7 +1009,7 @@ impl StableProvider for StableProviderImpl {
                 let req = match decode_req::<pb::ListRequest>(&req[..], "ListRequest") {
                     Ok(r) => r,
                     Err(e) => {
-                        let stream = error_item_stream(err_message(&e));
+                        let stream = err_item_stream(&e);
                         return ready(stream);
                     }
                 };
@@ -1099,11 +1115,17 @@ impl FunctionCaller for GuestFunctions {
     }
 }
 
-fn stream_err(message: String) -> Body {
+fn stream_err(e: &anyhow::Error) -> Body {
     Body::from(pb::StreamEnd {
-        error: wire_error(pb::error::Kind::Other, message).into(),
+        error: convert::error_to_pb(pb::error::Kind::Other, e).into(),
         ..Default::default()
     })
+}
+
+/// The `Error{Other}` reply for `e`: its whole chain, and its
+/// [`Diagnostic`](hplugin::diagnostic::Diagnostic) when it carries one.
+fn err_body(e: &anyhow::Error) -> Body {
+    Body::from(convert::error_to_pb(pb::error::Kind::Other, e))
 }
 
 /// Wraps an author `ManagedDriver` as a [`StableManagedDriver`].
@@ -1156,7 +1178,7 @@ async fn driver_parse(
     })();
     let preq = match preq {
         Ok(r) => r,
-        Err(e) => return frame_bytes(error_body(err_message(&e))),
+        Err(e) => return frame_bytes(err_body(&e)),
     };
     let guard = cancels.enter(&preq.request_id);
     let body = match driver.parse(preq, guard.token()).await {
@@ -1165,9 +1187,9 @@ async fn driver_parse(
                 target_def: td.into(),
                 ..Default::default()
             }),
-            Err(e) => error_body(err_message(&e)),
+            Err(e) => err_body(&e),
         },
-        Err(e) => error_body(err_message(&e)),
+        Err(e) => err_body(&e),
     };
     frame_bytes(body)
 }
@@ -1194,7 +1216,7 @@ async fn driver_apply_transitive(
     })();
     let areq = match areq {
         Ok(r) => r,
-        Err(e) => return frame_bytes(error_body(err_message(&e))),
+        Err(e) => return frame_bytes(err_body(&e)),
     };
     let guard = cancels.enter(&areq.request_id);
     let body = match driver.apply_transitive(areq, guard.token()).await {
@@ -1203,9 +1225,9 @@ async fn driver_apply_transitive(
                 target_def: td.into(),
                 ..Default::default()
             }),
-            Err(e) => error_body(err_message(&e)),
+            Err(e) => err_body(&e),
         },
-        Err(e) => error_body(err_message(&e)),
+        Err(e) => err_body(&e),
     };
     frame_bytes(body)
 }
@@ -1238,7 +1260,7 @@ impl StableManagedDriver for StableManagedDriverImpl {
                 let req = match decode_req::<pb::ParseRequest>(&req[..], "ParseRequest") {
                     Ok(r) => r,
                     Err(e) => {
-                        let body = frame_bytes(error_body(err_message(&e)));
+                        let body = frame_bytes(err_body(&e));
                         return ready(body);
                     }
                 };
@@ -1258,7 +1280,7 @@ impl StableManagedDriver for StableManagedDriverImpl {
                 ) {
                     Ok(r) => r,
                     Err(e) => {
-                        let body = frame_bytes(error_body(err_message(&e)));
+                        let body = frame_bytes(err_body(&e));
                         return ready(body);
                     }
                 };
@@ -2326,6 +2348,316 @@ mod tests {
                 named: Default::default(),
             },
         ))
+    }
+
+    /// Fails with a [`Diagnostic`](hplugin::diagnostic::Diagnostic) under a
+    /// context, as a plugin's error chains.
+    struct DiagnosticFn;
+    #[async_trait::async_trait]
+    impl PluginFn for DiagnosticFn {
+        async fn call(&self, _ctx: &FnCallContext<'_>, _args: FnArgs) -> Result<FnOutcome> {
+            use hplugin::diagnostic::{Diagnostic, Hint, HintKind, SourceLoc, Stage};
+            let d = Diagnostic::new(Stage::Eval, "no image named `bse`")
+                .with_location(
+                    SourceLoc::checked("p/BUILD".into(), 3, 9).map_err(anyhow::Error::msg)?,
+                )
+                .with_hint(Hint::new(HintKind::DidYouMean, "base"));
+            Err(anyhow::Error::new(d).context("resolving the image"))
+        }
+    }
+
+    /// D2 (0.21.4): the diagnostic a plugin's error carries crosses the seam
+    /// on the plugin's side (`Error.diagnostic`) and comes back on the host's
+    /// error chain, where `find_diagnostic` finds it, while the error's text
+    /// stays the plugin's chain with the diagnostic's text once.
+    #[test]
+    fn a_plugin_error_diagnostic_crosses_the_seam() {
+        use hplugin::diagnostic::{HintKind, SourceLoc, Stage, find_diagnostic};
+        let defs = through_the_seam(
+            "mock",
+            vec![PluginFnDef {
+                name: "fail".into(),
+                signature: FnSignature {
+                    positional: vec![],
+                    named: vec![],
+                    variadic: None,
+                    returns: ParamType::String,
+                },
+                doc: String::new(),
+                func: Arc::new(DiagnosticFn),
+            }],
+        );
+        let err = call(&defs[0], "p", vec![]).expect_err("the call fails");
+        let d = find_diagnostic(&err).expect("the diagnostic crossed");
+        assert_eq!(d.stage, Stage::Eval);
+        assert_eq!(d.message, "no image named `bse`");
+        assert_eq!(
+            d.location,
+            Some(SourceLoc::checked("p/BUILD".into(), 3, 9).expect("relative"))
+        );
+        assert_eq!(d.hints.len(), 1);
+        assert_eq!(d.hints[0].kind, HintKind::DidYouMean);
+        let text = hcore::hmemoizer::chain_message(&err);
+        assert!(text.contains("resolving the image"), "{text}");
+        assert_eq!(text.matches("no image named").count(), 1, "{text}");
+    }
+
+    /// The error every [`DiagProvider`] and [`DiagDriver`] call fails with: a
+    /// [`Diagnostic`](hplugin::diagnostic::Diagnostic) for `method` under a
+    /// context, as a plugin's error chains.
+    fn diag_err(method: &str) -> anyhow::Error {
+        use hplugin::diagnostic::{Diagnostic, Hint, HintKind, SourceLoc};
+        let loc = SourceLoc::checked("p/BUILD".into(), 4, 2).expect("relative");
+        let d = Diagnostic::new(call_stage(method), format!("{method} refused `x`"))
+            .with_location(loc)
+            .with_hint(Hint::new(HintKind::DidYouMean, "y"));
+        anyhow::Error::new(d).context(format!("in {method}"))
+    }
+
+    /// The stage the host gives a failure of `method`'s call.
+    fn call_stage(method: &str) -> hplugin::diagnostic::Stage {
+        use hplugin::diagnostic::Stage;
+        match method {
+            "parse" => Stage::Parse,
+            "apply_transitive" => Stage::Link,
+            _ => Stage::Spec,
+        }
+    }
+
+    /// `err`, as the host decoded it, carries [`diag_err`]'s diagnostic for
+    /// `method` on its chain, its context in the text, and the diagnostic's
+    /// text once.
+    fn assert_diag_crossed(err: &anyhow::Error, method: &str) {
+        use hplugin::diagnostic::{HintKind, SourceLoc, find_diagnostic};
+        let d = find_diagnostic(err).unwrap_or_else(|| panic!("{method}: no diagnostic: {err:#}"));
+        assert_eq!(d.stage, call_stage(method), "{method}");
+        assert_eq!(d.message, format!("{method} refused `x`"));
+        assert_eq!(
+            d.location,
+            Some(SourceLoc::checked("p/BUILD".into(), 4, 2).expect("relative")),
+            "{method}"
+        );
+        assert_eq!(d.hints.len(), 1, "{method}");
+        assert_eq!(d.hints[0].kind, HintKind::DidYouMean, "{method}");
+        let text = hcore::hmemoizer::chain_message(err);
+        assert!(text.contains(&format!("in {method}")), "{method}: {text}");
+        assert_eq!(text.matches("refused `x`").count(), 1, "{method}: {text}");
+    }
+
+    /// A provider whose every call fails with [`diag_err`].
+    struct DiagProvider;
+    impl Provider for DiagProvider {
+        fn config(&self, _req: ConfigRequest) -> Result<ConfigResponse> {
+            Ok(ConfigResponse {
+                name: "diag".into(),
+            })
+        }
+        fn list<'a>(
+            &'a self,
+            _req: ListRequest,
+            _ct: &'a (dyn Cancellable + Send + Sync),
+        ) -> futures::future::BoxFuture<
+            'a,
+            Result<Box<dyn Iterator<Item = Result<ListResponse>> + Send>>,
+        > {
+            Box::pin(async { Err(diag_err("list")) })
+        }
+        fn list_packages<'a>(
+            &'a self,
+            _req: ListPackagesRequest,
+            _ct: &'a (dyn Cancellable + Send + Sync),
+        ) -> futures::future::BoxFuture<
+            'a,
+            Result<Box<dyn Iterator<Item = Result<ListPackageResponse>> + Send>>,
+        > {
+            Box::pin(async {
+                let items: Vec<Result<ListPackageResponse>> = vec![
+                    Ok(ListPackageResponse {
+                        pkg: PkgBuf::from("p"),
+                    }),
+                    Err(diag_err("list_packages")),
+                ];
+                Ok(Box::new(items.into_iter()) as Box<_>)
+            })
+        }
+        fn get<'a>(
+            &'a self,
+            _req: GetRequest,
+            _ct: &'a (dyn Cancellable + Send + Sync),
+        ) -> futures::future::BoxFuture<'a, std::result::Result<GetResponse, GetError>> {
+            Box::pin(async { Err(GetError::Other(diag_err("get"))) })
+        }
+        fn probe<'a>(
+            &'a self,
+            _req: ProbeRequest,
+            _ct: &'a (dyn Cancellable + Send + Sync),
+        ) -> futures::future::BoxFuture<'a, Result<ProbeResponse>> {
+            Box::pin(async { Err(diag_err("probe")) })
+        }
+    }
+
+    fn diag_provider_host() -> hplugin_stabby::load_stable::StableRemoteProvider {
+        let dynp = make_dyn_provider(Arc::new(DiagProvider) as Arc<dyn Provider>);
+        hplugin_stabby::load_stable::StableRemoteProvider::new(dynp, "diag").expect("load")
+    }
+
+    /// D2: a provider's `list` that fails crosses with its diagnostic (the
+    /// host's `StreamEnd` decode).
+    #[test]
+    fn a_list_error_diagnostic_crosses_the_seam() {
+        let host = diag_provider_host();
+        let ct = StdCancellationToken::new();
+        let listed = futures::executor::block_on(host.list(
+            ListRequest {
+                request_id: String::new(),
+                package: PkgBuf::from("p"),
+                states: vec![],
+                executor: Arc::new(hplugin::provider::NoopExecutor),
+            },
+            &ct,
+        ));
+        let err = match listed {
+            Err(e) => e,
+            Ok(mut iter) => match iter.next() {
+                Some(Err(e)) => e,
+                Some(Ok(_)) => panic!("list yields no item"),
+                None => panic!("list ends with its error"),
+            },
+        };
+        assert_diag_crossed(&err, "list");
+    }
+
+    /// D2: a `list_packages` item that fails mid-stream crosses with its
+    /// diagnostic, after the package before it.
+    #[test]
+    fn a_list_packages_error_diagnostic_crosses_the_seam() {
+        let host = diag_provider_host();
+        let ct = StdCancellationToken::new();
+        let mut iter = futures::executor::block_on(host.list_packages(
+            ListPackagesRequest {
+                prefix: PkgBuf::from(""),
+            },
+            &ct,
+        ))
+        .expect("the stream opens");
+        let first = iter.next().expect("one package").expect("ok package");
+        assert_eq!(first.pkg, PkgBuf::from("p"));
+        let err = match iter.next() {
+            Some(Err(e)) => e,
+            _ => panic!("the second item is the error"),
+        };
+        assert_diag_crossed(&err, "list_packages");
+    }
+
+    /// D2: a `get` that fails crosses as a `GetError` with its diagnostic.
+    #[test]
+    fn a_get_error_diagnostic_crosses_the_seam() {
+        let host = diag_provider_host();
+        let ct = StdCancellationToken::new();
+        let got = futures::executor::block_on(host.get(
+            GetRequest {
+                request_id: String::new(),
+                addr: hmodel::htaddr::Addr::new(PkgBuf::from("p"), "t".into(), Default::default()),
+                states: vec![],
+                executor: Arc::new(hplugin::provider::NoopExecutor),
+            },
+            &ct,
+        ));
+        match got {
+            Err(GetError::Other(e)) => assert_diag_crossed(&e, "get"),
+            Err(GetError::NotFound) => panic!("get fails with its error, not NotFound"),
+            Ok(_) => panic!("get fails"),
+        }
+    }
+
+    /// D2: a `probe` that fails crosses with its diagnostic.
+    #[test]
+    fn a_probe_error_diagnostic_crosses_the_seam() {
+        let host = diag_provider_host();
+        let ct = StdCancellationToken::new();
+        let probed = futures::executor::block_on(host.probe(
+            ProbeRequest {
+                request_id: String::new(),
+                package: PkgBuf::from("p"),
+            },
+            &ct,
+        ));
+        match probed {
+            Err(e) => assert_diag_crossed(&e, "probe"),
+            Ok(_) => panic!("probe fails"),
+        }
+    }
+
+    /// A managed driver whose `parse` and `apply_transitive` fail with
+    /// [`diag_err`].
+    struct DiagDriver;
+    #[async_trait::async_trait]
+    impl ManagedDriver for DiagDriver {
+        fn config(
+            &self,
+            _r: hplugin::driver::ConfigRequest,
+        ) -> Result<hplugin::driver::ConfigResponse> {
+            Ok(hplugin::driver::ConfigResponse {
+                name: "diagdrv".into(),
+            })
+        }
+        fn schema(&self) -> hplugin::driver::DriverSchema {
+            hplugin::driver::DriverSchema::default()
+        }
+        async fn parse(
+            &self,
+            _r: hplugin::driver::ParseRequest,
+            _c: &(dyn Cancellable + Send + Sync),
+        ) -> Result<hplugin::driver::ParseResponse> {
+            Err(diag_err("parse"))
+        }
+        async fn apply_transitive(
+            &self,
+            _r: hplugin::driver::ApplyTransitiveRequest,
+            _c: &(dyn Cancellable + Send + Sync),
+        ) -> Result<hplugin::driver::ApplyTransitiveResponse> {
+            Err(diag_err("apply_transitive"))
+        }
+        async fn run<'a, 'io>(
+            &self,
+            _r: hdriver_support::driver_managed::ManagedRunRequest<'a, 'io>,
+            _c: &(dyn Cancellable + Send + Sync),
+        ) -> Result<hdriver_support::driver_managed::ManagedRunResponse> {
+            anyhow::bail!("unused")
+        }
+    }
+
+    fn diag_driver_host() -> hplugin_stabby::load_stable::StableRemoteManagedDriver {
+        let dynd = make_dyn_managed_driver(Arc::new(DiagDriver) as Arc<dyn ManagedDriver>);
+        hplugin_stabby::load_stable::StableRemoteManagedDriver::new(dynd, "diagdrv").expect("load")
+    }
+
+    /// D2: a driver's `parse` that fails crosses with its diagnostic.
+    #[test]
+    fn a_parse_error_diagnostic_crosses_the_seam() {
+        let host = diag_driver_host();
+        let ct = StdCancellationToken::new();
+        match futures::executor::block_on(host.parse(parse_request(), &ct)) {
+            Err(e) => assert_diag_crossed(&e, "parse"),
+            Ok(_) => panic!("parse fails"),
+        }
+    }
+
+    /// D2: a driver's `apply_transitive` that fails crosses with its
+    /// diagnostic.
+    #[test]
+    fn an_apply_transitive_error_diagnostic_crosses_the_seam() {
+        let host = diag_driver_host();
+        let ct = StdCancellationToken::new();
+        let req = hplugin::driver::ApplyTransitiveRequest {
+            request_id: "r".into(),
+            target_def: convert::target_def_from_pb(wire_target()).expect("def"),
+            sandbox: Default::default(),
+        };
+        match futures::executor::block_on(host.apply_transitive(req, &ct)) {
+            Err(e) => assert_diag_crossed(&e, "apply_transitive"),
+            Ok(_) => panic!("apply_transitive fails"),
+        }
     }
 
     struct EchoFn;

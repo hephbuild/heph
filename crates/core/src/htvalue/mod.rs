@@ -16,7 +16,24 @@ pub enum Value {
     List(Vec<Value>),
 }
 
+/// The most chars [`Value::to_starlark`] writes before it cuts the rest to `…`.
+pub const STARLARK_DISPLAY_CAP: usize = 256;
+
 impl Value {
+    /// The value as a BUILD author would write it — `3`, `["X"]`,
+    /// `{"X": 1}`, `True`, `None` — for an error message, never Rust's
+    /// `Debug` (`Int(3)`). Map keys are sorted, so the text is stable; control
+    /// characters in a string are escaped; a value whose text would pass
+    /// [`STARLARK_DISPLAY_CAP`] chars is cut there with `…`.
+    pub fn to_starlark(&self) -> String {
+        let mut out = String::new();
+        // `Err` only means the cap was reached, and `…` already says so.
+        if write_starlark(self, &mut out).is_err() {
+            debug_assert!(out.ends_with('…'));
+        }
+        out
+    }
+
     /// Structural equality, order-free for maps, with floats compared by
     /// their bits: `==` calls `-0.0` and `0.0` equal and a `NaN` unequal to
     /// itself, and both would misjudge whether two values are the same.
@@ -52,11 +69,114 @@ impl Value {
     }
 }
 
+/// The cap was reached: stop writing.
+struct Capped;
+
+/// Push `s` onto `out`, or as much of it as fits under the cap and then `…`.
+fn push_capped(out: &mut String, s: &str) -> Result<(), Capped> {
+    let used = out.chars().count();
+    let room = STARLARK_DISPLAY_CAP.saturating_sub(used);
+    if s.chars().count() <= room {
+        out.push_str(s);
+        return Ok(());
+    }
+    out.extend(s.chars().take(room));
+    out.push('…');
+    Err(Capped)
+}
+
+fn write_starlark(v: &Value, out: &mut String) -> Result<(), Capped> {
+    match v {
+        Value::String(s) => push_capped(out, &starlark_str(s)),
+        Value::Bool(true) => push_capped(out, "True"),
+        Value::Bool(false) => push_capped(out, "False"),
+        Value::Int(i) => push_capped(out, &i.to_string()),
+        Value::Uint(u) => push_capped(out, &u.to_string()),
+        Value::Float(f) => push_capped(out, &starlark_float(*f)),
+        Value::Null() => push_capped(out, "None"),
+        Value::List(items) => {
+            push_capped(out, "[")?;
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    push_capped(out, ", ")?;
+                }
+                write_starlark(item, out)?;
+            }
+            push_capped(out, "]")
+        }
+        Value::Map(m) => {
+            let mut keys: Vec<&String> = m.keys().collect();
+            keys.sort_unstable();
+            push_capped(out, "{")?;
+            for (i, k) in keys.into_iter().enumerate() {
+                if i > 0 {
+                    push_capped(out, ", ")?;
+                }
+                push_capped(out, &starlark_str(k))?;
+                push_capped(out, ": ")?;
+                if let Some(item) = m.get(k) {
+                    write_starlark(item, out)?;
+                }
+            }
+            push_capped(out, "}")
+        }
+    }
+}
+
+/// `s` as a Starlark string literal: double-quoted, with `"`, `\` and every
+/// control character escaped (`\n`, `\t`, `\x1b`), so it reads as written and
+/// never moves a terminal's cursor.
+pub fn starlark_str(s: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            c if c.is_control() && c.is_ascii() => {
+                // Writing to a `String` cannot fail.
+                write!(out, "\\x{:02x}", u32::from(c)).unwrap_or_default();
+            }
+            c if c.is_control() => {
+                write!(out, "\\u{:04x}", u32::from(c)).unwrap_or_default();
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// A float as Starlark writes one: always with a `.` or an exponent, so it
+/// does not read as an int.
+fn starlark_float(f: f64) -> String {
+    if f.is_nan() {
+        "float(\"nan\")".to_owned()
+    } else if f.is_infinite() {
+        if f > 0.0 {
+            "float(\"+inf\")"
+        } else {
+            "float(\"-inf\")"
+        }
+        .to_owned()
+    } else {
+        // `Debug` keeps the `.0` that `Display` drops from a whole float.
+        format!("{f:?}")
+    }
+}
+
 pub fn parse_string(v: &Value) -> anyhow::Result<Option<String>> {
     match v {
         Value::Null() => Ok(None),
         Value::String(s) => Ok(Some(s.clone())),
-        v => Err(anyhow::anyhow!("invalid: expected string, got: {:?}", v)),
+        v => Err(anyhow::anyhow!(
+            "invalid: expected string, got: {}",
+            v.to_starlark()
+        )),
     }
 }
 
@@ -75,8 +195,8 @@ pub fn parse_strings(v: &Value) -> anyhow::Result<Vec<String>> {
             }),
         Value::String(s) => Ok(vec![s.clone()]),
         v => Err(anyhow::anyhow!(
-            "invalid: expected string or [string], got: {:?}",
-            v
+            "invalid: expected string or [string], got: {}",
+            v.to_starlark()
         )),
     }
 }
@@ -84,8 +204,8 @@ pub fn parse_strings(v: &Value) -> anyhow::Result<Vec<String>> {
 /// The error both lenient map parsers return for a value of the wrong shape.
 fn map_mismatch(v: &Value) -> anyhow::Error {
     anyhow::anyhow!(
-        "invalid: expected string, [string], {{string: string}} or {{string: [string]}} got: {:?}",
-        v
+        "invalid: expected string, [string], {{string: string}} or {{string: [string]}} got: {}",
+        v.to_starlark()
     )
 }
 
@@ -117,12 +237,13 @@ pub fn parse_map_string_map_string_strings(
             .iter()
             .map(|(k, v)| {
                 parse_map_string_strings(v)
-                    .with_context(|| format!("key {k:?}"))
+                    .with_context(|| format!("key {}", starlark_str(k)))
                     .map(|inner| (k.clone(), inner))
             })
             .collect(),
         v => Err(anyhow::anyhow!(
-            "invalid: expected {{string: {{string: [string]}}}} got: {v:?}"
+            "invalid: expected {{string: {{string: [string]}}}} got: {}",
+            v.to_starlark()
         )),
     }
 }
@@ -147,13 +268,73 @@ pub fn parse_bool(v: &Value) -> anyhow::Result<bool> {
     match v {
         Value::Null() => Ok(false),
         Value::Bool(b) => Ok(*b),
-        _ => Err(anyhow::anyhow!("invalid: expected bool, got: {:?}", v)),
+        _ => Err(anyhow::anyhow!(
+            "invalid: expected bool, got: {}",
+            v.to_starlark()
+        )),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn to_starlark_writes_literals() {
+        let v = Value::Map(HashMap::from([
+            (
+                "b".to_owned(),
+                Value::List(vec![s("X"), Value::Int(-3), Value::Uint(4)]),
+            ),
+            ("a".to_owned(), Value::Bool(true)),
+            ("c".to_owned(), Value::Null()),
+            ("d".to_owned(), Value::Float(1.0)),
+        ]));
+        assert_eq!(
+            v.to_starlark(),
+            r#"{"a": True, "b": ["X", -3, 4], "c": None, "d": 1.0}"#
+        );
+        assert_eq!(s("q\"\\\x1b\n").to_starlark(), r#""q\"\\\x1b\n""#);
+        assert_eq!(
+            Value::Float(f64::INFINITY).to_starlark(),
+            r#"float("+inf")"#
+        );
+    }
+
+    #[test]
+    fn to_starlark_cuts_at_the_cap() {
+        let v = Value::List((0..1000).map(Value::Int).collect());
+        let text = v.to_starlark();
+        assert_eq!(text.chars().count(), STARLARK_DISPLAY_CAP + 1);
+        assert!(text.ends_with('…'));
+    }
+
+    /// F2: no `Int(`/`String(`/`List(` in what a parser says about a value.
+    #[test]
+    fn parse_errors_name_values_as_starlark() {
+        let errs = [
+            parse_string(&Value::Int(3)),
+            parse_strings(&Value::Map(HashMap::from([(
+                "X".to_owned(),
+                Value::Int(1),
+            )])))
+            .map(|_| None),
+            parse_bool(&Value::List(vec![s("X")])).map(|_| None),
+            parse_map_string_strings(&Value::Bool(true)).map(|_| None),
+        ];
+        let texts: Vec<String> = errs
+            .into_iter()
+            .map(|r| format!("{:#}", r.expect_err("a wrong type fails")))
+            .collect();
+        for t in &texts {
+            for leak in ["Int(", "String(", "List(", "Map(", "Bool("] {
+                assert!(!t.contains(leak), "{t}");
+            }
+        }
+        assert!(texts[0].ends_with("got: 3"), "{}", texts[0]);
+        assert!(texts[1].ends_with(r#"got: {"X": 1}"#), "{}", texts[1]);
+        assert!(texts[2].ends_with(r#"got: ["X"]"#), "{}", texts[2]);
+    }
 
     fn s(v: &str) -> Value {
         Value::String(v.to_string())
@@ -229,22 +410,22 @@ mod tests {
         let outer =
             "invalid: expected string, [string], {string: string} or {string: [string]} got: ";
         let cases: Vec<(Value, String)> = vec![
-            (Value::Bool(true), format!("{outer}Bool(true)")),
-            (Value::Int(1), format!("{outer}Int(1)")),
-            (Value::Uint(1), format!("{outer}Uint(1)")),
-            (Value::Float(1.5), format!("{outer}Float(1.5)")),
+            (Value::Bool(true), format!("{outer}True")),
+            (Value::Int(1), format!("{outer}1")),
+            (Value::Uint(1), format!("{outer}1")),
+            (Value::Float(1.5), format!("{outer}1.5")),
             // A list with a bad element reports the whole value, not the element.
             (
                 list(vec![s("a"), Value::Int(2)]),
-                format!("{outer}List([String(\"a\"), Int(2)])"),
+                format!("{outer}[\"a\", 2]"),
             ),
             (
                 map(vec![("k", Value::Bool(false))]),
-                "invalid: expected string or [string], got: Bool(false)".to_string(),
+                "invalid: expected string or [string], got: False".to_string(),
             ),
             (
                 map(vec![("k", list(vec![Value::Int(3)]))]),
-                "invalid: expected string, got: Int(3)".to_string(),
+                "invalid: expected string, got: 3".to_string(),
             ),
         ];
         for (input, want) in cases {
@@ -276,12 +457,12 @@ mod tests {
         let outer =
             "invalid: expected string, [string], {string: string} or {string: [string]} got: ";
         let cases: Vec<(Value, String)> = vec![
-            (Value::Bool(true), format!("{outer}Bool(true)")),
-            (Value::Int(1), format!("{outer}Int(1)")),
-            (list(vec![s("a")]), format!("{outer}List([String(\"a\")])")),
+            (Value::Bool(true), format!("{outer}True")),
+            (Value::Int(1), format!("{outer}1")),
+            (list(vec![s("a")]), format!("{outer}[\"a\"]")),
             (
                 map(vec![("k", list(vec![s("a")]))]),
-                "invalid: expected string, got: List([String(\"a\")])".to_string(),
+                "invalid: expected string, got: [\"a\"]".to_string(),
             ),
         ];
         for (input, want) in cases {
@@ -310,11 +491,11 @@ mod tests {
                 "linux",
                 Value::Int(1)
             )]))),
-            "key \"linux\": invalid: expected string, [string], {string: string} or {string: [string]} got: Int(1)"
+            "key \"linux\": invalid: expected string, [string], {string: string} or {string: [string]} got: 1"
         );
         assert_eq!(
             err(parse_map_string_map_string_strings(&s("a"))),
-            "invalid: expected {string: {string: [string]}} got: String(\"a\")"
+            "invalid: expected {string: {string: [string]}} got: \"a\""
         );
     }
 }

@@ -1876,7 +1876,12 @@ pub(crate) fn material_from_text(
             serde_json::Value::String(s) => s.clone(),
             serde_json::Value::Number(n) => n.to_string(),
             serde_json::Value::Bool(b) => b.to_string(),
-            other => anyhow::bail!("`{key}` is {other}, which is not a credential field"),
+            // Names the JSON type only: the value is the source's output, and
+            // an object or array under a credential key holds material (I7).
+            other => anyhow::bail!(
+                "`{key}` is {}, which is not a credential field",
+                json_type(other)
+            ),
         };
         out.insert(field.clone(), s);
     }
@@ -1891,6 +1896,18 @@ pub(crate) fn material_from_text(
     })
 }
 
+/// A JSON value's type, as an error names it in place of the value.
+fn json_type(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
+}
+
 /// A dotted path into a JSON document: `data.token`.
 fn json_path<'a>(doc: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::Value> {
     key.split('.').try_fold(doc, |d, part| d.get(part))
@@ -1902,13 +1919,17 @@ fn json_path<'a>(doc: &'a serde_json::Value, key: &str) -> Option<&'a serde_json
 /// `expires_in`); a string is an absolute RFC 3339 timestamp (AWS's `Expiration`).
 /// Told apart by type, because vendors do both and a declaration should not have
 /// to say which.
+///
+/// No error quotes the value: an `expires` path that lands on the wrong field
+/// (AWS's `Credentials` rather than `Credentials.Expiration`) holds the
+/// source's material (I7). It names the JSON type instead.
 fn parse_expiry(v: &serde_json::Value) -> anyhow::Result<u64> {
     let now = unix_secs(SystemTime::now());
     match v {
         serde_json::Value::Number(n) => {
-            let secs = n
-                .as_u64()
-                .ok_or_else(|| anyhow::anyhow!("expiry {n} is not a whole number of seconds"))?;
+            let secs = n.as_u64().ok_or_else(|| {
+                anyhow::anyhow!("the expiry is a number that is not a whole number of seconds")
+            })?;
             Ok(now.saturating_add(secs))
         }
         serde_json::Value::String(s) => {
@@ -1917,11 +1938,15 @@ fn parse_expiry(v: &serde_json::Value) -> anyhow::Result<u64> {
             if let Ok(secs) = s.parse::<u64>() {
                 return Ok(secs);
             }
-            let ts = chrono::DateTime::parse_from_rfc3339(s)
-                .with_context(|| format!("expiry {s:?} is not an RFC 3339 timestamp"))?;
+            let ts = chrono::DateTime::parse_from_rfc3339(s).context(
+                "the expiry is a string that is neither Unix seconds nor an RFC 3339 timestamp",
+            )?;
             Ok(ts.timestamp().max(0).cast_unsigned())
         }
-        other => anyhow::bail!("expiry {other} is neither a duration nor a timestamp"),
+        other => anyhow::bail!(
+            "the expiry is {}, which is neither a duration nor a timestamp",
+            json_type(other)
+        ),
     }
 }
 
@@ -2293,6 +2318,29 @@ mod tests {
         assert!(rel >= now + 59 && rel <= now + 61);
     }
 
+    /// An `expires` path that lands on the wrong field names its type, never
+    /// its content: AWS's `Credentials` object holds the secret (I7).
+    #[test]
+    fn credential_expiry_error_names_type_only() {
+        let doc = r#"{"Credentials":{"SecretAccessKey":"s3cr3t-key","Expiration":"x"},
+                      "n":-1.5,"s":"s3cr3t-str"}"#;
+        for (expires, wants) in [
+            ("Credentials", "the expiry is an object"),
+            ("n", "a number that is not a whole number"),
+            ("s", "a string that is neither Unix seconds nor an RFC 3339"),
+        ] {
+            let err = material_from_text(
+                doc,
+                &BTreeMap::from([("token".to_string(), "s".to_string())]),
+                Some(expires),
+            )
+            .expect_err("not an expiry");
+            let err = format!("{err:#}");
+            assert!(err.contains(wants), "{expires}: {err}");
+            assert!(!err.contains("s3cr3t") && !err.contains("-1.5"), "{err}");
+        }
+    }
+
     #[test]
     fn a_missing_field_names_what_the_source_did_yield() {
         let err = material_from_text(
@@ -2302,6 +2350,30 @@ mod tests {
         )
         .expect_err("must fail");
         assert!(format!("{err:#}").contains("SecretAccessKey"), "{err:#}");
+    }
+
+    /// A field map pointing at a subtree: the error names the subtree's JSON
+    /// type, never its content, which is the source's material (I7).
+    #[test]
+    fn credential_json_subtree_names_type_only() {
+        for (doc, ty) in [
+            (r#"{"creds":{"secret":"s3cr3t-obj"}}"#, "an object"),
+            (r#"{"creds":["s3cr3t-arr"]}"#, "an array"),
+            (r#"{"creds":null}"#, "null"),
+        ] {
+            let err = material_from_text(
+                doc,
+                &BTreeMap::from([("token".to_string(), "creds".to_string())]),
+                None,
+            )
+            .expect_err("a subtree is not a field");
+            let err = format!("{err:#}");
+            assert!(
+                err.contains(&format!("`creds` is {ty}, which is not a credential field")),
+                "{err}"
+            );
+            assert!(!err.contains("s3cr3t"), "the error quoted material: {err}");
+        }
     }
 
     #[test]

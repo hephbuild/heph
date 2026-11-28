@@ -73,10 +73,11 @@ impl Fetcher {
         let mut written = 0u64;
         while let Some(chunk) = body.chunk().await? {
             w.write_all(&chunk)
-                .with_context(|| format!("write body of {url}"))?;
+                .with_context(|| format!("write body of {}", redact_url(url)))?;
             written += chunk.len() as u64;
         }
-        w.flush().with_context(|| format!("write body of {url}"))?;
+        w.flush()
+            .with_context(|| format!("write body of {}", redact_url(url)))?;
         Ok(written)
     }
 
@@ -120,7 +121,8 @@ impl Fetcher {
             .send()
             .await
             .and_then(|r| r.error_for_status())
-            .with_context(|| format!("GET {url}"))?;
+            .map_err(scrub)
+            .with_context(|| format!("GET {}", redact_url(url)))?;
         Ok(Body { url, resp })
     }
 }
@@ -184,6 +186,54 @@ pub fn check_header(name: &str, value: &str) -> anyhow::Result<String> {
     Ok(lower.to_string())
 }
 
+/// `url` as a message may quote it: scheme, host, port and path, without the
+/// userinfo, the query or the fragment.
+///
+/// A presigned URL (S3's `X-Amz-Signature`, a CDN token) carries its secret in
+/// the query, and a URL a `${read://…}` reference resolved to may be one, so no
+/// error or log quotes a URL any other way (I7). Text that does not parse as a
+/// URL with a host (`u:p@h/x` parses as scheme `u`) is cut at its first `?` or
+/// `#`, and to what follows its last `@`.
+pub fn redact_url(url: &str) -> std::borrow::Cow<'_, str> {
+    let mut parsed = match reqwest::Url::parse(url) {
+        Ok(parsed) if parsed.has_host() => parsed,
+        _ => {
+            let cut = url.split(['?', '#']).next().unwrap_or(url);
+            return std::borrow::Cow::Borrowed(cut.rsplit('@').next().unwrap_or(cut));
+        }
+    };
+    if parsed.query().is_none()
+        && parsed.fragment().is_none()
+        && parsed.username().is_empty()
+        && parsed.password().is_none()
+    {
+        return std::borrow::Cow::Borrowed(url);
+    }
+    strip_secrets(&mut parsed);
+    std::borrow::Cow::Owned(parsed.into())
+}
+
+/// Drop what [`redact_url`] drops, in place.
+fn strip_secrets(url: &mut reqwest::Url) {
+    url.set_query(None);
+    url.set_fragment(None);
+    // Both refuse only a URL that has no host or cannot be a base (and
+    // `set_username` a `file:` one), none of which can carry userinfo: either
+    // outcome leaves none.
+    let (Ok(()) | Err(())) = url.set_password(None);
+    let (Ok(()) | Err(())) = url.set_username("");
+}
+
+/// A reqwest error with its URL redacted: reqwest prints the URL it failed on,
+/// which after a redirect is the target's (a release asset's CDN URL, signed in
+/// its query), not the one the caller asked for.
+fn scrub(mut err: reqwest::Error) -> reqwest::Error {
+    if let Some(url) = err.url_mut() {
+        strip_secrets(url);
+    }
+    err
+}
+
 /// The HTTP status a failed download was answered with, if the failure was a
 /// status at all (rather than a connection, timeout or write error): read off
 /// the error chain [`Fetcher::open`] returns.
@@ -232,7 +282,8 @@ impl Body<'_> {
         self.resp
             .chunk()
             .await
-            .with_context(|| format!("download {url}"))
+            .map_err(scrub)
+            .with_context(|| format!("download {}", redact_url(url)))
     }
 }
 
@@ -254,7 +305,7 @@ fn block_on_own_runtime<T: Send>(
                 .block_on(fut)
         })
         .join()
-        .map_err(|_e| anyhow::anyhow!("download thread for {url} panicked"))?
+        .map_err(|_e| anyhow::anyhow!("download thread for {} panicked", redact_url(url)))?
     })
 }
 
@@ -351,18 +402,18 @@ impl<W: Write> Sha256Writer<W> {
         for chunk in chunks {
             self.hw
                 .write_all(chunk.as_ref())
-                .with_context(|| format!("write body of {url}"))?;
+                .with_context(|| format!("write body of {}", redact_url(url)))?;
         }
         self.hw
             .flush()
-            .with_context(|| format!("write body of {url}"))
+            .with_context(|| format!("write body of {}", redact_url(url)))
     }
 
     /// Flush what was written and return its lowercase hex SHA-256.
     pub fn finish(mut self, url: &str) -> anyhow::Result<String> {
         self.hw
             .flush()
-            .with_context(|| format!("write body of {url}"))?;
+            .with_context(|| format!("write body of {}", redact_url(url)))?;
         Ok(hex::encode(self.hw.hasher.finalize()))
     }
 }
@@ -476,6 +527,63 @@ mod tests {
             .expect_err("stalled body must time out");
         let msg = format!("{err:#}");
         assert!(msg.contains(&url), "{msg}");
+    }
+
+    #[test]
+    fn redact_url_keeps_scheme_host_and_path() {
+        for (url, want) in [
+            ("https://h.example/a/b", "https://h.example/a/b"),
+            (
+                "https://h.example:8443/a?X-Amz-Signature=s3cr3t&b=1",
+                "https://h.example:8443/a",
+            ),
+            ("https://h.example/a#tok=s3cr3t", "https://h.example/a"),
+            ("https://u:s3cr3t@h.example/a", "https://h.example/a"),
+            ("https://s3cr3t@h.example/a", "https://h.example/a"),
+            ("not a url?sig=s3cr3t", "not a url"),
+            ("u:s3cr3t@h.example/a", "h.example/a"),
+            ("//u:s3cr3t@h.example/a?q=1", "h.example/a"),
+            ("${read://gh:tool_url}", "${read://gh:tool_url}"),
+            ("", ""),
+        ] {
+            assert_eq!(redact_url(url), want, "{url}");
+        }
+        assert!(matches!(
+            redact_url("https://h.example/a"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
+    /// reqwest prints the URL it failed on, which after a redirect is the
+    /// redirect's target: a signed CDN URL, its secret in the query. Neither
+    /// that nor the URL asked for reaches the error with its query (I7).
+    #[test]
+    fn reqwest_error_url_query_stripped() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let answers: [&[u8]; 2] = [
+                b"HTTP/1.1 302 Found\r\nlocation: /signed?X-Amz-Signature=s3cr3t-cdn\r\n\
+                  content-length: 0\r\nconnection: close\r\n\r\n",
+                b"HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+            ];
+            for answer in answers {
+                let (mut s, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf).unwrap();
+                s.write_all(answer).unwrap();
+            }
+        });
+        let url = format!("http://{addr}/asset?token=s3cr3t-asked");
+        let err = get(&url, &mut Vec::new()).expect_err("403 must fail");
+        let msg = format!("{err:#}");
+        assert!(!msg.contains("s3cr3t"), "a query reached the error: {msg}");
+        assert!(
+            msg.contains("/signed"),
+            "keeps the path it failed on: {msg}"
+        );
+        assert!(msg.contains(&format!("http://{addr}/asset")), "{msg}");
+        assert_eq!(http_status(&err), Some(403), "the status is still read");
     }
 
     /// An error status fails before any body is written.
