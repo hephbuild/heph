@@ -341,15 +341,33 @@ in
   # services.postgres.enable = true;
 
   # https://devenv.sh/scripts/
+  # `gen` and `gen-proto` work on the checkout they are run from — the cargo
+  # workspace around `$PWD`, as `target-dir .` resolves it — not on
+  # `$DEVENV_ROOT`, which is wherever the shell was started. An agent in a
+  # second worktree runs them from a shell started in the main checkout:
+  # anchored at `$DEVENV_ROOT`, `gen` deleted and regenerated the main
+  # checkout's `gen/` under whatever was building there, and the worktree
+  # still had none. A workspace without heph's `buf.gen.yaml` and
+  # `proto/Cargo.toml.tpl` is refused rather than having its `gen/` removed.
+  # `tests/root/gen_script.rs` runs this text.
   scripts.gen-proto.exec = ''
-    cd "$DEVENV_ROOT"
+    set -euo pipefail
+    root="$(cargo locate-project --workspace --message-format plain)"
+    cd "''${root%/Cargo.toml}"
     buf generate
   '';
   scripts.gen.exec = ''
-    set -e
-    rm -rf "$DEVENV_ROOT/gen"
-    gen-proto
-    cp "$DEVENV_ROOT/proto/Cargo.toml.tpl" "$DEVENV_ROOT/gen/proto/Cargo.toml"
+    set -euo pipefail
+    root="$(cargo locate-project --workspace --message-format plain)"
+    root="''${root%/Cargo.toml}"
+    if [ ! -f "$root/buf.gen.yaml" ] || [ ! -f "$root/proto/Cargo.toml.tpl" ]; then
+      echo "gen: $root is not a heph checkout (no buf.gen.yaml or proto/Cargo.toml.tpl); run gen from inside one" >&2
+      exit 1
+    fi
+    echo "gen: regenerating $root/gen" >&2
+    rm -rf "$root/gen"
+    (cd "$root" && gen-proto)
+    cp "$root/proto/Cargo.toml.tpl" "$root/gen/proto/Cargo.toml"
   '';
   scripts.gen-go-large.exec = ''
     rm -rf $DEVENV_ROOT/example/go/large

@@ -35,6 +35,7 @@ mod dev_debuginfo;
 mod execrunner_gate;
 mod feature_unification;
 mod gc_cli;
+mod gen_script;
 mod json_cli;
 mod json_print_gate;
 mod lint_gate;
