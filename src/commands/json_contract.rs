@@ -794,8 +794,12 @@ mod tests {
                 ("run", "path"),
                 ("run", "exit_code"),
                 ("inspect failure", "addr"),
+                ("inspect failure", "file"),
                 ("inspect failure", "hashin"),
                 ("inspect failure", "failed_at"),
+                ("inspect failure", "log"),
+                ("inspect failure", "log_lines"),
+                ("inspect failure", "location"),
             ] {
                 let ks = kinds(lines, cmd, field);
                 assert!(!ks.is_empty(), "{source}: `{cmd} {field}` missing");
