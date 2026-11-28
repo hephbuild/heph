@@ -413,10 +413,12 @@ fn exit_code_for(
     report(e, session);
     // A cancel exits 130 (error-reporting I6), in every mode, and a failure
     // the user then stopped too: the stop is read from the trigger, since the
-    // failure boxes carry no trace of it. The walker finds a cancel inside a
-    // `MultiError` or a memoizer-shared error.
-    let cancelled = cancel_requested
-        || hcore::hmemoizer::find::<heph::engine::error::CancelledError>(e).is_some();
+    // failure boxes carry no trace of it. Without the trigger, the error must
+    // be nothing but cancels (inside a `MultiError` or a memoizer-shared
+    // error included): a cancel beside a genuine failure is a sibling
+    // `--fail-fast` stopped, and that run failed, exit 1 (RUN-24).
+    let cancelled =
+        cancel_requested || hcore::hmemoizer::only::<heph::engine::error::CancelledError>(e);
     if cancelled {
         commands::run::EXIT_CANCELLED
     } else {
@@ -601,9 +603,12 @@ fn names_command(m: &clap::ArgMatches, path: &[&str]) -> bool {
 mod tests {
     use super::*;
 
-    /// A cancel exits 130 (I6): a cancel in the chain, one inside a
-    /// `MultiError` or behind a memoizer's shared error, and any failure the
-    /// user then stopped (the trigger fired). An ordinary failure exits 1.
+    /// A cancel exits 130 (I6): an error that is only a cancel (in the
+    /// chain, every member of a `MultiError`, behind a memoizer's shared
+    /// error), and any failure the user then stopped (the trigger fired). An
+    /// ordinary failure exits 1, and so does one `--fail-fast` then stopped
+    /// the siblings of (RUN-24): the cancels beside it are its doing, not the
+    /// user's.
     #[test]
     fn exit_code_for_maps_a_cancel_to_130() {
         use heph::engine::error::CancelledError;
@@ -612,11 +617,28 @@ mod tests {
 
         let cancel = || anyhow::Error::new(CancelledError).context("running //p:a");
         assert_eq!(code(cancel(), false), 130, "a cancel in the chain");
-        let multi = anyhow::Error::new(hcore::hmemoizer::MultiError(vec![
-            anyhow::anyhow!("boom"),
-            cancel(),
-        ]));
-        assert_eq!(code(multi, false), 130, "a cancel inside a MultiError");
+        let multi = anyhow::Error::new(hcore::hmemoizer::MultiError(vec![cancel(), cancel()]));
+        assert_eq!(
+            code(multi, false),
+            130,
+            "every member of a MultiError a cancel"
+        );
+        let fail_fast = || {
+            anyhow::Error::new(hcore::hmemoizer::MultiError(vec![
+                anyhow::anyhow!("boom"),
+                cancel(),
+            ]))
+        };
+        assert_eq!(
+            code(fail_fast(), false),
+            1,
+            "a failure, then the siblings --fail-fast stopped"
+        );
+        assert_eq!(
+            code(fail_fast(), true),
+            130,
+            "a failure, the fail-fast stop, then the user's stop"
+        );
         // A second holder, so the memoizer cannot hand the error back whole.
         let shared = Arc::new(cancel());
         let behind = hcore::hmemoizer::unwrap_arc_err(Arc::clone(&shared));

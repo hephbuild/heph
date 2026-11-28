@@ -94,6 +94,17 @@ pub(crate) async fn run_json(
     flags: &[&str],
     cancel_at: Option<&str>,
 ) -> JsonRun {
+    run_json_with(engine, m, flags, cancel_at, false).await
+}
+
+/// [`run_json`], under `--fail-fast` when `fail_fast`.
+pub(crate) async fn run_json_with(
+    engine: &Arc<Engine>,
+    m: &Matcher,
+    flags: &[&str],
+    cancel_at: Option<&str>,
+    fail_fast: bool,
+) -> JsonRun {
     let args = RunArgs::try_parse_from(flags).expect("run flags");
     let out = &args.out;
     assert!(out.enabled(), "{flags:?}");
@@ -102,10 +113,10 @@ pub(crate) async fn run_json(
         tokio::sync::mpsc::unbounded_channel::<heph::engine::event::BuildEvent>();
     let (tx, rx) = request_events(out.enabled(), Some(forward.clone()));
     let rx = rx.expect("under an output flag the request gets its own channel");
-    let rs = engine.new_state_with_events(false, tx);
+    let rs = engine.new_state_with_events(fail_fast, tx);
     let gaps = Gaps::new("test");
     let opts = ResultOptions {
-        discovery: Discovery::keep_going_unless(false, &gaps),
+        discovery: Discovery::keep_going_unless(fail_fast, &gaps),
         ..ResultOptions::default()
     };
     let outputs = args.output_matcher();
@@ -356,6 +367,90 @@ async fn run_json_entries_cancelled() {
     let e = stopped.entry("//p:slow");
     assert_eq!(e["outcome"], "cancelled", "{e}");
     assert!(e["exit_code"].is_null(), "{e}");
+}
+
+/// RUN-24's graph: `bad` fails (exit 3) after `slow` has started, and `slow`
+/// would run for a minute.
+const FAIL_FAST: &str = r#"
+target(name = "bad", driver = "bash", run = "sleep 1; echo oops; exit 3", out = "bad.txt")
+target(name = "slow", driver = "bash", run = "sleep 60; echo > $OUT", out = "slow.txt")
+"#;
+
+/// `heph run --fail-fast --json //p:` over [`FAIL_FAST`], bounded so a
+/// sibling fail-fast never stopped fails the test rather than hanging it.
+async fn fail_fast_run() -> JsonRun {
+    let root = tempfile::tempdir().expect("root tempdir");
+    write_pkg(root.path(), "p", FAIL_FAST);
+    let engine = build_engine_with_remote(root.path(), None);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        run_json_with(
+            &engine,
+            &Matcher::Package(PkgBuf::from("p")),
+            &["--json"],
+            None,
+            true,
+        ),
+    )
+    .await
+    .expect("fail-fast stops the sibling")
+}
+
+/// RUN-24: `--fail-fast` stops the running sibling once `bad` fails. The
+/// sibling ends cancelled, in its event and its record, and is neither
+/// blamed nor boxed: the one failure is `bad`'s.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fail_fast_siblings_are_cancelled_and_listed() {
+    let run = fail_fast_run().await;
+    assert!(run.res.is_err(), "a target failed: the run fails");
+    let bad = run.entry("//p:bad");
+    assert_eq!(bad["outcome"], "failed", "{bad}");
+    assert_eq!(bad["exit_code"], 3, "{bad}");
+    let slow = run.entry("//p:slow");
+    assert_eq!(slow["outcome"], "cancelled", "{slow}");
+    assert!(slow["root"].is_null(), "a stop blames no one: {slow}");
+    assert!(slow["exit_code"].is_null(), "{slow}");
+    let ends: Vec<_> = run
+        .events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            BuildEventKind::ResultEnd {
+                addr,
+                cancelled,
+                upstream_of,
+                ..
+            } if addr == "//p:slow" => Some((*cancelled, upstream_of.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ends, [(true, None)], "one cancelled end, naming no root");
+    assert_eq!(run.box_count(), 1, "{}", run.boxes);
+    assert!(run.boxes.contains("//p:bad"), "{}", run.boxes);
+    assert!(!run.boxes.contains("//p:slow"), "{}", run.boxes);
+}
+
+/// RUN-24 / JSON_OUTPUT.md: under `--fail-fast --json` the failure's record
+/// and the stopped sibling's `cancelled` record are written, then the list
+/// is left without its `]`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fail_fast_json_cancelled_records_then_unterminated() {
+    let run = fail_fast_run().await;
+    assert!(!run.closed, "a fail-fast stop leaves the list open");
+    let outcomes: Vec<(&str, &str)> = run
+        .entries
+        .iter()
+        .map(|e| {
+            (
+                e["addr"].as_str().unwrap_or_default(),
+                e["outcome"].as_str().unwrap_or_default(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        outcomes,
+        [("//p:bad", "failed"), ("//p:slow", "cancelled")],
+        "every record, in completion order, before the open end"
+    );
 }
 
 /// A run past its `timeout` fails, and says it timed out.

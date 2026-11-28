@@ -747,6 +747,27 @@ pub fn walk<'a, B>(
     std::ops::ControlFlow::Continue(())
 }
 
+/// Whether every failure `e` carries is a `T`: a `T` on its chain, or a
+/// [`MultiError`] on it whose members each are (through [`SharedAnyhow`]
+/// wrappers, as [`walk`] goes). An aggregate with no members is not, nor is
+/// a chain holding neither. Where [`find`] asks "is there a `T`", this asks
+/// "is there nothing else": one aggregate holding a `T` beside a genuine
+/// failure answers yes to the first and no here.
+pub fn only<T: std::error::Error + Send + Sync + 'static>(e: &anyhow::Error) -> bool {
+    for item in e.chain() {
+        if let Some(shared) = item.downcast_ref::<SharedAnyhow>() {
+            return only::<T>(&shared.0);
+        }
+        if item.is::<T>() {
+            return true;
+        }
+        if let Some(multi) = item.downcast_ref::<MultiError>() {
+            return !multi.0.is_empty() && multi.0.iter().all(only::<T>);
+        }
+    }
+    false
+}
+
 /// The first `T` in walk order: the outermost one.
 pub fn find<T: std::error::Error + Send + Sync + 'static>(e: &anyhow::Error) -> Option<&T> {
     walk(e, &mut |f| match f.downcast_ref::<T>() {
@@ -2808,6 +2829,30 @@ mod tests {
         assert_eq!(innermost::<Marker>(&multi).map(|m| m.0), Some("second"));
         // `frames` keeps the members inside the one `MultiError` frame.
         assert_eq!(frames(&multi).len(), 2);
+        // A `Marker` beside a plain failure: found, but not the only one.
+        assert!(!only::<Marker>(&multi));
+    }
+
+    /// `only`: every failure a `T`, through contexts, shared wrappers and
+    /// nested aggregates; one other failure anywhere, or none at all, is no.
+    #[test]
+    fn only_asks_whether_every_failure_is_a_t() {
+        let m = |s: &'static str| anyhow::Error::new(Marker(s));
+        assert!(only::<Marker>(&m("a").context("ctx")));
+        assert!(only::<Marker>(&shared(m("a"))));
+        let nested = anyhow::Error::new(MultiError(vec![
+            m("a"),
+            shared(anyhow::Error::new(MultiError(vec![m("b"), m("c")]))),
+        ]))
+        .context("fanout");
+        assert!(only::<Marker>(&nested));
+        let deep_other = anyhow::Error::new(MultiError(vec![
+            m("a"),
+            anyhow::Error::new(MultiError(vec![m("b"), anyhow::anyhow!("boom")])),
+        ]));
+        assert!(!only::<Marker>(&deep_other));
+        assert!(!only::<Marker>(&anyhow::anyhow!("boom")));
+        assert!(!only::<Marker>(&anyhow::Error::new(MultiError(Vec::new()))));
     }
 
     #[test]
