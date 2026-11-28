@@ -3882,6 +3882,34 @@ mod tests {
         assert_eq!((tabs.done, tabs.failed), (1, 1));
     }
 
+    /// What the engine sends since CQ-M2 for a culprit whose scope already
+    /// opened: the ok end, then the blame's failing end, with no second
+    /// start. The row reopens as a failed root just the same.
+    #[test]
+    fn culprit_end_after_ok_without_a_second_start_reopens_row_as_failed() {
+        let mut s = BuildState::new();
+        s.apply(&ev(1, result_start("//a:c")));
+        s.apply(&ev(2, result_end("//a:c", None)));
+        s.apply(&ev(3, result_start("//a:ok")));
+        s.apply(&ev(4, result_end("//a:ok", None)));
+        assert_eq!((s.completed, s.errored), (2, 0));
+
+        s.apply(&ev(5, result_end("//a:c", Some("c broke".into()))));
+        assert_eq!((s.completed, s.errored), (1, 1));
+        assert_eq!(s.failure_split(), (1, 0), "a root");
+        assert_eq!(s.dash.in_flight_count(), 0);
+        let tabs = s.dash.counts(CountScope::All);
+        assert_eq!((tabs.done, tabs.failed), (1, 1));
+        assert!(s.completed + s.errored <= tabs.all());
+        assert_eq!(
+            s.dash
+                .failures()
+                .map(|id| s.dash.addr(id))
+                .collect::<Vec<_>>(),
+            ["//a:c"]
+        );
+    }
+
     /// A stale entry is a miss in the counts, and the summary names it with
     /// the engine's reason, and says when its rebuild changed the output.
     /// Past the cap, the rest are counted.
