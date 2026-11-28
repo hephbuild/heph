@@ -1,0 +1,32 @@
+# The floor under a review brief (I3). A live line under one of these paths
+# is at least Glance: the triage can raise it, never put it lower. A move
+# into or within one of them is Glance too, and so is a deletion.
+#
+# One glob per line. `*` stays in one path segment, `**` crosses them, and a
+# trailing `/` means everything under the directory.
+#
+# This list changes only through a PR. Revisit it after the first real
+# brief (spec O2).
+
+# The engine, its locks and its memoizer.
+crates/engine/src/
+crates/lock/
+crates/core/src/hmemoizer/
+
+# The plugin seam and the wire formats.
+crates/plugin-abi/
+crates/plugin-stabby/
+proto/
+
+# The driver and provider contracts.
+crates/plugin/src/driver.rs
+crates/plugin/src/provider.rs
+crates/driver-support/
+
+# Where a target runs, and what it sees.
+crates/execrunner/
+crates/sandboxfuse/
+
+# Every plugin crate (the Go plugin included) and the builtin plugins.
+crates/plugin-*/
+crates/builtins/

@@ -1,0 +1,531 @@
+<title>Review brief</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+/* Layout: one reading column that opens on what waits for the reviewer, then
+   one section per layer; the ledger bars are the page's only strong colour. */
+:root {
+  --bg: #f6f7f9; --surface: #ffffff; --fg: #1b1f27; --muted: #5d6573; --line: #dde1e8;
+  --accent: #2856b8;
+  --t-scrutinize: #c2410c; --t-glance: #b7791f; --t-deep: #2b8a6e; --t-scout: #7fc4ad;
+  --t-counted: #a9b0bc; --t-untriaged: #a21caf;
+  --add-bg: #e7f5ec; --add-fg: #14532d; --del-bg: #fbeaea; --del-fg: #7f1d1d; --gap: #eef0f4;
+  --warn-bg: #fff4e0; --warn-fg: #7a4a00; --err-bg: #fdecec; --err-fg: #8b1c1c;
+  --sans: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #12151b; --surface: #1a1e26; --fg: #e4e7ee; --muted: #9aa3b2; --line: #2c323d;
+  --accent: #7ea6ff;
+  --t-scrutinize: #f07a3e; --t-glance: #e0a93b; --t-deep: #3fb68f; --t-scout: #2e6f5b;
+  --t-counted: #4a5262; --t-untriaged: #d55be6;
+  --add-bg: #13301f; --add-fg: #b7efc9; --del-bg: #3a1717; --del-fg: #f6c4c4; --gap: #20252f;
+  --warn-bg: #3a2a0c; --warn-fg: #f7d79a; --err-bg: #3d1515; --err-fg: #f8b4b4; color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #12151b; --surface: #1a1e26; --fg: #e4e7ee; --muted: #9aa3b2; --line: #2c323d;
+  --accent: #7ea6ff;
+  --t-scrutinize: #f07a3e; --t-glance: #e0a93b; --t-deep: #3fb68f; --t-scout: #2e6f5b;
+  --t-counted: #4a5262; --t-untriaged: #d55be6;
+  --add-bg: #13301f; --add-fg: #b7efc9; --del-bg: #3a1717; --del-fg: #f6c4c4; --gap: #20252f;
+  --warn-bg: #3a2a0c; --warn-fg: #f7d79a; --err-bg: #3d1515; --err-fg: #f8b4b4; color-scheme: dark }
+
+body { background: var(--bg); color: var(--fg); font: 15px/1.55 var(--sans);
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
+main { max-width: 64rem; margin: 0 auto; padding-block: 2rem 4rem; display: grid; gap: 2rem; }
+main > * { min-width: 0; }
+h1, h2, h3 { text-wrap: balance; margin: 0; line-height: 1.25; }
+h1 { font-size: 1.6rem; font-weight: 600; }
+h2 { font-size: 1.2rem; font-weight: 600; }
+h3 { font-size: 1rem; font-weight: 600; }
+p { margin: 0; }
+a { color: var(--accent); }
+a:focus-visible, button:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+code, .mono { font-family: var(--mono); font-size: 0.86em; }
+.muted { color: var(--muted); }
+.label { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); font-weight: 500; }
+.stack { display: grid; gap: 0.75rem; }
+.row { display: flex; flex-wrap: wrap; gap: 0.5rem 1rem; align-items: baseline; }
+.num { font-variant-numeric: tabular-nums; }
+
+.banner { padding: 0.75rem 1rem; border-radius: 6px; background: var(--warn-bg); color: var(--warn-fg); }
+.banner.err { background: var(--err-bg); color: var(--err-fg); }
+
+header.top { display: grid; gap: 0.75rem; }
+.layers { display: grid; gap: 0.35rem; }
+.layer-line { display: flex; flex-wrap: wrap; gap: 0.25rem 0.75rem; align-items: baseline; font-size: 0.92rem; }
+.layer-line .pr { font-weight: 600; font-variant-numeric: tabular-nums; }
+.fresh { font-size: 0.8rem; }
+.fresh.stale { color: var(--err-fg); font-weight: 600; }
+
+.assessment { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 1rem 1.25rem; display: grid; gap: 0.5rem; }
+
+.ledger { display: grid; gap: 1rem; }
+.bar { display: flex; height: 0.9rem; border-radius: 3px; overflow: hidden; background: var(--gap); }
+.bar span { display: block; height: 100%; min-width: 0; }
+.seg-scrutinize { background: var(--t-scrutinize); }
+.seg-glance { background: var(--t-glance); }
+.seg-deep { background: var(--t-deep); }
+.seg-scout { background: var(--t-scout); }
+.seg-counted { background: var(--t-counted); }
+.seg-untriaged { background: repeating-linear-gradient(45deg, var(--t-untriaged) 0 4px, transparent 4px 7px); }
+.legend { display: flex; flex-wrap: wrap; gap: 0.25rem 1rem; font-size: 0.82rem; color: var(--muted); }
+.legend i { display: inline-block; width: 0.7rem; height: 0.7rem; border-radius: 2px; margin-right: 0.35rem; vertical-align: -1px; }
+
+.decisions ul, .notincode ul { margin: 0; padding-left: 1.2rem; display: grid; gap: 0.35rem; }
+
+section.layer { display: grid; gap: 1rem; border-top: 1px solid var(--line); padding-top: 1.25rem; }
+section.layer > summary { cursor: pointer; list-style: none; display: grid; gap: 0.25rem; }
+section.layer > summary::-webkit-details-marker { display: none; }
+details.layer > summary { cursor: pointer; display: grid; gap: 0.25rem; }
+details.layer { display: grid; gap: 1rem; border-top: 1px solid var(--line); padding-top: 1.25rem; }
+details.layer[open] > summary { margin-bottom: 1rem; }
+.layer-body { display: grid; gap: 1.5rem; }
+
+.card { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 1rem 1.25rem; display: grid; gap: 0.75rem; min-width: 0; }
+.card[data-state="fine"] { opacity: 0.72; }
+.card[data-state="concern"] { border-color: var(--t-scrutinize); }
+.card .claim { font-weight: 600; }
+.card .question { border-left: 3px solid var(--t-scrutinize); padding-left: 0.75rem; }
+.chip { display: inline-block; font-size: 0.74rem; padding: 0.05rem 0.5rem; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); white-space: nowrap; }
+.chip.reason { color: var(--t-scrutinize); border-color: currentColor; }
+.chip.reopened { color: var(--err-fg); background: var(--err-bg); border-color: transparent; }
+.meta { display: grid; grid-template-columns: max-content 1fr; gap: 0.25rem 0.9rem; font-size: 0.86rem; }
+.meta > dt { color: var(--muted); }
+.meta > dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+.states { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+button { font: inherit; font-size: 0.85rem; padding: 0.3rem 0.8rem; border-radius: 6px; border: 1px solid var(--line); background: var(--bg); color: var(--fg); cursor: pointer; }
+button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); font-weight: 600; }
+
+.diff { overflow-x: auto; border: 1px solid var(--line); border-radius: 6px; }
+.diff table { border-collapse: collapse; font: 0.8rem/1.45 var(--mono); width: 100%; }
+.diff td { padding: 0 0.5rem; white-space: pre; vertical-align: top; }
+.diff td.n { color: var(--muted); text-align: right; user-select: none; font-variant-numeric: tabular-nums; width: 1%; }
+.diff tr.add td { background: var(--add-bg); color: var(--add-fg); }
+.diff tr.del td { background: var(--del-bg); color: var(--del-fg); }
+.diff tr.gap td { background: var(--gap); color: var(--muted); text-align: center; }
+.diff .path { font: 0.78rem var(--mono); padding: 0.3rem 0.5rem; border-bottom: 1px solid var(--line); color: var(--muted); display: flex; flex-wrap: wrap; justify-content: space-between; gap: 0.5rem; }
+
+.items { display: grid; gap: 0.5rem; }
+details.item { background: var(--surface); border: 1px solid var(--line); border-radius: 6px; padding: 0.5rem 0.9rem; }
+details.item > summary { cursor: pointer; }
+details.item[open] > summary { margin-bottom: 0.6rem; }
+details.item .stack { gap: 0.5rem; }
+
+.table-wrap { overflow-x: auto; }
+table.counted { border-collapse: collapse; font-size: 0.85rem; width: 100%; }
+table.counted th, table.counted td { text-align: left; padding: 0.3rem 0.6rem; border-bottom: 1px solid var(--line); }
+table.counted td.num, table.counted th.num { text-align: right; }
+
+footer { font-size: 0.85rem; color: var(--muted); display: grid; gap: 0.5rem; }
+textarea#review-text { width: 100%; min-height: 8rem; font: 0.8rem var(--mono); background: var(--surface); color: var(--fg); border: 1px solid var(--line); border-radius: 6px; box-sizing: border-box; }
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+
+<main id="app">
+  <p id="loading" class="muted">Loading the brief and checking its data against the manifest…</p>
+</main>
+
+<script>
+"use strict";
+// Draws a review brief from the data files `brief render` wrote beside it
+// (FORMAT.md). Every check lives in the Go program; this script only draws,
+// and verifies each file against manifest.json before drawing from it. All
+// data is inserted as text, never as HTML.
+(function () {
+  const app = document.getElementById("app");
+  const TIERS = [
+    ["scrutinize", "Scrutinize", "seg-scrutinize"],
+    ["glance", "Glance", "seg-glance"],
+    ["deep", "AI-cleared, reported read by the decider or stack review", "seg-deep"],
+    ["scout", "AI-cleared, reported read by a scout only", "seg-scout"],
+    ["counted", "Counted", "seg-counted"],
+    ["untriaged", "Untriaged", "seg-untriaged"],
+  ];
+
+  function el(tag, attrs, ...kids) {
+    const e = document.createElement(tag);
+    for (const [k, v] of Object.entries(attrs || {})) {
+      if (v === undefined || v === null || v === false) continue;
+      if (k === "class") e.className = v;
+      else if (k === "text") e.textContent = v;
+      else if (k.startsWith("on")) e.addEventListener(k.slice(2), v);
+      else e.setAttribute(k, v === true ? "" : String(v));
+    }
+    for (const k of kids.flat()) {
+      if (k === null || k === undefined || k === false) continue;
+      e.append(typeof k === "string" || typeof k === "number" ? document.createTextNode(String(k)) : k);
+    }
+    return e;
+  }
+  const link = (href, text, cls) => el("a", { href, target: "_blank", rel: "noopener", class: cls }, text);
+  const fmt = (n) => Number(n).toLocaleString("en-US");
+
+  async function sha256(buf) {
+    const d = await crypto.subtle.digest("SHA-256", buf);
+    return Array.from(new Uint8Array(d), (b) => b.toString(16).padStart(2, "0")).join("");
+  }
+
+  // Loads a data file and checks it against the manifest's sha256.
+  async function load(name, manifest) {
+    const want = manifest.files[name];
+    if (!want) throw new Error(name + " is not listed in the manifest");
+    const r = await fetch(name, { cache: "no-store" });
+    if (!r.ok) throw new Error(name + " did not load (HTTP " + r.status + ")");
+    const buf = await r.arrayBuffer();
+    const got = await sha256(buf);
+    if (got !== want) throw new Error(name + " does not match its manifest checksum");
+    return JSON.parse(new TextDecoder().decode(buf));
+  }
+
+  function refuse(msg) {
+    app.replaceChildren(el("div", { id: "integrity-error", class: "banner err", role: "alert" },
+      el("strong", { text: "This brief cannot be shown. " }),
+      msg + ". The ledger is not drawn, because a brief whose data does not add up could hide what it left out. Re-run the brief."));
+  }
+
+  // Review state: a convenience in this browser only, keyed by the stack and
+  // each range's content hash (I8). No agent can read it.
+  const store = {
+    get(k) { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : null; } catch (e) { return null; } },
+    set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) { /* storage blocked: state is not kept */ } },
+    del(k) { try { localStorage.removeItem(k); } catch (e) { /* nothing to remove */ } },
+  };
+
+  async function main() {
+    let manifest;
+    try {
+      const r = await fetch("manifest.json", { cache: "no-store" });
+      if (!r.ok) throw new Error("manifest.json did not load (HTTP " + r.status + ")");
+      manifest = await r.json();
+    } catch (e) { refuse(e.message); return; }
+    let stack; const layers = {};
+    try {
+      stack = await load("stack.json", manifest);
+      for (const l of stack.layers) {
+        const data = await load(l.file, manifest);
+        const want = manifest.sums[String(l.pr)];
+        const s = data.sums;
+        const sum = s.scrutinize + s.glance + s.ai_cleared + s.counted + s.untriaged;
+        if (!want || JSON.stringify(want) !== JSON.stringify(s) || sum !== s.total ||
+            s.ai_cleared !== s.ai_cleared_read_by_decider_or_stack_review + s.ai_cleared_read_by_scout_only) {
+          throw new Error("layer #" + l.pr + "'s line counts do not match the manifest or do not sum to its diff");
+        }
+        layers[l.pr] = data;
+      }
+    } catch (e) { refuse(e.message); return; }
+    draw(stack, layers, manifest);
+  }
+
+  function stateKey(stack, hash) { return "brief:" + stack.stack_key + ":" + hash; }
+  function anchorKey(stack, anchor) { return "brief:" + stack.stack_key + ":anchor:" + anchor; }
+
+  function draw(stack, layers, manifest) {
+    const kids = [];
+    kids.push(drawHeader(stack, layers));
+    if (stack.assessment) kids.push(drawAssessment(stack));
+    kids.push(drawLedger(stack, layers));
+    kids.push(drawDecisions(stack, layers));
+    const untriaged = drawUntriaged(stack, layers, manifest);
+    if (untriaged) kids.push(untriaged);
+    for (const l of stack.layers) kids.push(drawLayer(stack, l, layers[l.pr], manifest));
+    kids.push(drawFooter(stack, layers));
+    app.replaceChildren(...kids);
+    for (const l of stack.layers) checkFreshness(stack, l);
+  }
+
+  function drawHeader(stack, layers) {
+    const lines = stack.layers.map((l, i) => {
+      const pos = stack.layers.length === 1 ? "" : i === 0 ? "bottom" : i === stack.layers.length - 1 ? "top" : "";
+      return el("div", { class: "layer-line" },
+        el("span", { class: "pr" }, link(l.url || ("https://github.com/" + stack.repo + "/pull/" + l.pr), "#" + l.pr)),
+        el("span", { text: l.title || l.branch || "" }),
+        pos ? el("span", { class: "chip", text: pos }) : null,
+        el("code", { class: "muted", text: "head " + l.head.slice(0, 9) }),
+        el("span", { class: "fresh muted", id: "fresh-" + l.pr, text: "checking freshness…" }));
+    });
+    const open = stack.open_cards;
+    return el("header", { class: "top" },
+      el("span", { class: "label", text: "Review brief · " + stack.repo }),
+      el("h1", { text: stack.layers.length > 1 ? "Stack of " + stack.layers.length + " PRs under #" + stack.layers[0].pr : "PR #" + stack.layers[0].pr }),
+      el("p", { class: "row" },
+        el("strong", { text: open + (open === 1 ? " card open" : " cards open") }),
+        el("span", { class: "muted", text: stack.mode === "whole" ? "Merge mode: whole stack. You review each change in the form that reaches " + (stack.trunk || "master") + "." : "Merge mode: per layer. Each layer's own end state is shown." })),
+      el("div", { class: "layers" }, lines),
+      el("p", { id: "stale-banner", class: "banner", hidden: true }));
+  }
+
+  async function checkFreshness(stack, l) {
+    const out = document.getElementById("fresh-" + l.pr);
+    try {
+      const r = await fetch(stack.freshness_api + l.pr, { cache: "no-store" });
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      const pr = await r.json();
+      const head = pr && pr.head && pr.head.sha;
+      if (!head) throw new Error("no head");
+      if (head === l.head) { out.textContent = "current"; return; }
+      out.textContent = "stale: the branch is now at " + head.slice(0, 9);
+      out.classList.add("stale");
+      const b = document.getElementById("stale-banner");
+      b.hidden = false;
+      b.textContent = "A layer's branch has moved since this brief was cut. The cards show the code at the pinned heads, and their links still open that code.";
+    } catch (e) {
+      out.textContent = "freshness unknown";
+      out.title = "The page could not ask GitHub for this PR's head (" + e.message + "), so it cannot say whether the brief is current.";
+    }
+  }
+
+  function refText(r) { return r.path + ":" + r.start + (r.end !== r.start ? "-" + r.end : "") + (r.side === "old" ? " (removed)" : ""); }
+
+  function drawAssessment(stack) {
+    const a = stack.assessment;
+    return el("section", { class: "assessment", "aria-label": "Stack review" },
+      el("span", { class: "label", text: "Stack review" }),
+      el("p", { text: a.text }),
+      el("p", { class: "muted" }, "Cites: ", a.refs.map((r, i) => [i ? ", " : "", el("code", { text: "#" + r.layer + " " + refText(r) })])));
+  }
+
+  function drawLedger(stack, layers) {
+    const rows = stack.layers.map((l) => {
+      const s = layers[l.pr].sums;
+      const v = { scrutinize: s.scrutinize, glance: s.glance, deep: s.ai_cleared_read_by_decider_or_stack_review,
+        scout: s.ai_cleared_read_by_scout_only, counted: s.counted, untriaged: s.untriaged };
+      const bar = el("div", { class: "bar", role: "img", "aria-label": "Layer #" + l.pr + " lines by tier" },
+        TIERS.filter(([k]) => v[k] > 0).map(([k, name, cls]) =>
+          el("span", { class: cls, style: "width:" + (100 * v[k] / Math.max(1, s.total)) + "%", title: name + ": " + fmt(v[k]) + " lines" })));
+      return el("div", { class: "stack" },
+        el("div", { class: "row" }, el("strong", { text: "#" + l.pr }),
+          el("span", { class: "muted num", text: fmt(s.scrutinize) + " scrutinize · " + fmt(s.glance) + " glance · " + fmt(s.ai_cleared) +
+            " AI-cleared · " + fmt(s.counted) + " counted" + (s.untriaged ? " · " + fmt(s.untriaged) + " untriaged" : "") + " = " + fmt(s.total) + " changed lines" })),
+        bar);
+    });
+    return el("section", { id: "ledger", class: "ledger", "data-state": "verified", "aria-label": "Ledger" },
+      el("h2", { text: "Ledger" }),
+      el("p", { class: "muted", text: "Every changed line of each layer is in exactly one tier, and the tiers sum to the layer's diff. \"Reported read\" means the agent reported reading those lines; the program checks the ranges it reported, not that it read them." }),
+      rows,
+      el("div", { class: "legend" }, TIERS.map(([, name, cls]) => el("span", {}, el("i", { class: cls }), name))));
+  }
+
+  function drawDecisions(stack, layers) {
+    const items = stack.decisions || [];
+    return el("section", { class: "decisions stack", "aria-label": "Decisions waiting for you" },
+      el("h2", { text: "Decisions waiting for you" }),
+      items.length ? el("ul", {}, items.map((d) => el("li", {}, el("a", { href: "#card-" + d.layer + "-" + d.card, text: d.text }), el("span", { class: "muted", text: " · #" + d.layer }))))
+        : el("p", { class: "muted", text: "None: no open question, deviation from the spec or overruled board finding was recorded." }));
+  }
+
+  // Diff bodies load per layer, when the layer is opened, and are checked
+  // against the manifest before they are drawn.
+  const diffCache = {};
+  function diffsFor(stack, l, manifest) {
+    if (!diffCache[l.pr]) diffCache[l.pr] = load(l.diffs_file, manifest);
+    return diffCache[l.pr];
+  }
+
+  function diffBlock(stack, l, manifest, r) {
+    const box = el("div", { class: "diff" },
+      el("div", { class: "path" }, el("span", { text: refText(r) }), link(r.link, "Open on GitHub")));
+    if (!r.diff) return box;
+    const body = el("div", { class: "muted", style: "padding:0.4rem 0.6rem", text: "Loading diff…" });
+    box.append(body);
+    diffsFor(stack, l, manifest).then((d) => {
+      const lines = d.ranges[r.hash];
+      if (!lines) { body.textContent = "This range's diff is missing from the data file."; return; }
+      const rows = lines.map(([k, o, n, t]) => k === "@"
+        ? el("tr", { class: "gap" }, el("td", { colspan: 3, text: "⋯" }))
+        : el("tr", { class: k === "+" ? "add" : k === "-" ? "del" : "" },
+            el("td", { class: "n", text: o || "" }), el("td", { class: "n", text: n || "" }), el("td", { text: k + t })));
+      body.replaceWith(el("table", {}, el("tbody", {}, rows)));
+    }, (e) => { body.className = "banner err"; body.textContent = "The diff cannot be shown: " + e.message + "."; });
+    return box;
+  }
+
+  function codeOf(stack, l, manifest, c) {
+    if (c.display === "embed") return c.ranges.map((r) => diffBlock(stack, l, manifest, r));
+    if (c.display === "file") {
+      const r = c.ranges[0];
+      return el("div", { class: "stack" },
+        el("p", {}, "A whole new or rewritten file (" + fmt(c.changed) + " changed lines): ", link(r.link, refText(r))),
+        c.start_from && c.start_from.length ? el("p", { class: "muted" }, "Start from: ", c.start_from.map((s, i) => [i ? ", " : "", el("code", { text: s })])) : null);
+    }
+    return el("div", { class: "stack" },
+      el("p", { class: "muted", text: fmt(c.changed) + " changed lines: read these ranges on GitHub, in this order." }),
+      el("ol", { style: "margin:0;padding-left:1.2rem;display:grid;gap:0.3rem" },
+        c.ranges.map((r) => el("li", {}, link(r.link, refText(r)), r.note ? el("span", { text: " · " + r.note }) : null))));
+  }
+
+  function provenance(c) {
+    const p = c.provenance || {};
+    return [p.proposed_by && "proposed by " + p.proposed_by, p.tiered_by && "tiered by " + p.tiered_by,
+      p.raised_by && "raised by " + p.raised_by, c.floors && c.floors.length && "floor: " + c.floors.join(", ")].filter(Boolean).join(" · ");
+  }
+
+  // A card's state derives from its ranges' content hashes, so regrouping
+  // cards resets nothing and a changed range reopens its card.
+  function cardState(stack, c) {
+    let state = null, reopened = false, surroundings = false;
+    for (const r of c.ranges) {
+      const s = store.get(stateKey(stack, r.hash));
+      if (!s) {
+        const a = store.get(anchorKey(stack, r.anchor));
+        if (a && a.hash !== r.hash) reopened = true;
+        return { state: null, reopened, surroundings };
+      }
+      if (s.context !== r.context) surroundings = true;
+      state = state === null || state === s.state ? s.state : "mixed";
+    }
+    return { state: state === "mixed" ? null : state, reopened, surroundings };
+  }
+
+  function setCardState(stack, c, state) {
+    for (const r of c.ranges) {
+      if (state) {
+        store.set(stateKey(stack, r.hash), { state, context: r.context });
+        store.set(anchorKey(stack, r.anchor), { hash: r.hash });
+      } else {
+        store.del(stateKey(stack, r.hash));
+      }
+    }
+  }
+
+  function drawCard(stack, l, manifest, c, onChange) {
+    const st = cardState(stack, c);
+    const card = el("article", { class: "card", id: "card-" + l.pr + "-" + c.id, "data-state": st.state || "unread" });
+    const buttons = ["unread", "fine", "concern"].map((s) => el("button", {
+      type: "button", "aria-pressed": String((st.state || "unread") === s), text: s === "unread" ? "Unread" : s === "fine" ? "Fine" : "Concern",
+      onclick: (ev) => {
+        setCardState(stack, c, s === "unread" ? null : s);
+        card.dataset.state = s;
+        for (const b of buttons) b.setAttribute("aria-pressed", String(b === ev.currentTarget));
+        onChange();
+      },
+    }));
+    const board = (c.board || []).map((b) => el("div", {}, el("strong", { text: b.agent + " (" + b.status + "): " }), b.said));
+    card.append(
+      el("div", { class: "row" },
+        c.reason_title ? el("span", { class: "chip reason", text: c.reason_title }) : null,
+        st.reopened ? el("span", { class: "chip reopened", text: "changed since you reviewed it" }) : null,
+        st.surroundings ? el("span", { class: "chip", text: "surroundings changed" }) : null,
+        el("span", { class: "muted", style: "font-size:0.8rem", text: provenance(c) })),
+      el("p", { class: "claim", text: c.claim }),
+      c.question ? el("p", { class: "question", text: c.question }) : null,
+      el("div", { class: "stack" }, codeOf(stack, l, manifest, c)),
+      el("dl", { class: "meta" },
+        el("dt", { text: "Commits" }), el("dd", {}, commitsOf(c)),
+        el("dt", { text: "Tests" }), el("dd", {}, c.tests && c.tests.length ? c.tests.map((t, i) => [i ? ", " : "", link(t.link, t.name)]) : el("span", { class: "muted", text: "none named" })),
+        c.weakenings && c.weakenings.length ? [el("dt", { text: "Weakens" }), el("dd", {}, c.weakenings.map((w) => el("div", {}, el("code", { text: w }))))] : null,
+        board.length ? [el("dt", { text: "Board" }), el("dd", {}, board)] : null,
+        c.other_layers && c.other_layers.length ? [el("dt", { text: "Also in" }), el("dd", {}, c.other_layers.map((o, i) => [i ? ", " : "", link(o.link, "#" + o.pr + " " + o.symbol)]))] : null),
+      el("div", { class: "states" }, buttons));
+    return card;
+  }
+
+  function commitsOf(c) {
+    const seen = new Map();
+    for (const r of c.ranges) for (const m of r.commits || []) seen.set(m.sha, m);
+    if (!seen.size) return el("span", { class: "muted", text: "none in the pinned range" });
+    return [...seen.values()].map((m) => el("div", {}, link(m.link, m.short), " ", m.subject || ""));
+  }
+
+  function drawItem(stack, l, manifest, c) {
+    const d = el("details", { class: "item", id: "card-" + l.pr + "-" + c.id },
+      el("summary", {}, el("span", { text: c.claim }), el("span", { class: "muted num", text: " · " + fmt(c.changed) + " lines" })));
+    let filled = false;
+    d.addEventListener("toggle", () => {
+      if (!d.open || filled) return;
+      filled = true;
+      d.append(el("div", { class: "stack" },
+        el("span", { class: "muted", style: "font-size:0.8rem", text: provenance(c) }),
+        codeOf(stack, l, manifest, c),
+        el("dl", { class: "meta" }, el("dt", { text: "Commits" }), el("dd", {}, commitsOf(c)))));
+    });
+    return d;
+  }
+
+  function drawLayer(stack, l, data, manifest) {
+    const cards = data.cards.filter((c) => c.tier === "scrutinize");
+    const glance = data.cards.filter((c) => c.tier === "glance");
+    const cleared = data.cards.filter((c) => c.tier === "ai-cleared");
+    const progress = el("span", { class: "muted" });
+    const update = () => {
+      const closed = cards.filter((c) => { const s = cardState(stack, c); return s.state === "fine" || s.state === "concern"; }).length;
+      progress.textContent = cards.length === 0 ? "No cards in this layer." :
+        closed === cards.length ? "All " + cards.length + " cards closed: this layer has none left." : closed + " of " + cards.length + " cards closed.";
+    };
+    update();
+    const body = el("div", { class: "layer-body" });
+    const sec = el("details", { class: "layer", id: "layer-" + l.pr, open: cards.length > 0 || data.untriaged.length > 0 },
+      el("summary", {},
+        el("h2", {}, "#" + l.pr + " ", el("span", { class: "muted", style: "font-weight:400", text: l.title || "" })),
+        el("span", { class: "row" }, progress,
+          el("span", { class: "muted num", text: fmt(data.live) + " live lines · budget " + fmt(data.budget.cards) + " cards, " + fmt(data.budget.lines) + " lines" }))),
+      body);
+    let filled = false;
+    const fill = () => {
+      if (filled) return; filled = true;
+      if (data.overflow) body.append(el("p", { class: "banner", text: fmt(data.used.cards) + " changes in this layer need you, over its budget of " + fmt(data.budget.cards) + " cards and " + fmt(data.budget.lines) + " lines. Every one is shown: the layer is too large to review in less." }));
+      if (data.confirmation) body.append(el("p", { class: "muted", text: data.confirmation }));
+      body.append(el("div", { class: "stack" }, el("h3", { text: "Scrutinize" }),
+        cards.length ? cards.map((c) => drawCard(stack, l, manifest, c, update)) : el("p", { class: "muted", text: "No change in this layer needs your judgment." })));
+      if (glance.length) body.append(el("div", { class: "stack" }, el("h3", { text: "Glance" }), el("div", { class: "items" }, glance.map((c) => drawItem(stack, l, manifest, c)))));
+      if (cleared.length) body.append(el("div", { class: "stack" }, el("h3", { text: "AI-cleared" }), el("div", { class: "items" }, cleared.map((c) => drawItem(stack, l, manifest, c)))));
+      body.append(drawCounted(data));
+    };
+    if (sec.open) fill(); else sec.addEventListener("toggle", () => { if (sec.open) fill(); });
+    return sec;
+  }
+
+  function drawCounted(data) {
+    const rows = (data.counted || []).map((c) => el("tr", {},
+      el("td", {}, link(c.link, c.path, "mono")),
+      el("td", { text: c.class }),
+      el("td", { class: "num", text: "+" + fmt(c.added) }),
+      el("td", { class: "num", text: "−" + fmt(c.removed) }),
+      el("td", { class: "muted", text: [c.note, c.moved && c.moved.length ? "moved, other end at " + c.moved.join(", ") : ""].filter(Boolean).join("; ") })));
+    return el("details", { class: "item" },
+      el("summary", {}, el("strong", { text: "Counted" }), el("span", { class: "muted", text: " · " + fmt(data.sums.counted) + " lines in " + data.counted.length + " rows: tests, moves, docs, lockfiles, generated code, lines a higher layer replaces" })),
+      (data.counted || []).length === 0 ? el("p", { class: "muted", text: "Nothing in this layer is counted." }) : null,
+      el("div", { class: "table-wrap" }, el("table", { class: "counted" },
+        el("thead", {}, el("tr", {}, el("th", { text: "File" }), el("th", { text: "Class" }), el("th", { class: "num", text: "Added" }), el("th", { class: "num", text: "Removed" }), el("th", { text: "Note" }))),
+        el("tbody", {}, rows))));
+  }
+
+  function drawUntriaged(stack, layers, manifest) {
+    const blocks = [];
+    for (const l of stack.layers) for (const r of layers[l.pr].untriaged) blocks.push(el("div", {}, el("span", { class: "label", text: "#" + l.pr }), diffBlock(stack, l, manifest, r)));
+    if (!blocks.length) return null;
+    return el("section", { class: "stack", id: "untriaged", "aria-label": "Untriaged" },
+      el("h2", { text: "Untriaged" }),
+      el("p", { class: "banner err", text: "The triage left these live lines without a tier. They are shown in full so a triage failure costs you extra reading, never missing reading." }),
+      blocks);
+  }
+
+  function drawFooter(stack, layers) {
+    const out = el("textarea", { id: "review-text", readonly: true, hidden: true, "aria-label": "Review to paste into GitHub" });
+    const note = el("span", { class: "muted" });
+    const copy = el("button", { type: "button", text: "Copy review", onclick: () => {
+      const lines = [];
+      for (const l of stack.layers) for (const c of layers[l.pr].cards) {
+        if (cardState(stack, c).state !== "concern") continue;
+        const r = c.ranges[0];
+        lines.push("- **#" + l.pr + " " + refText(r) + "**: " + c.claim + (c.question ? "\n  " + c.question : "") + "\n  " + r.link);
+      }
+      const text = lines.length ? "Concerns from the review brief:\n\n" + lines.join("\n") : "No card is marked as a concern.";
+      out.value = text; out.hidden = false;
+      const fallback = () => { out.select(); note.textContent = "Select and copy the text above."; };
+      if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(() => { note.textContent = "Copied."; }, fallback);
+      else fallback();
+    } });
+    const nic = stack.not_in_code || [];
+    return el("footer", {},
+      nic.length ? el("section", { class: "notincode stack" }, el("h3", { text: "Not in the code" }),
+        el("p", { text: "Points with no code to show. They are not part of what you approve." }),
+        el("ul", {}, nic.map((n) => el("li", {}, n.text, " ", link(n.link, "where it was raised"))))) : null,
+      el("div", { class: "row" }, copy, note),
+      out,
+      el("p", { text: "Card states (unread, fine, concern) are kept in this browser only, keyed by each range's content: a rebase keeps them and a change to the code reopens the card. No agent can read them. A concern counts once it is a comment on the PR: follow the card's link and leave a line comment, or paste the copied review into a GitHub review." }),
+      el("p", { text: "Format " + stack.format + ". Approval and merge stay on GitHub." }));
+  }
+
+  main().catch((e) => refuse("The page failed while drawing: " + e.message));
+})();
+</script>
