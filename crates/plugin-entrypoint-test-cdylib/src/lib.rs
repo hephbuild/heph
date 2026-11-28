@@ -16,6 +16,9 @@
 //! `plugin_dylib.rs`'s `cdylib_host_paths_cross_abi`; [`OLD_ABI_ENV`] makes
 //! the whole cdylib report ABI 0.21.1, as a plugin from before host paths.
 //!
+//! The fifth, `fault`, panics in the call [`FAULT_ENV`] names, for
+//! `plugin_dylib.rs`'s seam-panic rows.
+//!
 //! The first driver, `tool`: its own `parse` declares the entrypoint (no exec
 //! underneath), and its `run` spawns `/bin/sh -c SCRIPT sh <args>` through the
 //! SDK's foreground spawn with everything the run's `RunOptions` carry. It is
@@ -369,6 +372,72 @@ fn old_abi() -> bool {
     std::env::var_os(OLD_ABI_ENV).is_some()
 }
 
+/// Set in heph's environment to `config`, `parse`, `apply_transitive` or
+/// `run`, the `fault` driver panics in that call, with the payload
+/// `fault: <call> exploded`: `plugin_dylib.rs`'s seam-panic rows. Unset, it
+/// is a driver whose target builds nothing. Read like [`OLD_ABI_ENV`].
+const FAULT_ENV: &str = "HEPH_TEST_PLUGIN_FAULT";
+
+/// Panic when [`FAULT_ENV`] names `call`.
+#[expect(clippy::panic, reason = "the fixture's whole job is to panic here")]
+fn fault_at(call: &str) {
+    if std::env::var(FAULT_ENV).is_ok_and(|v| v == call) {
+        panic!("fault: {call} exploded");
+    }
+}
+
+/// The driver [`FAULT_ENV`] makes panic.
+struct Fault;
+
+#[async_trait::async_trait]
+impl ManagedDriver for Fault {
+    fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
+        fault_at("config");
+        Ok(ConfigResponse {
+            name: "fault".to_string(),
+        })
+    }
+
+    fn schema(&self) -> DriverSchema {
+        DriverSchema::default()
+    }
+
+    async fn parse(
+        &self,
+        req: ParseRequest,
+        _ctoken: &(dyn Cancellable + Send + Sync),
+    ) -> anyhow::Result<ParseResponse> {
+        fault_at("parse");
+        Ok(ParseResponse {
+            target_def: TargetDef {
+                addr: req.target_spec.addr.clone(),
+                hash: b"entrypoint-test-fault".to_vec(),
+                ..Default::default()
+            },
+        })
+    }
+
+    async fn apply_transitive(
+        &self,
+        req: ApplyTransitiveRequest,
+        _ctoken: &(dyn Cancellable + Send + Sync),
+    ) -> anyhow::Result<ApplyTransitiveResponse> {
+        fault_at("apply_transitive");
+        Ok(ApplyTransitiveResponse {
+            target_def: req.target_def,
+        })
+    }
+
+    async fn run<'a, 'io>(
+        &self,
+        _req: ManagedRunRequest<'a, 'io>,
+        _ctoken: &(dyn Cancellable + Send + Sync),
+    ) -> anyhow::Result<ManagedRunResponse> {
+        fault_at("run");
+        Ok(ManagedRunResponse::default())
+    }
+}
+
 /// The `hostpaths` driver's output, relative to the target's package.
 const HOSTPATHS_OUT: &str = "hostpaths.txt";
 
@@ -496,18 +565,24 @@ pub extern "C" fn heph_plugin_create(
     _functions: DynFunctionRegistry,
 ) -> PluginComponents {
     let mut drivers = stabby::vec::Vec::new();
-    let created = create_config_from_bytes(&cfg).and_then(|_| {
-        Ok([
-            named_managed_driver(Tool)?,
-            named_managed_driver(Allot)?,
-            named_managed_driver(Stream)?,
-            named_managed_driver(HostPaths)?,
-        ])
+    let created = create_config_from_bytes(&cfg).map(|cfg| {
+        [
+            named_managed_driver(&cfg.name, Tool),
+            named_managed_driver(&cfg.name, Allot),
+            named_managed_driver(&cfg.name, Stream),
+            named_managed_driver(&cfg.name, HostPaths),
+            named_managed_driver(&cfg.name, Fault),
+        ]
     });
+    // The create entry cannot fail across the ABI; the workspace then fails
+    // on the first target naming a driver that is missing ("unknown driver").
+    // Each driver on its own: a `fault` whose `config()` panics leaves the
+    // others registered.
     match created {
-        Ok(created) => created.into_iter().for_each(|d| drivers.push(d)),
-        // The create entry cannot fail across the ABI; the workspace then fails
-        // on the first target naming the driver ("unknown driver").
+        Ok(created) => created.into_iter().for_each(|d| match d {
+            Ok(d) => drivers.push(d),
+            Err(e) => tracing::error!(error = %format!("{e:#}"), "entrypoint test plugin: create"),
+        }),
         Err(e) => tracing::error!(error = %format!("{e:#}"), "entrypoint test plugin: create"),
     }
     PluginComponents {

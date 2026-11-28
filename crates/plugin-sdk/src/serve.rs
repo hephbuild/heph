@@ -7,6 +7,7 @@
 //! direct calls — no mux, no channels, no task spawn (see ai-docs/PERFORMANCE.md).
 
 use crate::guest::GuestExecutor;
+use crate::seam_panic::{self, SeamLabel};
 use anyhow::{Context, Result};
 use buffa::Message;
 use hcore::hartifactcontent::tar::TarPacker;
@@ -131,9 +132,11 @@ impl<T> Drop for SeamTask<T> {
 /// the `catch_unwind`) and is mapped to an error payload via `mk_err` — never
 /// `resume_unwind`, since this wrapper's poll runs inside the host's
 /// `extern "C"` shim where an unwind would abort the process. A
-/// runtime-shutdown `JoinError` maps to an error the same way.
+/// runtime-shutdown `JoinError` maps to an error the same way. The body is
+/// [`seam_panic::guarded`], so its panic's text reaches the error and not std's
+/// hook on stderr.
 fn spawn_seam<T, F>(
-    plugin: &Arc<str>,
+    label: &Arc<SeamLabel>,
     method: &'static str,
     key: String,
     fut: F,
@@ -144,32 +147,31 @@ where
     T: Send + 'static,
 {
     let task = SeamTask {
-        handle: hcore::hmemoizer::spawn_on_with_cycle_ctx(cdylib_runtime().handle(), fut),
+        handle: hcore::hmemoizer::spawn_on_with_cycle_ctx(
+            cdylib_runtime().handle(),
+            seam_panic::guarded(fut),
+        ),
     };
-    let plugin = Arc::clone(plugin);
+    let label = Arc::clone(label);
     async move {
         match task.await {
             Ok(v) => v,
             Err(e) if e.is_panic() => {
                 let payload = e.into_panic();
-                mk_err(format!(
-                    "plugin {plugin}: {method}({key}) panicked: {}",
-                    panic_text(payload.as_ref())
-                ))
+                mk_err(label.panicked(method, &key, panic_text(payload.as_ref())))
             }
-            Err(_) => mk_err(format!(
-                "plugin {plugin}: {method}({key}) aborted: plugin runtime shut down"
-            )),
+            Err(_) => mk_err(label.aborted(method, &key)),
         }
     }
 }
 
-/// Component name for seam diagnostics: the configured name, or `<unnamed>`
-/// when `config()` failed or returned an empty name.
-fn seam_name(configured: Result<String>) -> Arc<str> {
+/// A component's local name for seam diagnostics: what its `config()`
+/// reports (empty for a component with no local name), `<unnamed>` when
+/// `config()` failed or panicked.
+fn seam_local(configured: Result<Result<String>, String>) -> String {
     match configured {
-        Ok(n) if !n.is_empty() => n.into(),
-        _ => "<unnamed>".into(),
+        Ok(Ok(n)) => n,
+        _ => "<unnamed>".to_owned(),
     }
 }
 
@@ -296,14 +298,32 @@ fn get_error_kind(e: &anyhow::Error) -> pb::get_error::Kind {
 /// Wrap a real provider as an ABI-stable [`hplugin_stabby::abi::DynProvider`] handle
 /// (in-process; the cdylib entry produces the same handle across the boundary).
 pub fn make_dyn_provider(provider: Arc<dyn Provider>) -> hplugin_stabby::abi::DynProvider {
+    provider_handle(None, provider)
+}
+
+/// [`make_dyn_provider`] for a cdylib's provider: `plugin` (its
+/// [`CreateConfig::name`](plugin_abi::convert::CreateConfig::name)) names it
+/// in a seam diagnostic, `plugin `go` panicked in provider `go` during get(…)`.
+pub fn make_dyn_plugin_provider(
+    plugin: &str,
+    provider: Arc<dyn Provider>,
+) -> hplugin_stabby::abi::DynProvider {
+    provider_handle(Some(plugin), provider)
+}
+
+fn provider_handle(
+    plugin: Option<&str>,
+    provider: Arc<dyn Provider>,
+) -> hplugin_stabby::abi::DynProvider {
     // Captured once for seam diagnostics (panic messages) — `config` is static
     // metadata; calling it lazily on the error path would run author code
-    // inside the extern shim's poll. `<unnamed>` rather than an empty string,
-    // so a failing config still yields a readable "plugin <unnamed>: …" error.
-    let name: Arc<str> = seam_name(provider.config(ConfigRequest {}).map(|r| r.name));
+    // inside the extern shim's poll.
+    let local = seam_local(seam_panic::catch(|| {
+        provider.config(ConfigRequest {}).map(|r| r.name)
+    }));
     dynify(stabby::boxed::Box::new(StableProviderImpl {
         provider,
-        name,
+        label: Arc::new(SeamLabel::new(plugin, "provider", &local)),
         cancels: Arc::new(CancelRegistry::default()),
     }))
 }
@@ -312,47 +332,81 @@ pub fn make_dyn_provider(provider: Arc<dyn Provider>) -> hplugin_stabby::abi::Dy
 pub fn make_dyn_managed_driver(
     driver: Arc<dyn ManagedDriver>,
 ) -> hplugin_stabby::abi::DynManagedDriver {
-    let name: Arc<str> = seam_name(driver.config(DriverConfigRequest {}).map(|r| r.name));
+    let local = seam_local(seam_panic::catch(|| {
+        driver.config(DriverConfigRequest {}).map(|r| r.name)
+    }));
+    driver_handle(SeamLabel::new(None, "driver", &local), driver)
+}
+
+/// [`make_dyn_managed_driver`] for a cdylib's driver: `plugin` (its
+/// [`CreateConfig::name`](plugin_abi::convert::CreateConfig::name)) names it
+/// `<plugin>.<local>` in a seam diagnostic.
+pub fn make_dyn_plugin_managed_driver(
+    plugin: &str,
+    driver: Arc<dyn ManagedDriver>,
+) -> hplugin_stabby::abi::DynManagedDriver {
+    let local = seam_local(seam_panic::catch(|| {
+        driver.config(DriverConfigRequest {}).map(|r| r.name)
+    }));
+    driver_handle(SeamLabel::new(Some(plugin), "driver", &local), driver)
+}
+
+fn driver_handle(
+    label: SeamLabel,
+    driver: Arc<dyn ManagedDriver>,
+) -> hplugin_stabby::abi::DynManagedDriver {
     dynify(stabby::boxed::Box::new(StableManagedDriverImpl {
         driver,
-        name,
+        label: Arc::new(label),
         cancels: Arc::new(CancelRegistry::default()),
     }))
 }
 
-/// Export a managed driver for a cdylib's `PluginComponents.drivers`, under the
-/// local name its own `config()` reports — the name the host registers it by
-/// (prefixed with the plugin's). The driver states its name once; a cdylib
-/// never repeats it as a literal beside the driver.
+/// Export a managed driver of `plugin` (its
+/// [`CreateConfig::name`](plugin_abi::convert::CreateConfig::name)) for a
+/// cdylib's `PluginComponents.drivers`, under the local name its own
+/// `config()` reports — the name the host registers it by (prefixed with the
+/// plugin's). The driver states its name once; a cdylib never repeats it as a
+/// literal beside the driver.
 ///
-/// Fails, naming the driver's type, when its `config()` does.
+/// Fails, naming the driver's type, when its `config()` does, or panics: the
+/// panic is caught, so a create entry that reports the error instead of
+/// aborting keeps the process alive.
 pub fn named_managed_driver<D: ManagedDriver + 'static>(
+    plugin: &str,
     driver: D,
 ) -> Result<hplugin_stabby::abi::NamedDriver> {
-    let name = driver
-        .config(DriverConfigRequest {})
-        .with_context(|| format!("config of driver {}", std::any::type_name::<D>()))?
-        .name;
-    Ok(hplugin_stabby::abi::NamedDriver {
-        name: name.as_str().into(),
-        driver: make_dyn_managed_driver(Arc::new(driver)),
-    })
+    let what = || format!("config of driver {}", std::any::type_name::<D>());
+    named_driver(plugin, Arc::new(driver), what)
 }
 
 /// [`named_managed_driver`] for a driver already boxed, as a plugin's shared
 /// driver list hands them out (one list for its cdylib and its in-process
 /// tests).
 pub fn named_boxed_managed_driver(
+    plugin: &str,
     driver: Box<dyn ManagedDriver>,
 ) -> Result<hplugin_stabby::abi::NamedDriver> {
-    let driver: Arc<dyn ManagedDriver> = Arc::from(driver);
-    let name = driver
-        .config(DriverConfigRequest {})
-        .context("config of a boxed driver")?
-        .name;
+    named_driver(plugin, Arc::from(driver), || {
+        "config of a boxed driver".to_owned()
+    })
+}
+
+fn named_driver(
+    plugin: &str,
+    driver: Arc<dyn ManagedDriver>,
+    what: impl Fn() -> String,
+) -> Result<hplugin_stabby::abi::NamedDriver> {
+    let name = match seam_panic::catch(|| driver.config(DriverConfigRequest {})) {
+        Ok(config) => config.with_context(&what)?.name,
+        Err(msg) => {
+            let label = SeamLabel::new(Some(plugin), "driver", "<unnamed>");
+            return Err(anyhow::anyhow!(label.panicked("config", "", &msg))).with_context(what);
+        }
+    };
     Ok(hplugin_stabby::abi::NamedDriver {
         name: name.as_str().into(),
-        driver: make_dyn_managed_driver(driver),
+        driver: driver_handle(SeamLabel::new(Some(plugin), "driver", &name), driver),
     })
 }
 
@@ -584,8 +638,8 @@ impl CancelGuard {
 /// Wraps an author `Provider` as a [`StableProvider`].
 pub struct StableProviderImpl {
     pub provider: Arc<dyn Provider>,
-    /// Provider name, for seam diagnostics (panic/abort error messages).
-    name: Arc<str>,
+    /// What seam diagnostics (panic/abort error messages) call the provider.
+    label: Arc<SeamLabel>,
     cancels: Arc<CancelRegistry>,
 }
 
@@ -827,8 +881,27 @@ fn config_response(name: Result<String>) -> SVec<u8> {
     })
 }
 
-fn provider_config(provider: &Arc<dyn Provider>) -> SVec<u8> {
-    config_response(provider.config(ConfigRequest {}).map(|r| r.name))
+/// [`config_response`] for a `config()` run under [`seam_panic::catch`]. A
+/// panic is caught (this runs in the host's `extern "C"` call, where an unwind
+/// aborts) and logged under `label`, since the response has no field for its
+/// text; the name is absent, as for a failure.
+fn caught_config_response(label: &SeamLabel, name: Result<Result<String>, String>) -> SVec<u8> {
+    config_response(name.unwrap_or_else(|msg| {
+        let msg = label.panicked("config", "", &msg);
+        tracing::error!(
+            plugin = label.plugin().unwrap_or_default(),
+            component = label.component(),
+            "{msg}"
+        );
+        Err(anyhow::anyhow!(msg))
+    }))
+}
+
+fn provider_config(label: &SeamLabel, provider: &Arc<dyn Provider>) -> SVec<u8> {
+    caught_config_response(
+        label,
+        seam_panic::catch(|| provider.config(ConfigRequest {}).map(|r| r.name)),
+    )
 }
 
 fn provider_state_schema(provider: &Arc<dyn Provider>) -> SVec<u8> {
@@ -876,7 +949,7 @@ pub fn make_plugin_functions(
     }
     let handle: DynPluginFunctions = dynify(stabby::boxed::Box::new(StablePluginFunctionsImpl {
         fns: Arc::new(fns),
-        name: seam_name(Ok(plugin.to_string())),
+        plugin: plugin.into(),
     }));
     Ok((named, Some(handle)))
 }
@@ -885,7 +958,7 @@ pub fn make_plugin_functions(
 struct StablePluginFunctionsImpl {
     fns: Arc<HashMap<String, Arc<dyn PluginFn>>>,
     /// Plugin name, for seam diagnostics.
-    name: Arc<str>,
+    plugin: Arc<str>,
 }
 
 // Each call runs through [`spawn_seam`], like `StableProviderImpl::invoke`: the
@@ -905,7 +978,7 @@ impl StablePluginFunctions for StablePluginFunctionsImpl {
                 let Some(func) = self.fns.get(&name).cloned() else {
                     let body = frame_bytes(error_body(format!(
                         "plugin {} has no function {name:?}",
-                        self.name
+                        self.plugin
                     )));
                     return ready(body);
                 };
@@ -919,10 +992,11 @@ impl StablePluginFunctions for StablePluginFunctionsImpl {
                             return ready(body);
                         }
                     };
+                let label = Arc::new(SeamLabel::new(Some(&self.plugin), "function", &name));
                 dynify(stabby::boxed::Box::new(spawn_seam(
-                    &self.name,
+                    &label,
                     "call_function",
-                    name.clone(),
+                    String::new(),
                     plugin_call_function(func, name, req),
                     |m| frame_bytes(error_body(m)),
                 )))
@@ -944,7 +1018,7 @@ pub fn guest_functions(reg: DynFunctionRegistry) -> Arc<dyn FunctionCaller> {
 impl StableMeta for StableProviderImpl {
     extern "C" fn meta(&self, kind: u32) -> SVec<u8> {
         match method_id::<pb::ProviderMethod>(kind) {
-            Some(pb::ProviderMethod::Config) => provider_config(&self.provider),
+            Some(pb::ProviderMethod::Config) => provider_config(&self.label, &self.provider),
             Some(pb::ProviderMethod::StateSchema) => provider_state_schema(&self.provider),
             // Unknown sync metadatum: empty == "none", never a hard failure.
             _ => SVec::new(),
@@ -973,7 +1047,7 @@ impl StableProvider for StableProviderImpl {
                 };
                 let key = req.package.clone().unwrap_or_default();
                 dynify(stabby::boxed::Box::new(spawn_seam(
-                    &self.name,
+                    &self.label,
                     "probe",
                     key,
                     provider_probe(provider, req, Arc::clone(&self.cancels)),
@@ -1003,7 +1077,7 @@ impl StableProvider for StableProviderImpl {
                     };
                 let key = req.prefix.clone().unwrap_or_default();
                 dynify(stabby::boxed::Box::new(spawn_seam(
-                    &self.name,
+                    &self.label,
                     "list_packages",
                     key,
                     provider_list_packages_stream(provider, req),
@@ -1032,7 +1106,7 @@ impl StableProvider for StableProviderImpl {
                 };
                 let key = req.package.clone().unwrap_or_default();
                 dynify(stabby::boxed::Box::new(spawn_seam(
-                    &self.name,
+                    &self.label,
                     "list",
                     key,
                     provider_list_stream(provider, req, exec),
@@ -1079,7 +1153,7 @@ impl StableProvider for StableProviderImpl {
                 };
                 let key = pb_addr_key(req.addr.as_option());
                 dynify(stabby::boxed::Box::new(spawn_seam(
-                    &self.name,
+                    &self.label,
                     "get",
                     key,
                     provider_get(provider, req, exec, Arc::clone(&self.cancels)),
@@ -1148,8 +1222,8 @@ fn err_body(e: &anyhow::Error) -> Body {
 /// Wraps an author `ManagedDriver` as a [`StableManagedDriver`].
 pub struct StableManagedDriverImpl {
     pub driver: Arc<dyn ManagedDriver>,
-    /// Driver name, for seam diagnostics (panic/abort error messages).
-    name: Arc<str>,
+    /// What seam diagnostics (panic/abort error messages) call the driver.
+    label: Arc<SeamLabel>,
     cancels: Arc<CancelRegistry>,
 }
 
@@ -1162,8 +1236,11 @@ impl StableCancel for StableManagedDriverImpl {
     }
 }
 
-fn driver_config(driver: &Arc<dyn ManagedDriver>) -> SVec<u8> {
-    config_response(driver.config(DriverConfigRequest {}).map(|r| r.name))
+fn driver_config(label: &SeamLabel, driver: &Arc<dyn ManagedDriver>) -> SVec<u8> {
+    caught_config_response(
+        label,
+        seam_panic::catch(|| driver.config(DriverConfigRequest {}).map(|r| r.name)),
+    )
 }
 
 fn driver_schema(driver: &Arc<dyn ManagedDriver>) -> SVec<u8> {
@@ -1252,7 +1329,7 @@ async fn driver_apply_transitive(
 impl StableMeta for StableManagedDriverImpl {
     extern "C" fn meta(&self, kind: u32) -> SVec<u8> {
         match method_id::<pb::DriverMethod>(kind) {
-            Some(pb::DriverMethod::Config) => driver_config(&self.driver),
+            Some(pb::DriverMethod::Config) => driver_config(&self.label, &self.driver),
             Some(pb::DriverMethod::Schema) => driver_schema(&self.driver),
             _ => SVec::new(),
         }
@@ -1283,7 +1360,7 @@ impl StableManagedDriver for StableManagedDriverImpl {
                 };
                 let key = pb_addr_key(req.target_spec.as_option().and_then(|t| t.addr.as_option()));
                 dynify(stabby::boxed::Box::new(spawn_seam(
-                    &self.name,
+                    &self.label,
                     "parse",
                     key,
                     driver_parse(driver, req, Arc::clone(&self.cancels)),
@@ -1303,7 +1380,7 @@ impl StableManagedDriver for StableManagedDriverImpl {
                 };
                 let key = pb_addr_key(req.target_def.as_option().and_then(|t| t.addr.as_option()));
                 dynify(stabby::boxed::Box::new(spawn_seam(
-                    &self.name,
+                    &self.label,
                     "apply_transitive",
                     key,
                     driver_apply_transitive(driver, req, Arc::clone(&self.cancels)),
@@ -1340,9 +1417,10 @@ impl StableManagedDriver for StableManagedDriverImpl {
     ) -> DynFuture<'a, DynItemStream> {
         let driver = Arc::clone(&self.driver);
         let cancels = Arc::clone(&self.cancels);
+        let label = Arc::clone(&self.label);
         dynify(stabby::boxed::Box::new(async move {
             match method_id::<pb::DriverMethod>(method) {
-                Some(pb::DriverMethod::Run) => run_bidi(driver, req, cancels).await,
+                Some(pb::DriverMethod::Run) => run_bidi(driver, label, req, cancels).await,
                 _ => unimplemented_item_stream(method),
             }
         }))
@@ -1433,6 +1511,7 @@ fn pull_run_start(req: &DynItemStream) -> Result<RunStartFrame> {
 
 async fn run_bidi(
     driver: Arc<dyn ManagedDriver>,
+    label: Arc<SeamLabel>,
     req: DynItemStream,
     cancels: Arc<CancelRegistry>,
 ) -> DynItemStream {
@@ -1490,7 +1569,21 @@ async fn run_bidi(
         });
         // `tx` carries both the live output frames and the terminal one, in that
         // order, so the host sees the log before the result that ends the stream.
-        let out = run_once(driver, request_id, start, &tx, guard.token()).await;
+        // A panic in the driver's run is that frame's failure, naming the
+        // plugin, the driver and the payload: uncaught, it killed this task and
+        // the host read only "run stream ended without a result".
+        let addr = start.target.addr.to_string();
+        let ran = std::panic::AssertUnwindSafe(seam_panic::guarded(run_once(
+            driver,
+            request_id,
+            start,
+            &tx,
+            guard.token(),
+        )));
+        let out = match futures::FutureExt::catch_unwind(ran).await {
+            Ok(out) => out,
+            Err(p) => run_out_err(label.panicked("run", &addr, panic_text(p.as_ref()))),
+        };
         if let Some(stop_forward) = stop_forward {
             stop_forward.abort();
         }
@@ -3902,7 +3995,7 @@ mod tests {
     /// host registers is that name, carried by the exported `NamedDriver`.
     #[test]
     fn an_exported_driver_is_registered_under_its_config_name() {
-        let nd = named_managed_driver(BareDriver(Some("layer"))).expect("export");
+        let nd = named_managed_driver("p", BareDriver(Some("layer"))).expect("export");
         let mut host = hplugin_stabby::load_stable::decode_drivers([nd]).expect("load");
         assert_eq!(host.len(), 1);
         let (local, drv) = host.remove(0);
@@ -3921,12 +4014,114 @@ mod tests {
     /// the export fails, naming the driver's type so the cdylib's log says which.
     #[test]
     fn exporting_a_driver_whose_config_fails_names_the_driver() {
-        let Err(err) = named_managed_driver(BareDriver(None)) else {
+        let Err(err) = named_managed_driver("p", BareDriver(None)) else {
             panic!("a failing config must fail the export");
         };
         let msg = format!("{err:#}");
         assert!(msg.contains("BareDriver"), "{msg}");
         assert!(msg.contains("config deliberately fails"), "{msg}");
+    }
+
+    /// A driver whose `config()` panics when `.0`, and whose `run` always does.
+    struct PanicDriver(bool);
+
+    #[async_trait::async_trait]
+    impl ManagedDriver for PanicDriver {
+        fn config(
+            &self,
+            _r: hplugin::driver::ConfigRequest,
+        ) -> Result<hplugin::driver::ConfigResponse> {
+            if self.0 {
+                std::panic::panic_any("config exploded");
+            }
+            Ok(hplugin::driver::ConfigResponse { name: "drv".into() })
+        }
+        fn schema(&self) -> hplugin::driver::DriverSchema {
+            hplugin::driver::DriverSchema::default()
+        }
+        async fn parse(
+            &self,
+            _r: hplugin::driver::ParseRequest,
+            _c: &(dyn hcore::hasync::Cancellable + Send + Sync),
+        ) -> Result<hplugin::driver::ParseResponse> {
+            anyhow::bail!("unused")
+        }
+        async fn apply_transitive(
+            &self,
+            _r: hplugin::driver::ApplyTransitiveRequest,
+            _c: &(dyn hcore::hasync::Cancellable + Send + Sync),
+        ) -> Result<hplugin::driver::ApplyTransitiveResponse> {
+            anyhow::bail!("unused")
+        }
+        async fn run<'a, 'io>(
+            &self,
+            _r: ManagedRunRequest<'a, 'io>,
+            _c: &(dyn hcore::hasync::Cancellable + Send + Sync),
+        ) -> Result<hdriver_support::driver_managed::ManagedRunResponse> {
+            std::panic::panic_any("run exploded")
+        }
+    }
+
+    /// A `config()` that panics while a cdylib exports its driver is the
+    /// export's error, never an unwind out of the create entry (an abort).
+    #[test]
+    fn exporting_a_driver_whose_config_panics_is_an_error() {
+        let Err(err) = named_managed_driver("fault", PanicDriver(true)) else {
+            panic!("a panicking config must fail the export");
+        };
+        let msg = format!("{err:#}");
+        assert!(msg.contains("PanicDriver"), "names the type: {msg}");
+        assert!(
+            msg.contains("plugin `fault` panicked in driver"),
+            "names the plugin: {msg}"
+        );
+        assert!(
+            msg.contains("config exploded"),
+            "carries the payload: {msg}"
+        );
+    }
+
+    /// The host's sync `config` call into a driver whose `config()` panics
+    /// answers "no name" instead of unwinding through the extern shim.
+    #[test]
+    fn a_panicking_config_meta_answers_no_name() {
+        use hplugin_stabby::abi::StableMetaDyn;
+        let dynd = make_dyn_plugin_managed_driver("fault", Arc::new(PanicDriver(true)));
+        let bytes = dynd.meta(pb::DriverMethod::Config as u32);
+        let resp = pb::ConfigResponse::decode_from_slice(&bytes[..]).expect("decode");
+        assert_eq!(resp.name, None);
+    }
+
+    /// A `run` that panics ends the run stream with one failure frame naming
+    /// the plugin, the driver as `<plugin>.<local>`, the target and the
+    /// payload — not a stream that ends with no result.
+    #[test]
+    fn a_panicking_run_is_the_terminal_failure_naming_plugin_and_driver() {
+        use hplugin_stabby::abi::{StableItemStreamDyn, StableManagedDriverDyn};
+        let nd = named_managed_driver("fault", PanicDriver(false)).expect("export");
+        let req_stream = item_stream(std::iter::once(start_frame(wire_run(wire_target()))));
+        let resp = futures::executor::block_on(
+            nd.driver
+                .invoke_bidi(pb::DriverMethod::Run as u32, req_stream),
+        );
+        let frames = std::thread::spawn(move || {
+            std::iter::from_fn(|| Some(resp.next()).filter(|b| !b.is_empty()))
+                .map(|b| b.to_vec())
+                .collect::<Vec<_>>()
+        })
+        .join()
+        .expect("drain thread");
+        let last = frames.last().expect("a terminal frame");
+        let frame = pb::RunOutFrame::decode_from_slice(&last[..]).expect("decode RunOutFrame");
+        let Some(pb::run_out_frame::Msg::Failure(f)) = frame.msg else {
+            panic!("expected a failure frame, got {:?}", frame.msg);
+        };
+        let msg = f.message.unwrap_or_default();
+        assert!(
+            msg.starts_with("plugin `fault` panicked in driver `fault.drv` during run(//"),
+            "{msg}"
+        );
+        assert!(msg.ends_with(": run exploded"), "{msg}");
     }
 
     // ---- CancelRegistry: deterministic coverage of the enter/cancel/drop
@@ -4762,8 +4957,11 @@ mod tests {
             }
         }
 
-        let host =
-            StableRemoteProvider::new(make_dyn_provider(Arc::new(Boomer)), "boomer").expect("load");
+        let host = StableRemoteProvider::new(
+            make_dyn_plugin_provider("fault", Arc::new(Boomer)),
+            "boomer",
+        )
+        .expect("load");
         let ct = StdCancellationToken::new();
         let msg = match futures::executor::block_on(host.probe(
             ProbeRequest {
@@ -4775,10 +4973,12 @@ mod tests {
             Ok(_) => panic!("panic must surface as an error, not success"),
             Err(e) => format!("{e:#}"),
         };
-        assert!(msg.contains("plugin boomer"), "names the plugin: {msg}");
-        assert!(msg.contains("probe(p)"), "names method + key: {msg}");
-        assert!(msg.contains("panicked"), "states it panicked: {msg}");
-        assert!(msg.contains("probe exploded"), "carries the payload: {msg}");
+        assert!(
+            msg.contains(
+                "plugin `fault` panicked in provider `fault.boomer` during probe(p): probe exploded"
+            ),
+            "names the plugin, the provider, method + key and the payload: {msg}"
+        );
     }
 
     // Abort-on-drop: dropping the seam wrapper without a cooperative cancel is
@@ -5072,8 +5272,8 @@ mod tests {
             Err(e) => format!("{e:#}"),
         };
         assert!(
-            msg.contains("plugin tokiodrv: parse(//p:t) panicked"),
-            "names the plugin, method and addr: {msg}"
+            msg.contains("driver `tokiodrv` panicked during parse(//p:t)"),
+            "names the driver, method and addr: {msg}"
         );
         assert!(msg.contains("parse exploded"), "carries the payload: {msg}");
     }

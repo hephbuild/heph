@@ -12,7 +12,8 @@
 use hplugin_go::plugingo::{self, Provider};
 use plugin_sdk::stabby::abi::{DynFunctionRegistry, PluginComponents};
 use plugin_sdk::stabby::{
-    create_config_from_bytes, make_dyn_provider, make_plugin_functions, named_boxed_managed_driver,
+    create_config_from_bytes, make_dyn_plugin_provider, make_plugin_functions,
+    named_boxed_managed_driver,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -93,11 +94,11 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
     // point, since the plugin also stops owning the eviction, the locking and
     // the visibility it never had.
     for driver in plugingo::managed_drivers(go_runner) {
-        drivers.push(named_boxed_managed_driver(driver)?);
+        drivers.push(named_boxed_managed_driver(&cfg.name, driver)?);
     }
 
     Ok(PluginComponents {
-        provider: stabby::option::Option::Some(make_dyn_provider(provider)),
+        provider: stabby::option::Option::Some(make_dyn_plugin_provider(&cfg.name, provider)),
         drivers,
         functions,
         function_handle: function_handle.into(),

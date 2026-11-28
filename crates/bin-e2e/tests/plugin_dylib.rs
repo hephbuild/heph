@@ -1503,3 +1503,115 @@ fn cdylib_host_paths_cross_abi() {
         }
     }
 }
+
+/// `heph run //app:t` on a target of the test cdylib's `fault` driver, with
+/// `HEPH_TEST_PLUGIN_FAULT=<call>` making that call panic.
+fn run_fault(call: &str) -> Output {
+    let dist = Dist::locate();
+    let dylib = dist.test_plugin("entrypoint");
+    assert!(dylib.is_file(), "missing {}", dylib.display());
+    let ws = Workspace::new().expect("workspace");
+    let manifest = ws.root().join("test-entrypoint-plugin.json");
+    let sum = sha256_file(&dylib).expect("hash test cdylib");
+    write_manifest(&manifest, "entrypoint_test", &dylib, Some(&sum)).expect("write manifest");
+    ws.config(&format!("{BASE_CONFIG}  - path: {}\n", manifest.display()))
+        .expect("write config");
+    ws.write(
+        "app/BUILD",
+        "target(name = \"t\", driver = \"entrypoint_test.fault\")\n",
+    )
+    .expect("write BUILD");
+    let child = ws
+        .cmd(&dist, &["run", "//app:t"])
+        .env("HEPH_TEST_PLUGIN_FAULT", call)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn heph");
+    wait_output(child, RUN_DEADLINE).expect("heph run")
+}
+
+/// A panic in plugin code at the seam is the call's error: std's panic hook
+/// never writes its raw `thread '…' panicked at <file>:<line>` to stderr.
+fn assert_no_raw_hook_output(out: &Output) {
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("panicked at"),
+        "the panic hook's raw output reached stderr: {}",
+        describe(out)
+    );
+}
+
+/// **STAGE-14 (PR 7): a driver whose `config()` panics while the cdylib is
+/// created exits 1, never 134.** The SDK catches the panic and the export of
+/// that driver fails; the test cdylib reports it and registers the others, so
+/// the target naming `fault` fails as an unknown driver.
+#[test]
+fn cdylib_config_panic_exits_1() {
+    let out = run_fault("config");
+    assert_eq!(out.status.code(), Some(1), "{}", describe(&out));
+    assert_no_raw_hook_output(&out);
+}
+
+/// **STAGE-13: a panic in a cdylib driver's `run` fails the target, naming the
+/// plugin, the driver as `<plugin>.<local>` and the payload**, instead of a
+/// run stream that ends with no result.
+#[test]
+fn cdylib_run_panic_names_plugin_driver_payload() {
+    let out = run_fault("run");
+    assert_eq!(out.status.code(), Some(1), "{}", describe(&out));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(
+            "plugin `entrypoint_test` panicked in driver `entrypoint_test.fault` during run(//app:t)"
+        ),
+        "{}",
+        describe(&out)
+    );
+    assert!(stderr.contains("fault: run exploded"), "{}", describe(&out));
+    assert_no_raw_hook_output(&out);
+}
+
+/// **STAGE-12: a panic in a cdylib driver's `parse` already failed the target;
+/// now it names the driver `<plugin>.<local>` and the raw panic-hook output
+/// stays off stderr.**
+#[test]
+fn cdylib_parse_panic_no_raw_hook_output_driver_named() {
+    let out = run_fault("parse");
+    assert_eq!(out.status.code(), Some(1), "{}", describe(&out));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("panicked in driver `entrypoint_test.fault` during parse(//app:t)"),
+        "{}",
+        describe(&out)
+    );
+    assert!(
+        stderr.contains("fault: parse exploded"),
+        "{}",
+        describe(&out)
+    );
+    assert_no_raw_hook_output(&out);
+}
+
+/// **STAGE-12**, as [`cdylib_parse_panic_no_raw_hook_output_driver_named`] for
+/// `apply_transitive`.
+#[test]
+fn cdylib_apply_transitive_panic_no_raw_hook_output_driver_named() {
+    let out = run_fault("apply_transitive");
+    assert_eq!(out.status.code(), Some(1), "{}", describe(&out));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(
+            "panicked in driver `entrypoint_test.fault` during apply_transitive(//app:t)"
+        ),
+        "{}",
+        describe(&out)
+    );
+    assert!(
+        stderr.contains("fault: apply_transitive exploded"),
+        "{}",
+        describe(&out)
+    );
+    assert_no_raw_hook_output(&out);
+}

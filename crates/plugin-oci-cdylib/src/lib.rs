@@ -21,7 +21,7 @@
 use hplugin_oci::pluginoci;
 use plugin_sdk::stabby::abi::{DynFunctionRegistry, NamedRunner, PluginComponents};
 use plugin_sdk::stabby::{
-    create_config_from_bytes, make_dyn_provider, make_dyn_runner, named_boxed_managed_driver,
+    create_config_from_bytes, make_dyn_plugin_provider, make_dyn_runner, named_boxed_managed_driver,
 };
 use std::sync::Arc;
 
@@ -71,7 +71,7 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
     // Each driver is exported under the local name its `config()` reports.
     let mut drivers = stabby::vec::Vec::new();
     for driver in pluginoci::managed_drivers(home) {
-        drivers.push(named_boxed_managed_driver(driver)?);
+        drivers.push(named_boxed_managed_driver(&plugin, driver)?);
     }
 
     let provider: Arc<dyn hplugin::provider::Provider> =
@@ -89,7 +89,7 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
     });
 
     Ok(PluginComponents {
-        provider: stabby::option::Option::Some(make_dyn_provider(provider)),
+        provider: stabby::option::Option::Some(make_dyn_plugin_provider(&plugin, provider)),
         drivers,
         runners,
         ..PluginComponents::empty()

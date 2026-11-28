@@ -46,10 +46,10 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
     let cfg = create_config_from_bytes(cfg)?;
     let mut drivers = stabby::vec::Vec::new();
     // `home` is where the driver roots the store paths a runner names.
-    drivers.push(named_managed_driver(plugindevenv::Driver::from_options(
-        &cfg.options,
-        &cfg.home,
-    )?)?);
+    drivers.push(named_managed_driver(
+        &cfg.name,
+        plugindevenv::Driver::from_options(&cfg.options, &cfg.home)?,
+    )?);
 
     Ok(PluginComponents {
         drivers,

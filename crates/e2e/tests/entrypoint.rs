@@ -1148,7 +1148,7 @@ fn behind_the_seam(
     driver: impl heph::engine::driver_managed::ManagedDriver + 'static,
 ) -> anyhow::Result<PluginParts> {
     create_seam_plugin(root, name)?;
-    let exported = hplugin_sdk::stabby::named_managed_driver(driver)?;
+    let exported = hplugin_sdk::stabby::named_managed_driver(name, driver)?;
     let mut parts = PluginParts::default();
     for (_local, host) in hplugin_stabby::load_stable::decode_drivers([exported])? {
         parts = parts.with_managed_driver(Box::new(host));

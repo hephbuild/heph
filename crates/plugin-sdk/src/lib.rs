@@ -51,6 +51,8 @@ mod logsink;
 #[cfg(feature = "stabby")]
 mod runnerhost;
 #[cfg(feature = "stabby")]
+mod seam_panic;
+#[cfg(feature = "stabby")]
 mod serve;
 #[cfg(feature = "stabby")]
 mod supervisor;
@@ -71,7 +73,8 @@ pub mod stabby {
     pub use crate::runnerhost::{install_runner_host, make_dyn_runner};
     pub use crate::serve::{
         cdylib_runtime_handle, guest_functions, make_dyn_hook, make_dyn_managed_driver,
-        make_dyn_provider, make_plugin_functions, named_boxed_managed_driver, named_managed_driver,
+        make_dyn_plugin_managed_driver, make_dyn_plugin_provider, make_dyn_provider,
+        make_plugin_functions, named_boxed_managed_driver, named_managed_driver,
     };
     pub use crate::supervisor::{install_supervisor, supervisor_sink};
 
