@@ -339,11 +339,43 @@ pub struct FailureSlots {
     writes: PendingCounter,
     /// One exclusion per slot key, held by a fill, a claim write or a clear
     /// while it changes that slot: a clear or a fill never lands under a
-    /// claim write registered before it. An entry no one holds is pruned on
-    /// the next lookup.
-    slot_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// claim write registered before it. The entries no one holds are pruned
+    /// when the map outgrows twice what it held after the last prune
+    /// (FQ-1): amortized O(1) per lookup, where pruning on every lookup was
+    /// O(n) each and O(n²) over a burst of failures.
+    slot_locks: std::sync::Mutex<SlotLocks>,
     #[cfg(any(test, feature = "test-support"))]
     fills: std::sync::atomic::AtomicU64,
+}
+
+/// The slot exclusions ([`FailureSlots::slot_lock`]): one per key, the ones
+/// no one holds pruned once the map doubles past its last pruned size.
+#[derive(Default)]
+struct SlotLocks {
+    map: HashMap<String, Arc<tokio::sync::Mutex<()>>>,
+    /// The size past which the next lookup prunes.
+    prune_at: usize,
+    /// How many entries the prunes walked, in all.
+    #[cfg(test)]
+    walked: usize,
+}
+
+impl SlotLocks {
+    /// The fewest entries a prune waits for.
+    const PRUNE_MIN: usize = 64;
+
+    /// The exclusion of `key`, pruning first when the map is due.
+    fn get(&mut self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
+        if self.map.len() >= self.prune_at.max(Self::PRUNE_MIN) {
+            #[cfg(test)]
+            {
+                self.walked += self.map.len();
+            }
+            self.map.retain(|_, l| Arc::strong_count(l) > 1);
+            self.prune_at = self.map.len().saturating_mul(2);
+        }
+        Arc::clone(self.map.entry(key.to_owned()).or_default())
+    }
 }
 
 impl fmt::Debug for FailureSlots {
@@ -373,14 +405,12 @@ impl FailureSlots {
         self.writes.wait_drained().await;
     }
 
-    /// The exclusion of the slot `key`, pruning the entries no one holds.
+    /// The exclusion of the slot `key`.
     fn slot_lock(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
-        let mut locks = self
-            .slot_locks
+        self.slot_locks
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        locks.retain(|_, l| Arc::strong_count(l) > 1);
-        Arc::clone(locks.entry(key.to_owned()).or_default())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(key)
     }
 
     /// Whether someone holds or awaits the exclusion of the slot `key`.
@@ -388,6 +418,7 @@ impl FailureSlots {
         self.slot_locks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .map
             .get(key)
             .is_some_and(|l| Arc::strong_count(l) > 1)
     }
@@ -1923,6 +1954,75 @@ mod tests {
         assert!(log.path().is_none());
         assert_eq!(log.tail().expect("tail").text, "producer said");
         assert!(!slots.root().exists(), "no slot, not even the directory");
+    }
+
+    /// FQ-1: thousands of claim writes at distinct keys walk at most twice
+    /// as many exclusion-map entries as there were lookups (a walk per
+    /// lookup was N²/2); once they are done, the next lookup due prunes the
+    /// map back down.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slot_locks_prune_amortized_over_many_claims() {
+        const N: usize = 4_000;
+        let (engine, _dir) = crate::engine::cache_test_support::test_engine();
+        let started = std::time::Instant::now();
+        for i in 0..N {
+            let mut rec = hcore::failure::FailureRecord::new(hplugin::diagnostic::Diagnostic::new(
+                hplugin::diagnostic::Stage::Run,
+                "boom",
+            ));
+            rec.addr = Some(format!("//p:t{i}"));
+            write_claim(
+                Arc::clone(&engine),
+                PendingCounter::default(),
+                ClaimWrite {
+                    culprit: hplugin::error::Culprit::Target(addr(&format!("//p:t{i}"))),
+                    record: Arc::new(rec),
+                    fill_id: None,
+                    packages: Vec::new(),
+                },
+            );
+        }
+        engine.failure_slots.writes_drained().await;
+        let elapsed = started.elapsed();
+        let walked = engine
+            .failure_slots
+            .slot_locks
+            .lock()
+            .expect("locks")
+            .walked;
+        assert!(walked <= 2 * N, "{walked} entries walked for {N} lookups");
+        for i in [0, N - 1] {
+            let a = addr(&format!("//p:t{i}"));
+            assert!(engine.failure_slots.read(&a).is_some(), "{a} landed");
+        }
+        // Nothing is held now: grow the map to its next prune, which
+        // leaves only what that lookup holds.
+        let mut held = Vec::new();
+        let mut i = 0;
+        while held.len() < 4 * N {
+            held.push(engine.failure_slots.slot_lock(&format!("again-{i}")));
+            i += 1;
+            let len = engine
+                .failure_slots
+                .slot_locks
+                .lock()
+                .expect("locks")
+                .map
+                .len();
+            if len == held.len() {
+                break;
+            }
+        }
+        let len = engine
+            .failure_slots
+            .slot_locks
+            .lock()
+            .expect("locks")
+            .map
+            .len();
+        assert_eq!(len, held.len(), "the released exclusions were pruned");
+        // Generous: the quadratic walk took seconds at this size.
+        assert!(elapsed < std::time::Duration::from_secs(60), "{elapsed:?}");
     }
 
     /// H-M1: a material run's memory tail is scrubbed before it is cut to
