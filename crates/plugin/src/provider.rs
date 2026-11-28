@@ -113,7 +113,8 @@ pub struct TargetSpec {
     /// Moving a declaration down a line, or into a helper, must rebuild
     /// nothing (I1). It is skipped by serde, and [`SpecSource`] has no `Hash`,
     /// so a driver that hashes its spec cannot pick it up by accident. A
-    /// cdylib driver receives it too, and nothing checks what it does with it.
+    /// cdylib driver never receives it: the host leaves it out of the
+    /// `ParseRequest` it sends.
     #[serde(skip)]
     pub source: Option<SpecSource>,
 }

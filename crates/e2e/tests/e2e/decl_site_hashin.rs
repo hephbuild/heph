@@ -7,7 +7,9 @@
 //! registered with no fixture fails the test, so a new driver gets one.
 //! The engine is built as `heph` builds one (`commands::bootstrap`), plus the
 //! go, oci, devenv and gh plugins in-process, with the parts their cdylibs
-//! export. A cdylib driver is not checked (E8).
+//! export. A cdylib driver is not run here: it never receives the source,
+//! which the host leaves out of its `ParseRequest`
+//! (`a_driver_parse_request_carries_no_spec_source` in `plugin-stabby`).
 
 use futures::TryStreamExt as _;
 use heph::commands::bootstrap;

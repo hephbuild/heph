@@ -1021,6 +1021,23 @@ fn decode_state_schema(bytes: &[u8]) -> anyhow::Result<Option<StateSchema>> {
     convert::state_schema_from_pb(plugin_abi::decode::<pb::Schema>(bytes)?).map(Some)
 }
 
+/// The `ParseRequest` a cdylib driver gets, **without** `TargetSpec.source`.
+/// Where a target was declared is diagnostics only (I1), and the engine
+/// computes every location itself, so no driver needs it. Leaving it out makes
+/// I1 structural for an out-of-tree driver too: one that keys its def on the
+/// spec's bytes cannot rebuild when a declaration moves, and one cannot carry
+/// the location into its run. Field 7 travels only provider to host.
+fn parse_request_to_pb(req: ParseRequest, driver: &str) -> pb::ParseRequest {
+    let mut spec = convert::target_spec_to_pb(req.target_spec.as_ref());
+    spec.source = Default::default();
+    pb::ParseRequest {
+        request_id: Some(req.request_id),
+        target_spec: spec.into(),
+        driver: Some(driver.to_owned()),
+        ..Default::default()
+    }
+}
+
 /// A driver's `Schema` meta answer.
 fn decode_driver_schema(bytes: &[u8]) -> anyhow::Result<DriverSchema> {
     convert::driver_schema_from_pb(plugin_abi::decode::<pb::Schema>(bytes)?)
@@ -1044,12 +1061,7 @@ impl ManagedDriver for StableRemoteManagedDriver {
         ct: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ParseResponse> {
         let request_id = req.request_id.clone();
-        let pb_req = pb::ParseRequest {
-            request_id: Some(req.request_id),
-            target_spec: convert::target_spec_to_pb(req.target_spec.as_ref()).into(),
-            driver: Some(self.name.clone()),
-            ..Default::default()
-        };
+        let pb_req = parse_request_to_pb(req, &self.name);
         let fut = self
             .inner
             .invoke(pb::DriverMethod::Parse as u32, encode_svec(&pb_req));
@@ -1862,6 +1874,48 @@ mod tests {
         // No file list (a Support input's shape) crosses as absent, not `""`,
         // which the guest refuses as malformed.
         assert_eq!(wire.list_path, None);
+    }
+
+    /// A cdylib driver never sees where its target was declared (I1, E8):
+    /// moving the declaration leaves the bytes it parses unchanged.
+    #[test]
+    fn a_driver_parse_request_carries_no_spec_source() {
+        let at = |line: u32| {
+            let mut spec = hplugin::provider::TargetSpec {
+                addr: hmodel::htaddr::parse_addr("//p:t").expect("addr"),
+                driver: "exec".to_string(),
+                ..Default::default()
+            };
+            let span = hplugin::diagnostic::Span {
+                start_line: line,
+                start_col: 1,
+                end_line: line + 2,
+                end_col: 2,
+            };
+            spec.source = Some(
+                hplugin::provider::SpecSource::checked("p/BUILD".into(), span).expect("source"),
+            );
+            let spec = Arc::new(spec);
+            // The provider-to-host form keeps it: that direction is D3's.
+            assert!(convert::target_spec_to_pb(&spec).source.is_set());
+            parse_request_to_pb(
+                ParseRequest {
+                    request_id: "r".to_string(),
+                    target_spec: spec,
+                },
+                "exec",
+            )
+        };
+        let first = at(3);
+        let wire = first.target_spec.as_option().expect("target_spec");
+        assert!(!wire.source.is_set(), "source left out of the parse request");
+        assert_eq!(wire.driver.as_deref(), Some("exec"));
+        assert_eq!(first.driver.as_deref(), Some("exec"));
+        assert_eq!(
+            encode_svec(&first).as_slice(),
+            encode_svec(&at(9)).as_slice(),
+            "a moved declaration sends the same bytes"
+        );
     }
 
     fn addr() -> pb::Addr {
