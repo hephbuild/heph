@@ -1104,7 +1104,7 @@ fn cdylib_namespace_is_its_manifest_name() {
     for want in [
         "invalid plugin name \"my-go\"",
         "[a-z_][a-z0-9_]*",
-        &manifest.display().to_string(),
+        &format!("plugin manifest {}", in_message(&ws, &manifest)),
     ] {
         assert!(
             stderr.contains(want),
@@ -1279,6 +1279,16 @@ fn assert_contains_all(stderr: &str, wants: &[&str]) {
     }
 }
 
+/// `path` as heph's own messages print it: relative to the workspace when
+/// under it (the error-reporting spec's path rule), as a refusal naming a
+/// fixture in the workspace does. A log line keeps it absolute.
+fn in_message(ws: &Workspace, path: &std::path::Path) -> String {
+    path.strip_prefix(ws.root())
+        .expect("a fixture under the workspace")
+        .display()
+        .to_string()
+}
+
 /// **A plugin that reports no ABI version is refused at load, before anything
 /// in it is called.** Every plugin since 0.17.0 exports
 /// `heph_plugin_abi_semver`; one without it predates the check, and the skew it
@@ -1288,14 +1298,14 @@ fn assert_contains_all(stderr: &str, wants: &[&str]) {
 #[test]
 fn a_plugin_without_an_abi_version_is_refused() {
     let dist = Dist::locate();
-    let (_ws, dylib, stderr) = load_refused_fixture(&dist, &fixture_source(None));
+    let (ws, dylib, stderr) = load_refused_fixture(&dist, &fixture_source(None));
     assert_contains_all(
         &stderr,
         &[
             "was built against a different heph ABI (it reports no ABI version, so it \
              predates 0.17.0; host ",
             "rebuild it against this heph",
-            &dylib.display().to_string(),
+            &format!("plugin {} was built against", in_message(&ws, &dylib)),
         ],
     );
     assert!(
@@ -1309,13 +1319,13 @@ fn a_plugin_without_an_abi_version_is_refused() {
 #[test]
 fn a_plugin_reporting_another_abi_is_refused() {
     let dist = Dist::locate();
-    let (_ws, dylib, stderr) = load_refused_fixture(&dist, &fixture_source(Some("0.1.0")));
+    let (ws, dylib, stderr) = load_refused_fixture(&dist, &fixture_source(Some("0.1.0")));
     assert_contains_all(
         &stderr,
         &[
             "was built against a different heph ABI (plugin 0.1.0; host ",
             "rebuild it against this heph",
-            &dylib.display().to_string(),
+            &format!("plugin {} was built against", in_message(&ws, &dylib)),
         ],
     );
     let (_ws, _, stderr) = load_refused_fixture(&dist, &fixture_source(Some("999.0.0")));
