@@ -304,20 +304,39 @@ impl fmt::Display for ShellNeedsSingleTarget {
 
 impl std::error::Error for ShellNeedsSingleTarget {}
 
+/// A dependency cycle.
+///
+/// `path` follows the dependency edges and ends on the member it starts
+/// from: `[w, x, y, z, w]`, or `[a, a]` for a target that depends on itself.
+/// A path of one member, [`CycleError::through`], is a cycle reported across
+/// the plugin seam, which carries no path: that member is in it, the rest is
+/// not known.
 #[derive(Debug, Clone)]
 pub struct CycleError {
-    pub from: Addr,
-    pub to: Addr,
+    pub path: Vec<Addr>,
+}
+
+impl CycleError {
+    /// A cycle known only to pass through `addr`.
+    pub fn through(addr: Addr) -> Self {
+        Self { path: vec![addr] }
+    }
 }
 
 impl fmt::Display for CycleError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "cyclic dependency detected: {} → {}",
-            self.from.format(),
-            self.to.format()
-        )
+        f.write_str("cyclic dependency detected")?;
+        match self.path.as_slice() {
+            [] => Ok(()),
+            [only] => write!(f, " through {}", only.format()),
+            [first, rest @ ..] => {
+                write!(f, ": {}", first.format())?;
+                for addr in rest {
+                    write!(f, " → {}", addr.format())?;
+                }
+                Ok(())
+            }
+        }
     }
 }
 

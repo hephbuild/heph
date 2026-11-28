@@ -7854,8 +7854,7 @@ mod failure_fate_tests {
     #[test]
     fn failure_fate_cycle_under_input_def_propagates() {
         let cycle: anyhow::Error = CycleError {
-            from: a("//d:t"),
-            to: a("//c:y"),
+            path: vec![a("//c:y"), a("//d:t"), a("//c:y")],
         }
         .into();
         let e = at_input(cycle, "//d:t", "//c:y", "deps");
@@ -10639,13 +10638,9 @@ mod tests {
             Box::pin(async move {
                 match (fails, kind) {
                     (false, _) => Err(GetError::NotFound),
-                    (true, FailKind::Cycle) => Err(GetError::Other(
-                        CycleError {
-                            from: addr.clone(),
-                            to: addr,
-                        }
-                        .into(),
-                    )),
+                    (true, FailKind::Cycle) => {
+                        Err(GetError::Other(CycleError::through(addr).into()))
+                    }
                     (true, FailKind::Typed) => Err(GetError::Other(ProviderBlewUp.into())),
                 }
             })

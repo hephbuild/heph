@@ -984,7 +984,7 @@ mod tests {
         };
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("cyclic dependency detected: //pkg:b → //pkg:a"),
+            msg.contains("cyclic dependency detected: //pkg:a → //pkg:b → //pkg:a"),
             "got: {msg}"
         );
         Ok(())

@@ -218,8 +218,7 @@ impl DepDag {
 
         if f == t {
             return Err(CycleError {
-                from: from.clone(),
-                to: to.clone(),
+                path: vec![from.clone(), to.clone()],
             });
         }
 
@@ -242,13 +241,51 @@ impl DepDag {
         self.pk = pk;
         if !acyclic {
             return Err(CycleError {
-                from: from.clone(),
-                to: to.clone(),
+                path: self.cycle_path(f, t),
             });
         }
 
         self.commit_edge(f, t);
         Ok(())
+    }
+
+    /// The cycle the rejected edge `f → t` would close, from `t`: `t`, the
+    /// committed edges back to `f`, then `t` again. `t` is the member the
+    /// walk reached first, so the path reads from the outside in. A
+    /// breadth-first walk, so it is a shortest one; it runs only on a
+    /// rejection.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "all u32 indices are valid NodeIndex values produced by get_or_insert and bound to the vectors' lengths"
+    )]
+    fn cycle_path(&self, f: u32, t: u32) -> Vec<Addr> {
+        let mut prev: FxHashMap<u32, u32> = FxHashMap::default();
+        let mut queue = std::collections::VecDeque::from([t]);
+        'walk: while let Some(n) = queue.pop_front() {
+            for &w in &self.succ[n as usize] {
+                if w != t && !prev.contains_key(&w) {
+                    prev.insert(w, n);
+                    if w == f {
+                        break 'walk;
+                    }
+                    queue.push_back(w);
+                }
+            }
+        }
+        // `reorder` found `f` from `t`, so the walk reaches it.
+        let mut back = vec![f];
+        let mut cur = f;
+        while let Some(&p) = prev.get(&cur) {
+            back.push(p);
+            cur = p;
+        }
+        let mut path: Vec<Addr> = back
+            .iter()
+            .rev()
+            .map(|&n| self.nodes[n as usize].clone())
+            .collect();
+        path.push(self.nodes[t as usize].clone());
+        path
     }
 
     /// Pearce-Kelly reorder for the back-edge `f → t` (`ord[f] >= ord[t]`)
@@ -2295,12 +2332,14 @@ impl RequestState {
     pub fn track_dep(&self, addr: &Addr) -> Result<(), CycleError> {
         if self.speculative {
             let mut cur = self.crumbs.as_deref();
+            let mut back: Vec<&Addr> = Vec::new();
             while let Some(crumb) = cur {
+                back.push(&crumb.addr);
                 if crumb.addr == *addr {
-                    return Err(CycleError {
-                        from: crumb.addr.clone(),
-                        to: addr.clone(),
-                    });
+                    // `back` runs from the parent up to `addr`'s crumb.
+                    let mut path: Vec<Addr> = back.into_iter().rev().cloned().collect();
+                    path.push(addr.clone());
+                    return Err(CycleError { path });
                 }
                 cur = crumb.parent.as_deref();
             }
@@ -3104,6 +3143,52 @@ mod tests {
         let mut dag = DepDag::new();
         let a = addr("a");
         assert!(dag.add_dep(&a, &a).is_err());
+    }
+
+    fn cycle_names(e: &CycleError) -> Vec<String> {
+        e.path.iter().map(|a| a.name.clone()).collect()
+    }
+
+    /// The rejection names the whole cycle, from the edge's target, along a
+    /// shortest path: the side branch `b → x → y → d` is not taken.
+    #[test]
+    fn dep_dag_cycle_names_the_whole_shortest_path() {
+        let mut dag = DepDag::new();
+        for (f, t) in [
+            ("a", "b"),
+            ("b", "x"),
+            ("x", "y"),
+            ("y", "d"),
+            ("b", "c"),
+            ("c", "d"),
+        ] {
+            assert!(dag.add_dep(&addr(f), &addr(t)).is_ok(), "{f} → {t}");
+        }
+        let Err(e) = dag.add_dep(&addr("d"), &addr("b")) else {
+            panic!("d → b closes a cycle");
+        };
+        assert_eq!(cycle_names(&e), ["b", "c", "d", "b"]);
+        let Err(e) = dag.add_dep(&addr("a"), &addr("a")) else {
+            panic!("a self-cycle");
+        };
+        assert_eq!(cycle_names(&e), ["a", "a"]);
+    }
+
+    /// A speculative state names the cycle from its breadcrumbs.
+    #[test]
+    fn speculative_cycle_names_the_breadcrumbs() -> anyhow::Result<()> {
+        let (_dir, engine) = test_engine()?;
+        let rs = engine
+            .new_state()
+            .speculative()
+            .with_parent(addr("a"))
+            .with_parent(addr("b"))
+            .with_parent(addr("c"));
+        let Err(e) = rs.track_dep(&addr("b")) else {
+            panic!("c → b closes a cycle");
+        };
+        assert_eq!(cycle_names(&e), ["b", "c", "b"]);
+        Ok(())
     }
 
     #[test]
