@@ -574,7 +574,8 @@ impl Fold {
                     .and_then(|a| crate::htaddr::parse_addr(a).ok())
             })
             .collect();
-        let failures = rs.failures();
+        // `skipped_report` reads each culprit, never its path: no path pass.
+        let failures = rs.failures_unpathed();
         let report = rs.skipped_report(failures.iter().map(|f| &**f), addrs.iter().flatten());
         for (h, addr) in held.into_iter().zip(&addrs) {
             let mut entry = h.entry;
@@ -1433,6 +1434,17 @@ mod tests {
         let engine =
             Arc::new(Engine::new(crate::engine::Config::for_tests(dir.path())).expect("engine"));
         let rs = engine.new_state_with_events(false, None);
+        let a = |s: &str| crate::htaddr::parse_addr(s).expect("addr");
+        rs.add_dep_for_test(&a("//p:a"), &a("//p:c")).expect("edge");
+        rs.add_dep_for_test(&a("//p:b"), &a("//p:c")).expect("edge");
+        rs.record_failure(
+            Culprit::Target(a("//p:c")),
+            Arc::new(TargetFailure::new(
+                a("//p:c"),
+                None,
+                anyhow::anyhow!("boom"),
+            )),
+        );
         let (_, mut f) = fold_with(
             vec![
                 ev(0, matched(&["//p:a", "//p:b"], true)),
@@ -1446,6 +1458,9 @@ mod tests {
         assert!(f.held.is_empty(), "{:?}", f.held.len());
         assert!(f.finish(&rs).is_empty(), "each record once");
         assert_eq!(rs.report_passes(), 1);
+        // The culprits it hands `skipped_report` are read without a path
+        // pass: `finish` never reads a failure's own path.
+        assert_eq!(rs.path_passes(), 0);
     }
 
     /// FQ-4: a pure chain of 5000 selected targets, all skipped under the
