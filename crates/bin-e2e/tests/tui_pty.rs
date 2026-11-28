@@ -3186,7 +3186,14 @@ fn mid_run_failure_build(gate: &std::path::Path) -> String {
 /// ends, which under keep-going is late but always right.
 #[test]
 fn tui_no_failure_rows_mid_run_count_right_at_end() {
-    let mut g = Gated::start_build(mid_run_failure_build, "", &[], "//pkg:bad //pkg:gate");
+    // Two targets are selected by an expression: a second positional after
+    // an address is a package matcher, which `heph run` refuses (R18).
+    let mut g = Gated::start_build(
+        mid_run_failure_build,
+        "",
+        &[],
+        "-e '//pkg:bad || //pkg:gate'",
+    );
     let marker = g.gate.with_file_name("bad-ran");
     let started = Instant::now();
     while !marker.exists() {
