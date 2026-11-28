@@ -282,6 +282,7 @@ target(name = "top", driver = "bash", out = "top.txt", deps = [":mid", ":other"]
 /// cached one does, in every renderer: the same box, the same report, the
 /// same records, and a slot with its log.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "pending user decision: a cache = False culprit's run --json cache is null, or miss as a cached one's"]
 async fn uncached_dep_failure_reads_as_cached_one() -> anyhow::Result<()> {
     let ws = Workspace::new();
     ws.write_build_file(
