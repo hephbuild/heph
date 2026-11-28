@@ -667,6 +667,14 @@ a run returns, including the log file a driver hands back at the end of the
 run instead of streaming it. A driver
 cannot opt out of it by writing its own log.
 
+A consumer's recorded failure (its report, `run --json`'s `error`, `inspect
+failure`) is scrubbed of every material acquired for it, from the moment the
+material is held: its credentials' and the credentials their sources need
+(`credentials` on a source), so a source command that fails quoting a token it
+was handed is recorded scrubbed. A refresh a credential helper calls back from
+inside the sandbox has no consumer in hand, and its material does not reach that
+scrub yet.
+
 The scrubber holds back `len(longest secret) - 1` bytes across every read
 boundary, because a token can arrive split across two chunks with nothing wrong
 with either half — and per-chunk scanning would let exactly that one through,

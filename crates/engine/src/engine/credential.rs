@@ -130,16 +130,31 @@ impl HeldCredentials {
 ///
 /// Conflating them is how the guard came to compare a 16-hex resolution key
 /// against `"//auth:x"` and therefore never fire.
+///
+/// `consumer` is the target the whole chain is acquired for, when there is
+/// one: every material acquired along the chain, a source's own credentials
+/// included, is added to that target's failure scrub (U20). It is neither
+/// identity nor guard, so it reaches no cell and no key.
 #[derive(Debug, Clone, Default)]
 pub struct Chain {
     visited: Vec<Addr>,
     keys: Vec<String>,
+    consumer: Option<Addr>,
 }
 
 impl Chain {
-    /// The empty chain: a credential a consumer named directly.
+    /// The empty chain: a credential named directly, with no consumer whose
+    /// failure its material must be scrubbed from.
     pub fn root() -> Self {
         Self::default()
+    }
+
+    /// The empty chain of a credential `consumer` named.
+    pub fn for_consumer(consumer: &Addr) -> Self {
+        Self {
+            consumer: Some(consumer.clone()),
+            ..Self::default()
+        }
     }
 
     /// `Err` when `addr` is already being acquired further up, naming the loop.
@@ -164,6 +179,7 @@ impl Chain {
         Self {
             visited,
             keys: self.keys.clone(),
+            consumer: self.consumer.clone(),
         }
     }
 
@@ -173,11 +189,23 @@ impl Chain {
         Self {
             visited: self.visited.clone(),
             keys,
+            consumer: self.consumer.clone(),
         }
     }
 
     fn keys(&self) -> &[String] {
         &self.keys
+    }
+}
+
+/// Scrub `acquired`'s material out of the failure of the chain's consumer,
+/// if it has one, from the moment it is held: a failure presenting it, or
+/// acquiring anything after it, a later source's command quoting it
+/// included, is recorded scrubbed. Every field, as `present_material`'s
+/// `redact`, whose floor `add_scrub` applies.
+fn scrub_for_consumer(rs: &RequestState, chain: &Chain, acquired: &Acquired) {
+    if let Some(consumer) = &chain.consumer {
+        rs.add_scrub(consumer, acquired.material.secrets().map(str::to_owned));
     }
 }
 
@@ -448,6 +476,7 @@ impl Engine {
         if let Some(a) = held.as_ref()
             && a.material.usable_at(now, a.acquired_at)
         {
+            scrub_for_consumer(rs, chain, a);
             return Ok(a.clone());
         }
 
@@ -455,6 +484,7 @@ impl Engine {
             .walk_and_acquire(rs, addr, def, chain)
             .await
             .with_context(|| format!("acquire credential {addr}"))?;
+        scrub_for_consumer(rs, chain, &acquired);
         *held = Some(acquired.clone());
         Ok(acquired)
     }
@@ -1263,15 +1293,13 @@ impl Engine {
     ) -> anyhow::Result<HeldCredentials> {
         let mut held = Vec::with_capacity(resolved.len());
         for rc in resolved {
+            // The chain names the consumer, so `acquire_declared` scrubs the
+            // consumer's failure of every material it holds, this one's and
+            // its sources' own credentials' (I7, H-M2, U20).
             let acquired = self
-                .acquire_declared(rs, &rc.addr, &rc.def, &Chain::root())
+                .acquire_declared(rs, &rc.addr, &rc.def, &Chain::for_consumer(consumer))
                 .await
                 .with_context(|| format!("{consumer} needs credential {}", rc.addr))?;
-            // The consumer's recorded failure is scrubbed of the material from
-            // the moment it is held (I7, H-M2): a failure presenting it, or
-            // acquiring the next credential, is recorded scrubbed. Every field,
-            // as `present_material`'s `redact`, whose floor `add_scrub` applies.
-            rs.add_scrub(consumer, acquired.material.secrets().map(str::to_owned));
             held.push((rc, acquired));
         }
         Ok(HeldCredentials { held })
