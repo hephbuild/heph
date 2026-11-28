@@ -986,6 +986,31 @@ async fn cycle_under_input_def_is_a_cycle_not_a_failure() -> anyhow::Result<()> 
     Ok(())
 }
 
+/// A cycle beside a second failing input, under keep-going: the two ride
+/// one aggregate, and the cycle is still found in it and propagated as a
+/// cycle, never regrouped into culprits that drop it. The other input's
+/// own failure is still recorded.
+#[tokio::test]
+async fn cycle_beside_a_failing_input_is_still_a_cycle() -> anyhow::Result<()> {
+    let ws = build_ws(&[
+        ("a", &t("root", r#"deps = ["//b:x", "//d:bad"]"#)),
+        ("b", &t("x", r#"deps = ["//c:y"]"#)),
+        ("c", &t("y", r#"deps = ["//b:x"]"#)),
+        (
+            "d",
+            r#"target(name = "bad", driver = "bash", run = "exit 3", out = "o.txt")"#,
+        ),
+    ]);
+    let r = run(&ws.engine, "//a:root").await;
+    let err = r.err.as_ref().expect("failed");
+    assert!(
+        hcore::hmemoizer::find::<hplugin::error::CycleError>(err).is_some(),
+        "the cycle is found: {err:#}"
+    );
+    r.assert_blames("//d:bad");
+    Ok(())
+}
+
 /// RUN-22: Ctrl-C while `//a:slowtop`'s two deps run is a cancellation:
 /// the request ends cancelled and nothing is recorded, least of all
 /// `//a:slowtop` blamed for itself.

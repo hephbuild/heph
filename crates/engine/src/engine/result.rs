@@ -2777,7 +2777,11 @@ fn failure_fate<'a>(addr: &Addr, e: &'a anyhow::Error) -> FailureFate<'a> {
     // of the cycle, not a single target's own work failing. Propagate unchanged
     // so the cycle surfaces directly to the caller (and never gets masked behind
     // an `UpstreamFailed` marker or duplicated into the failure registry).
-    if downcast_chain_ref::<CycleError>(e).is_some() {
+    // Looked for through the walker, so a cycle that rides one member of an
+    // aggregate (keep-going, beside another failing input) is found too:
+    // regrouping that aggregate into culprits would record the cycle as a
+    // target's failure, or drop it.
+    if hcore::hmemoizer::find::<CycleError>(e).is_some() {
         return FailureFate::Propagate;
     }
 
@@ -2912,7 +2916,9 @@ fn failure_slot_out(e: &anyhow::Error) -> Option<std::path::PathBuf> {
 /// instead, so this is purely about the value returned to direct callers. No-op
 /// for inner frames and for non-marker errors (cancellation, cycles, …).
 fn surface_top(is_top: bool, rs: &RequestState, e: anyhow::Error) -> anyhow::Error {
-    if !is_top {
+    // A cycle in an aggregate is propagated as itself (see `failure_fate`),
+    // so it is not a marker to swap for a recorded failure either.
+    if !is_top || hcore::hmemoizer::find::<CycleError>(&e).is_some() {
         return e;
     }
     let is_marker = downcast_chain_ref::<UpstreamFailed>(&e).is_some()
@@ -7540,6 +7546,31 @@ mod failure_fate_tests {
             matches!(failure_fate(&a("//c:y"), &e), FailureFate::Propagate),
             "{e:#}"
         );
+    }
+
+    /// A cycle in one member of an aggregate, shared or not, beside another
+    /// failing input: still a cycle, never regrouped into culprits.
+    #[test]
+    fn failure_fate_cycle_in_an_aggregate_propagates() {
+        for share in [false, true] {
+            let cycle: anyhow::Error = CycleError {
+                from: a("//d:t"),
+                to: a("//c:y"),
+            }
+            .into();
+            let cycle = at_input(cycle, "//d:t", "//c:y", "deps");
+            let other = at_input(not_found("//e:missing"), "//e:missing", "//c:y", "deps");
+            let (cycle, other) = if share {
+                (shared(cycle).0, shared(other).0)
+            } else {
+                (cycle, other)
+            };
+            let e: anyhow::Error = MultiError(vec![other, cycle]).into();
+            assert!(
+                matches!(failure_fate(&a("//c:y"), &e), FailureFate::Propagate),
+                "shared {share}: {e:#}"
+            );
+        }
     }
 
     /// A marker is collateral: its root, never this target, never recorded.
