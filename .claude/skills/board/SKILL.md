@@ -89,7 +89,31 @@ Prior verdicts: <from the spec's board section, for round 2+>
 Your lane: <per agent — what it owns, and what belongs to another agent at this stage>
 Your question: <per agent — the specific thing this agent should judge>
 Answer with: verdict, then findings ranked by severity, each with file:line. At most ~600 words.
+  At review, then a `surface` block (below).
 ```
+
+### The surface block (review only)
+
+A review brief (`/review-brief`) shows the user the changes that need their judgment. At review,
+each agent's answer ends with a `surface` block: what the user should see that is **not** a
+defect. A defect stays a finding. Add this to every review brief:
+
+```
+Then a JSON code block headed `surface`: {"items": [...], "vouched": [...]}.
+  items: what the user should see before merging that is not a defect: a judgment call, an
+    open or overruled finding, a decision the code makes. Each {"claim": one sentence on what the
+    code does, "reason": one of cache-key, stored-format, concurrency, engine-flow, compatibility,
+    security, hermeticity, unsafe-seam, platform, decision, low-confidence, weakened-test,
+    "question": answerable with yes, no or a choice, "tier": scrutinize | glance | ai-cleared
+    (your call; the brief cannot put it lower), "status": fixed | overruled | open when it was a
+    finding, "ranges": [{"path", "start", "end"}] on the head side ("side": "old" for removed
+    lines)}. Every item has a range: a point with no code to show is not an item.
+  vouched: [{"path", "start", "end"}] you read and are willing to vouch for.
+  Empty lists are a valid answer.
+```
+
+Only the final round on the SHA that is pushed counts: an item from an earlier round is about code
+later fixes changed.
 
 ### The pack (review only)
 
@@ -186,3 +210,12 @@ Append to the spec's `## Board` section (create it if missing), one line per age
 
 A BLOCKER, NOT HERMETIC or BREAKING is fixed or overruled with a stated reason before commit; a
 RETHINK or DON'T BUILD goes to the user. Report the verdicts to the user as a table.
+
+At review, once the round on the pushed SHA is final, write the agents' `surface` blocks to
+`~/.cache/heph-briefs/surface/pr-<PR>-<git rev-parse --short=9 <head>>.json`, the file
+`/review-brief` reads. It is `heph-review-brief-surface/1` (fields in
+`.claude/skills/review-brief/FORMAT.md`): every agent's items in one `items` list, each with
+`"id": "<agent>-<PR>-<n>"`, `"agent"`, `"layer": <PR>` added; and each agent's vouched ranges as
+`{"agent": "<agent>", "layer": <PR>, "ranges": [...]}` in `vouched`. Write it with Write, not a
+script. A later round on a new head writes a new file; the brief ignores files whose head is not
+the pinned one.

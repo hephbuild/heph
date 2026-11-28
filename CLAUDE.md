@@ -406,6 +406,20 @@ every field, a new one included, to that.
 
 **Don't run it locally by default — let CI do it.** It exists to catch regressions across a baseline (N-1) and a candidate (N) build under controlled, repeatable conditions; a single local run competes with everything else on the machine and its noise floor makes one-off numbers unreliable next to CI's comparison. Run it locally only when absolutely necessary — reproducing a CI-reported regression, or developing the harness itself — or when explicitly asked to.
 
+### Review briefs
+
+`.claude/skills/review-brief/SKILL.md`. `/review-brief <pr>` cuts one page per PR or stack that
+shows the user only the changes that need their judgment, each with its diff, its commits and
+the question to answer, and counts every other changed line. A Go program
+(`.claude/skills/review-brief/brief/`, `go test ./...` there) pins, classifies and renders;
+Sonnet scouts, one Opus decider and the `stack-review` agent judge. For now it is published as a
+private Claude artifact, republished to the same URL each round.
+
+The one thing to know going in: the brief is **advisory** and gates nothing (I10). It runs in a
+fresh session, never the one that wrote the code, and the program refuses a triage that leaves a
+live line untiered or puts protected code below Glance. The rules files under `.claude/review/`
+(`protected-paths`, `tripwires`, `classes`) change only through a PR.
+
 ## Workflow
 
 **Never run the whole test suite locally — not `tst`, not `cargo test --workspace`, whatever the change.** CI runs it on every push (on all three platforms); a local run only delays the push. That holds for engine-core, trait and caching changes too: a wide break shows up in CI.
@@ -495,6 +509,8 @@ A change goes through three phases, and **each phase is its own session**:
 | Implementation | `/goal implement <spec-url>` | an open PR whose spec tests pass |
 | Follow-up | `/goal get PR #<n> green and through review` | a merged PR |
 
+A PR or stack over about 1,000 lines gets a review brief (`/review-brief <bottom PR>`, in its own session) before review is requested.
+
 The next session starts from the hand-off's link, never from the conversation that produced it. `/handoff` closes a phase: it brings the spec or the PR description up to date and prints the next session's prompt. If a session has to carry on past a phase boundary, `/compact` there instead of waiting for auto-compact.
 
 **The spec is the contract.** A plan that only describes the change leaves the implementation session to work the details out again, and gives the reviewer nothing to check the code against. The spec has these sections:
@@ -524,7 +540,7 @@ Brief a fresh agent with the diff range, the finding or the user's words, and th
 
 **Independent changes run in parallel.** One design session can produce several specs. Each gets its own implementation session in its own workspace or worktree, branched off `master`. Stack only when a change can't compile or be reviewed without the one below it (see "Stacked PRs"). Wall-clock time is then the slowest PR, not the sum of all of them.
 
-**Match the model to the job.** Lookups and triage don't need the strongest model: `Explore`, `/ci-triage` (which runs forked on Sonnet), and the `product-vision` and `feature-quality` consults at both stages use `model: "sonnet"`. Every board agent's model is pinned in its frontmatter (`.claude/agents/`) and none inherits the session's: `code-quality` and `hermeticity` run on Opus, `feature-quality`, `product-vision`, `compatibility` and `perf-measurement` on Sonnet. Only the implementation itself follows the session model.
+**Match the model to the job.** Lookups and triage don't need the strongest model: `Explore`, `/ci-triage` (which runs forked on Sonnet), and the `product-vision` and `feature-quality` consults at both stages use `model: "sonnet"`. Every board agent's model is pinned in its frontmatter (`.claude/agents/`) and none inherits the session's: `code-quality` and `hermeticity` run on Opus, `feature-quality`, `product-vision`, `compatibility`, `perf-measurement` and `stack-review` on Sonnet. A review brief's scouts run on Sonnet and its one decider on Opus at `high`. Only the implementation itself follows the session model.
 
 **Match the effort to the phase, too.** `/effort xhigh` saved during design carries into implementation, and thinking is re-sent on every later call: one implementation session carried ~210k thinking tokens, ~35M input. Use `xhigh` for design and for review agents, `high` (or lower) for implementation, and raise it for the stretch that needs it — concurrency, locking, cache keys. The same goes for the model: a dependency upgrade, its CI fixes and an upstream bug report ran on Fable at `xhigh` for 302 calls (2026-10-18), ~74s of generation per call and six hours of model time against one hour of tools.
 
@@ -571,6 +587,7 @@ Mechanical triggers — if the change touches it, consult. Not a judgment call.
 | `hermeticity` | New/changed `Driver` or `Provider`; anything feeding the input hash, def hash, or cache key; sandbox input/output declaration | **Design** and **review** |
 | `compatibility` | `proto/`; `crates/plugin-abi` or `ABI_SEMVER`; cache serialization / on-disk or remote-cache format; Starlark builtins or rule signatures; CLI command/flag/exit-code/`--json` shape | **Design** (before the format is fixed) and **review** |
 | `perf-measurement` | Change lands on a hot path (result/spec resolution, hashing, cache read, provider walk); a perf claim needs proof; something feels slower | **After** implementation, before commit |
+| `stack-review` (Sonnet) | A PR or stack ready for human review: run by `/review-brief`, not by `/board` | **Before human review**, after the implementation board |
 
 ### Rules
 
