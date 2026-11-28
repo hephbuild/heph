@@ -475,12 +475,25 @@ impl Fold {
             vec![entry]
         } else if !self.matched_complete {
             // Not matched (yet): a dependency, or a selected target the walk
-            // has not reported.
+            // has not reported. Its first end is kept, unless a later one
+            // makes it a culprit: a target that built and was then blamed
+            // must still get its culprit record, which only `root` earns.
             self.seq += 1;
             let seq = self.seq;
-            self.early
-                .entry(addr.to_owned())
-                .or_insert(Early::Record { seq, entry });
+            match self.early.entry(addr.to_owned()) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(Early::Record { seq, entry });
+                }
+                std::collections::hash_map::Entry::Occupied(mut slot) => {
+                    let earlier_no_culprit = matches!(
+                        slot.get(),
+                        Early::Record { entry: earlier, .. } if earlier.root.is_none()
+                    );
+                    if earlier_no_culprit && entry.root.is_some() {
+                        slot.insert(Early::Record { seq, entry });
+                    }
+                }
+            }
             Vec::new()
         } else if entry.root.is_some() {
             self.done.insert(addr.to_owned());
@@ -1321,6 +1334,34 @@ mod tests {
         let rs = engine.new_state_with_events(false, None);
         assert!(Fold::default().finish(&rs).is_empty());
         assert_eq!(rs.report_passes(), 0, "a green run pays for no pass");
+    }
+
+    /// A dependency that built, then was blamed when it later ended failed,
+    /// all before the matched set completed: its culprit record is written
+    /// at the end of matching, not lost behind its first, successful end.
+    #[test]
+    fn early_culprit_after_an_ok_end() {
+        let known = Known::default().target("//p:c", "c broke");
+        let (entries, f) = fold_with(
+            vec![
+                ev(0, matched(&[], false)),
+                ev(1, start("//p:c")),
+                ev(2, end("//p:c", None, None)),
+                ev(3, start("//p:c")),
+                ev(4, end("//p:c", Some("c broke"), None)),
+                ev(5, matched(&["//p:top"], false)),
+                ev(6, end("//p:top", Some("dependency failed"), Some("//p:c"))),
+                ev(7, matched(&[], true)),
+            ],
+            &known,
+        );
+        assert_eq!(
+            addrs(&entries),
+            [(Some("//p:c"), Outcome::Failed, false)],
+            "{entries:?}"
+        );
+        assert_eq!(entries[0].root.as_deref(), Some("//p:c"));
+        assert_eq!(f.held.len(), 1, "the selected target, skipped");
     }
 
     /// A selected target built as a dependency before the walk reports it
