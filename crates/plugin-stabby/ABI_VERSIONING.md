@@ -249,7 +249,11 @@ skipped in silence.
   holds a control character, or a span that is incomplete, 0-based or
   reversed, is dropped and the spec kept. Both skews degrade to diagnostics
   without a location: an older provider sends none, a newer provider's is
-  skipped by an older host. No plugin must be rebuilt.
+  skipped by an older host. No plugin must be rebuilt. The field travels
+  from a provider to the host only: the host clears it from the spec in a
+  parse request to a cdylib driver. In source, it is a break for an
+  out-of-tree plugin crate: a `TargetSpec { .. }` literal needs `source`
+  (or `..Default::default()`), and `MissingDep` gained `at`.
 - **0.21.4** (additive patch) — diagnostics on errors.
   `Error.diagnostic` (3), `GetError.diagnostic` (3) and `RunFailure.diagnostic`
   (6) carry a `Diagnostic` (common.proto: stage, message, location, snippet,
