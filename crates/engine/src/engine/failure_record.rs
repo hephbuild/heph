@@ -164,7 +164,10 @@ pub(crate) fn compact(
     rec.streamed = RunStreamed::on(e);
     rec.failed_in = if rec.exit.is_some() || rec.timed_out.is_some() {
         FailedIn::Exec
-    } else if frozen.is_some() || downcast_chain_ref::<RunStreamed>(e).is_some() {
+    } else if frozen.is_some()
+        || downcast_chain_ref::<RunStreamed>(e).is_some()
+        || downcast_chain_ref::<FailureSlot>(e).is_some_and(|s| s.after_run)
+    {
         FailedIn::AfterRun
     } else {
         FailedIn::BeforeRun

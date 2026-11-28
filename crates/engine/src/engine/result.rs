@@ -6226,7 +6226,8 @@ impl Engine {
                                 .is_some_and(|d| d.managed);
                             let slot = crate::engine::failure_slot::FailureSlot::default()
                                 .with_sandbox(managed.then_some(fate))
-                                .with_streamed(streamed);
+                                .with_streamed(streamed)
+                                .after_run();
                             return Err(err.context(slot));
                         }
                     };
@@ -19334,6 +19335,56 @@ mod tests {
             let detail = crate::engine::event::ErrorDetail::from_error(&err);
             assert_eq!(detail.streamed, streamed, "{msg}");
             assert!(!detail.kept, "no slot on a store failure: {msg}");
+        }
+        Ok(())
+    }
+
+    /// U6, D6.1c "execution went fine, then a later step failed": a run that
+    /// streamed, then a cache store that refused its artifacts (`dup`), or a
+    /// declared host path that does not exist (`badout`, the missing-output
+    /// case). The wrapper is told of no failed process, so it prints no
+    /// one-liner; the record is a streamed one past the run, which every
+    /// renderer boxes (`told_streamed` false) with the pointer in place of
+    /// the log (`log_rows_follow_the_slot`, `ci_view_told_streamed_no_box_but_counted`,
+    /// `gather_drops_told_streamed_keeps_after_run`).
+    #[tokio::test]
+    async fn streamed_then_cache_store_fails_box_without_log() -> anyhow::Result<()> {
+        for flag in ["dup", "badout"] {
+            let mut spec = leaf_spec("//pkg:t", false)?;
+            spec.config
+                .insert(flag.to_string(), hcore::htvalue::Value::Bool(true));
+            let h = terminal_harness(vec![spec])?;
+            let rs = h.engine.new_state();
+            let addr = hmodel::htaddr::parse_addr("//pkg:t")?;
+            let heard: SArc<parking_lot::Mutex<Option<crate::engine::RunEnd>>> = SArc::default();
+            let wrapper: InteractiveWrapper = SArc::new({
+                let heard = SArc::clone(&heard);
+                move |inner: InteractiveInner| {
+                    let heard = SArc::clone(&heard);
+                    Box::pin(async move {
+                        let end = inner(None, None, None, None).await?;
+                        *heard.lock() = Some(end);
+                        Ok(TerminalUse { streamed: true })
+                    })
+                }
+            });
+            let opts = ResultOptions {
+                interactive: Some(wrapper),
+                ..Default::default()
+            };
+            Arc::clone(&h.engine)
+                .result_addr(rs.clone(), &addr, OutputMatcher::All, &opts)
+                .await
+                .err()
+                .expect("a later step fails");
+
+            let end = heard.lock().take().expect("the wrapper ran the target");
+            assert_eq!(end.exec_failure, None, "{flag}: the process went fine");
+            let rec = &rs.get_failure(&addr).expect("failure recorded").record;
+            assert!(rec.streamed, "{flag}: the run streamed");
+            assert_eq!(rec.failed_in, hcore::failure::FailedIn::AfterRun, "{flag}");
+            assert!(!rec.told_streamed(), "{flag}: its box is printed");
+            assert!(!rec.cancelled, "{flag}");
         }
         Ok(())
     }
