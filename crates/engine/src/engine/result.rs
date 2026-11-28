@@ -2382,7 +2382,7 @@ fn record_culprit(
             Some(c) => rs.scrub_for(&[addr, &entry, c]),
             None => rs.scrub_for(&[addr, &entry]),
         };
-        let mut record = crate::engine::failure_record::compact(&e, &culprit, &entry, &scrub, None);
+        let mut record = crate::engine::failure_record::compact(&e, &culprit, &entry, &scrub);
         record.path = path.iter().map(Addr::format).collect();
         Arc::new(record)
     });
