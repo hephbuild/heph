@@ -21,9 +21,12 @@
 //!
 //! **Serialized** (`serde`) for the failure record ([`crate::failure`]) that
 //! rides the event wire and the failure slot's `diagnostic.json`. Every field
-//! but `stage` and `message` may be absent, so a sparse record decodes; a
-//! location decodes through [`SourceLoc::checked`], so a file that names an
-//! absolute or climbing path is refused there too.
+//! but `stage` and `message` may be absent, so a sparse record decodes. The
+//! decode is forward-compatible, since a slot outlives the heph that wrote
+//! it: an unknown stage reads as [`Stage::Run`], an unknown hint kind as
+//! [`HintKind::Other`]. A diagnostic's location goes through
+//! [`SourceLoc::checked`], and one that names an absolute or climbing path is
+//! dropped, never the diagnostic around it.
 
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -134,6 +137,30 @@ impl TryFrom<RawSourceLoc> for SourceLoc {
     }
 }
 
+/// [`Diagnostic::stage`] decoded leniently: an unknown name is
+/// [`Stage::Run`]. Only a value that is not a string fails the decode.
+fn lenient_stage<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Stage, D::Error> {
+    let name = <std::borrow::Cow<'de, str>>::deserialize(d)?;
+    Ok(Stage::from_name(&name).unwrap_or(Stage::Run))
+}
+
+/// [`Diagnostic::location`] decoded leniently: a location of the wrong shape,
+/// or one [`SourceLoc::checked`] refuses, is `None`.
+fn lenient_location<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<SourceLoc>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Loose {
+        Loc(RawSourceLoc),
+        Other(serde::de::IgnoredAny),
+    }
+    Ok(match Option::<Loose>::deserialize(d)? {
+        Some(Loose::Loc(raw)) => SourceLoc::try_from(raw).ok(),
+        Some(Loose::Other(_)) | None => None,
+    })
+}
+
 impl SourceLoc {
     /// `file`, `line`, `col` as a location, or why not: an empty, absolute or
     /// `..`-climbing file, or one over [`FILE_CAP`].
@@ -236,13 +263,22 @@ impl Hint {
 /// what to do. See the module docs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Diagnostic {
+    /// A stage this heph does not know (a newer peer's, or a slot's
+    /// `diagnostic.json` from a newer heph) decodes as [`Stage::Run`].
+    #[serde(deserialize_with = "lenient_stage")]
     pub stage: Stage,
     /// The target it is about (`//pkg:name`); `None` for a file culprit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub addr: Option<String>,
     /// One sentence, in the user's words.
     pub message: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// A location [`SourceLoc::checked`] refuses, or one that is not a
+    /// location at all, decodes as `None`: the rest of the diagnostic is kept.
+    #[serde(
+        default,
+        deserialize_with = "lenient_location",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub location: Option<SourceLoc>,
     /// Source lines around `location`, as the producer framed them.
     #[serde(default, skip_serializing_if = "Option::is_none")]

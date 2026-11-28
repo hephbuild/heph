@@ -268,8 +268,10 @@ mod tests {
         assert_eq!(back, full);
     }
 
-    /// A newer peer's hint kind is `Other`; a location that climbs out of the
-    /// workspace is refused at decode, as at the plugin seam.
+    /// A newer peer's hint kind is `Other`. A location that climbs out of the
+    /// workspace is refused at decode, as at the plugin seam, but only the
+    /// location goes: the diagnostic around it is kept. So does one of the
+    /// wrong shape.
     #[test]
     fn decode_is_lenient_on_hint_kind_and_strict_on_location() {
         let d: Diagnostic = serde_json::from_str(
@@ -277,9 +279,49 @@ mod tests {
         )
         .expect("decodes");
         assert_eq!(d.hints, [Hint::new(HintKind::Other, "t")]);
-        let climbing = serde_json::from_str::<Diagnostic>(
-            r#"{"stage":"eval","message":"m","location":{"file":"../x","line":1,"col":1}}"#,
+        for loc in [
+            r#"{"file":"../x","line":1,"col":1}"#,
+            r#"{"file":"/etc/passwd","line":1,"col":1}"#,
+            r#"{"file":"a","line":"one","col":1}"#,
+            r#""p/BUILD:1:1""#,
+            "null",
+        ] {
+            let rec: FailureRecord = serde_json::from_str(&format!(
+                r#"{{"diagnostic":{{"stage":"eval","message":"m","location":{loc}}},"entry":"//p:t"}}"#
+            ))
+            .unwrap_or_else(|e| panic!("{loc}: the record decodes: {e}"));
+            assert_eq!(rec.diagnostic.location, None, "{loc}");
+            assert_eq!(
+                (rec.diagnostic.message.as_str(), rec.entry.as_str()),
+                ("m", "//p:t")
+            );
+        }
+        // A sound one is kept.
+        let d: Diagnostic = serde_json::from_str(
+            r#"{"stage":"eval","message":"m","location":{"file":"p/BUILD","line":2,"col":3}}"#,
+        )
+        .expect("decodes");
+        assert_eq!(
+            d.location,
+            Some(SourceLoc::checked("p/BUILD".into(), 2, 3).expect("loc"))
         );
-        assert!(climbing.is_err());
+    }
+
+    /// A stage this heph does not know (a newer heph's slot, a newer
+    /// plugin's record) decodes as `run`, the rest of the record intact; a
+    /// stage that is not a string still fails.
+    #[test]
+    fn unknown_stage_decodes() {
+        let rec: FailureRecord = serde_json::from_str(
+            r#"{"diagnostic":{"stage":"from_the_future","message":"boom"},"exit":{"code":3}}"#,
+        )
+        .expect("an unknown stage decodes");
+        assert_eq!(rec.diagnostic.stage, Stage::Run);
+        assert_eq!(rec.diagnostic.message, "boom");
+        assert_eq!(rec.exit.and_then(|x| x.code), Some(3));
+        assert!(
+            serde_json::from_str::<Diagnostic>(r#"{"stage":7,"message":"m"}"#).is_err(),
+            "not a stage name"
+        );
     }
 }
