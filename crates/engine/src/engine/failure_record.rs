@@ -767,7 +767,13 @@ mod tests {
             Boundary::GetDef,
             &addr("//d:t"),
         );
-        let rec = compact(&e, &target("//d:t"), &addr("//d:t"), &Scrub::default(), None);
+        let rec = compact(
+            &e,
+            &target("//d:t"),
+            &addr("//d:t"),
+            &Scrub::default(),
+            None,
+        );
         assert_eq!(rec.diagnostic.stage, Stage::Link);
         let rec = compact(
             &missing(),

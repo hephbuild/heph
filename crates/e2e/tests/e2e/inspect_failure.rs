@@ -243,7 +243,10 @@ target(
         "{}",
         fixes.display()
     );
-    assert!(v.log.as_ref().is_some_and(|l| l.starts_with(&v.slot)), "{v:?}");
+    assert!(
+        v.log.as_ref().is_some_and(|l| l.starts_with(&v.slot)),
+        "{v:?}"
+    );
     let out = v.out.as_ref().expect("an out/");
     assert_eq!(std::fs::read_to_string(out.join("fix/r/t.txt"))?, "trace\n");
     Ok(())

@@ -1003,7 +1003,10 @@ async fn session_show_next_hint_only_for_culprits() {
         ),
         // Only a skipped target recorded: nothing to inspect.
         (
-            vec![start(T0 + 1, "//a:b"), end(T0 + 2, "//a:b", Some("//a:dep"))],
+            vec![
+                start(T0 + 1, "//a:b"),
+                end(T0 + 2, "//a:b", Some("//a:dep")),
+            ],
             "rerun",
             "heph run //a:b",
         ),
@@ -1020,7 +1023,10 @@ async fn session_show_next_hint_only_for_culprits() {
         assert_eq!(json["next"]["kind"], kind, "case {n}: {json}");
         assert_eq!(json["next"]["command"], command, "case {n}: {json}");
         let out = run_show(&sources, &id.encode(), false).await.expect("show");
-        assert!(out.contains(&format!("\nNext: {command}\n")), "case {n}: {out}");
+        assert!(
+            out.contains(&format!("\nNext: {command}\n")),
+            "case {n}: {out}"
+        );
     }
 }
 
