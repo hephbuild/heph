@@ -2797,276 +2797,6 @@ fn failure_fate<'a>(addr: &Addr, e: &'a anyhow::Error) -> FailureFate<'a> {
     FailureFate::Blame { culprit, entry }
 }
 
-/// [`failure_fate`]'s rule order (D1.c) and the D1.b adversarial table, on
-/// chains built the way the engine's sites build them (`MissingDep::wrap_or`
-/// with an `InputDefFailed` fallback, one memoizer level per `get_def`).
-#[cfg(test)]
-mod failure_fate_tests {
-    use super::*;
-    use hcore::hmemoizer::unwrap_arc_err;
-
-    fn a(s: &str) -> Addr {
-        hmodel::htaddr::parse_addr(s).expect("addr")
-    }
-
-    fn not_found(dep: &str) -> anyhow::Error {
-        TargetNotFoundError { addr: a(dep) }.into()
-    }
-
-    /// What `input_defs` makes of `e`, the def failure of `input` declared
-    /// by `declarer` under `origin`.
-    fn at_input(e: anyhow::Error, input: &str, declarer: &str, origin: &str) -> anyhow::Error {
-        let (input, declarer) = (a(input), a(declarer));
-        MissingDep::wrap_or(
-            e,
-            &input,
-            &declarer,
-            || origin.to_owned(),
-            |e| {
-                e.context(InputDefFailed {
-                    input: input.clone(),
-                    declarer: declarer.clone(),
-                    origin_id: origin.to_owned(),
-                })
-            },
-        )
-    }
-
-    /// `e` handed back through a memoizer cell another waiter also holds.
-    fn shared(e: anyhow::Error) -> (anyhow::Error, Arc<anyhow::Error>) {
-        let arc = Arc::new(e);
-        let other = Arc::clone(&arc);
-        (unwrap_arc_err(arc), other)
-    }
-
-    fn broken_file(file: &str) -> anyhow::Error {
-        anyhow::anyhow!("fail: boom").context(FileEvalFailed {
-            file: Arc::from(file),
-        })
-    }
-
-    #[track_caller]
-    fn blamed(addr: &str, e: &anyhow::Error) -> (Culprit, Addr) {
-        match failure_fate(&a(addr), e) {
-            FailureFate::Blame { culprit, entry } => (culprit, entry),
-            FailureFate::Propagate => panic!("propagated: {e:#}"),
-            FailureFate::Cancelled => panic!("cancelled: {e:#}"),
-            FailureFate::Upstream(root) => panic!("upstream of {root}: {e:#}"),
-            FailureFate::Shell(_) => panic!("shell: {e:#}"),
-            FailureFate::Each { culprit, .. } => panic!("each, led by {culprit}: {e:#}"),
-        }
-    }
-
-    #[track_caller]
-    fn blames_target(addr: &str, e: &anyhow::Error, culprit: &str) {
-        let (c, entry) = blamed(addr, e);
-        assert_eq!(c, Culprit::Target(a(culprit)), "{e:#}");
-        assert_eq!(entry, a(culprit), "{e:#}");
-    }
-
-    // --- D1.b: who a not-found blames ---------------------------------------
-
-    /// `//c:y` declares `//d:missing`; `d/BUILD` evaluates.
-    #[test]
-    fn d1b_attribution_declarer_of_missing_dep() {
-        let e = at_input(not_found("//d:missing"), "//d:missing", "//c:y", "deps");
-        let e = at_input(e, "//c:y", "//b:x", "deps");
-        let e = at_input(e, "//b:x", "//a:root", "deps");
-        blames_target("//a:root", &e, "//c:y");
-        let m = downcast_chain_ref::<MissingDep>(&e).expect("a MissingDep");
-        assert_eq!(m.dep, a("//d:missing"));
-    }
-
-    /// `//c:y` → `//d:t`, which declares `//e:missing`: `//d:t`.
-    #[test]
-    fn d1b_attribution_deeper_declarer() {
-        let e = at_input(not_found("//e:missing"), "//e:missing", "//d:t", "deps");
-        let e = at_input(e, "//d:t", "//c:y", "deps");
-        blames_target("//c:y", &e, "//d:t");
-    }
-
-    /// The same, `//d:t`'s failure reaching `//c:y` through a memoizer cell
-    /// shared with another waiter (`SharedAnyhow`): still `//d:t`.
-    #[test]
-    fn d1b_attribution_shared_anyhow_flattened() {
-        let e = at_input(not_found("//e:missing"), "//e:missing", "//d:t", "deps");
-        let (e, _other) = shared(e);
-        let e = at_input(e, "//d:t", "//c:y", "deps");
-        let (e, _other2) = shared(e);
-        blames_target("//c:y", &e, "//d:t");
-    }
-
-    /// `//c:y` declares `//p:ab`; the not-found raised deeper names `//p:a`
-    /// (declared by `//p:ab`): never `//c:y`.
-    #[test]
-    fn d1b_attribution_near_miss_name() {
-        let e = at_input(not_found("//p:a"), "//p:a", "//p:ab", "deps");
-        let e = at_input(e, "//p:ab", "//c:y", "deps");
-        blames_target("//c:y", &e, "//p:ab");
-        // A not-found of `//p:a` is not one of `//p:ab`, even with no
-        // declarer of its own on the chain.
-        let e = at_input(not_found("//p:a"), "//p:ab", "//c:y", "deps");
-        assert!(downcast_chain_ref::<MissingDep>(&e).is_none(), "{e:#}");
-        blames_target("//c:y", &e, "//p:ab");
-    }
-
-    /// `//c:y` → `//d:t`; `d/BUILD` does not evaluate: the file, entered
-    /// through `//d:t`.
-    #[test]
-    fn d1b_attribution_broken_file() {
-        let e =
-            hplugin::diagnostic::with_stage(broken_file("d/BUILD"), Boundary::GetSpec, &a("//d:t"));
-        let e = at_input(e, "//d:t", "//c:y", "deps");
-        let (e, _other) = shared(e);
-        let e = at_input(e, "//c:y", "//a:x", "deps");
-        let (c, entry) = blamed("//a:x", &e);
-        assert_eq!(c, Culprit::File(Arc::from("d/BUILD")), "{e:#}");
-        assert_eq!(entry, a("//d:t"), "{e:#}");
-    }
-
-    /// `//a:x` → group `//g:grp`, whose member `//d:missing` is missing:
-    /// the group, which named it.
-    #[test]
-    fn d1b_attribution_group_member() {
-        let e = at_input(not_found("//d:missing"), "//d:missing", "//g:grp", "dep||0");
-        let e = at_input(e, "//g:grp", "//a:x", "deps");
-        blames_target("//a:x", &e, "//g:grp");
-    }
-
-    /// `//c:y` declares `//d:t|out` and `//d:t` is missing: `//c:y`, the ref
-    /// compared without its output group.
-    #[test]
-    fn d1b_attribution_output_group() {
-        let r = crate::engine::driver::TargetAddr::parse("//d:t|out", &a("//c:y").package)
-            .expect("ref");
-        let e = at_input(not_found("//d:t"), &r.r#ref.format(), "//c:y", "deps");
-        let e = at_input(e, "//c:y", "//a:x", "deps");
-        blames_target("//a:x", &e, "//c:y");
-    }
-
-    /// `${read://p:missing}` in `//c:y`: `//c:y`, under `${read://}`.
-    #[test]
-    fn d1b_attribution_read_producer() {
-        let e = at_input(
-            not_found("//p:missing"),
-            "//p:missing",
-            "//c:y",
-            "${read://}",
-        );
-        let e = at_input(e, "//c:y", "//a:x", "deps");
-        blames_target("//a:x", &e, "//c:y");
-        let m = downcast_chain_ref::<MissingDep>(&e).expect("a MissingDep");
-        assert_eq!(m.origin_id, "${read://}");
-    }
-
-    /// A `CancelledError` and a not-found in one `MultiError`: a
-    /// cancellation, no culprit.
-    #[test]
-    fn d1b_attribution_cancel_and_not_found() {
-        let missing = at_input(not_found("//d:missing"), "//d:missing", "//c:y", "deps");
-        let e: anyhow::Error = MultiError(vec![anyhow::Error::new(CancelledError), missing]).into();
-        assert!(
-            matches!(failure_fate(&a("//c:y"), &e), FailureFate::Cancelled),
-            "{e:#}"
-        );
-    }
-
-    // --- D1.c rule order ----------------------------------------------------
-
-    /// A stop on the chain is propagated, whatever blame sits above it.
-    #[test]
-    fn failure_fate_top_level_cancel_propagates() {
-        let e = at_input(anyhow::Error::new(CancelledError), "//d:t", "//c:y", "deps");
-        let e = e.context(MissingDep {
-            dep: a("//d:t"),
-            declarer: a("//c:y"),
-            origin_id: "deps".to_owned(),
-        });
-        assert!(
-            matches!(failure_fate(&a("//c:y"), &e), FailureFate::Propagate),
-            "{e:#}"
-        );
-    }
-
-    /// Every member a stop: a cancellation, never `UpstreamFailed` naming
-    /// this target (RUN-22).
-    #[test]
-    fn failure_fate_all_cancelled_multi_is_cancelled() {
-        let e: anyhow::Error = MultiError(vec![
-            anyhow::Error::new(CancelledError),
-            anyhow::Error::new(CancelledError).context("meta: //d:t"),
-        ])
-        .into();
-        assert!(
-            matches!(failure_fate(&a("//c:y"), &e), FailureFate::Cancelled),
-            "{e:#}"
-        );
-    }
-
-    /// A cycle is structural: propagated, even under an input frame.
-    #[test]
-    fn failure_fate_cycle_under_input_def_propagates() {
-        let cycle: anyhow::Error = CycleError {
-            from: a("//d:t"),
-            to: a("//c:y"),
-        }
-        .into();
-        let e = at_input(cycle, "//d:t", "//c:y", "deps");
-        assert!(
-            matches!(failure_fate(&a("//c:y"), &e), FailureFate::Propagate),
-            "{e:#}"
-        );
-    }
-
-    /// A marker is collateral: its root, never this target, never recorded.
-    #[test]
-    fn failure_fate_marker_is_upstream() {
-        let root = Culprit::File(Arc::from("d/BUILD"));
-        let e = at_input(
-            UpstreamFailed { root: root.clone() }.into(),
-            "//c:y",
-            "//b:x",
-            "deps",
-        );
-        match failure_fate(&a("//b:x"), &e) {
-            FailureFate::Upstream(r) => assert_eq!(r, root),
-            _ => panic!("not upstream: {e:#}"),
-        }
-    }
-
-    /// A requested target in a broken file: the file, entered through the
-    /// target itself.
-    #[test]
-    fn failure_fate_file_eval_on_own_spec_blames_file() {
-        let e = broken_file("d/BUILD").context("get spec");
-        let (c, entry) = blamed("//d:t", &e);
-        assert_eq!(c, Culprit::File(Arc::from("d/BUILD")), "{e:#}");
-        assert_eq!(entry, a("//d:t"));
-    }
-
-    /// One broken file reached through two of its targets, shared or not:
-    /// one culprit, entered through the first member, never `Each` (whose
-    /// regrouping of the two met this aggregate again, without end).
-    #[test]
-    fn failure_fate_one_file_two_entries_blames_the_file() {
-        for share in [false, true] {
-            let member = |input: &str, declarer: &str| {
-                let e = at_input(broken_file("e/BUILD"), input, declarer, "deps");
-                if share { shared(e).0 } else { e }
-            };
-            let e: anyhow::Error =
-                MultiError(vec![member("//e:a", "//d:x"), member("//e:b", "//d:y")]).into();
-            let (c, entry) = blamed("//top:t", &e);
-            assert_eq!(
-                c,
-                Culprit::File(Arc::from("e/BUILD")),
-                "shared {share}: {e:#}"
-            );
-            assert_eq!(entry, a("//e:a"), "shared {share}");
-        }
-    }
-}
-
 /// `ResultEnd`'s `left_behind`: what the failure slot holds, plus whether the
 /// log can be read when that was asked. The log's path is kept whether or not
 /// the output streamed: a streamed box points at it (D6.1).
@@ -7509,6 +7239,280 @@ fn rewrite_query_inputs(
         }
     }
     def
+}
+
+/// [`failure_fate`]'s rule order (D1.c) and the D1.b adversarial table, on
+/// chains built the way the engine's sites build them (`MissingDep::wrap_or`
+/// with an `InputDefFailed` fallback, one memoizer level per `get_def`).
+///
+/// Below every non-test item, as the file's other test modules are:
+/// `tests/root/cache_tier_gate.rs` reads a file's production code as what
+/// comes before its first `#[cfg(test)] mod`.
+#[cfg(test)]
+mod failure_fate_tests {
+    use super::*;
+    use hcore::hmemoizer::unwrap_arc_err;
+
+    fn a(s: &str) -> Addr {
+        hmodel::htaddr::parse_addr(s).expect("addr")
+    }
+
+    fn not_found(dep: &str) -> anyhow::Error {
+        TargetNotFoundError { addr: a(dep) }.into()
+    }
+
+    /// What `input_defs` makes of `e`, the def failure of `input` declared
+    /// by `declarer` under `origin`.
+    fn at_input(e: anyhow::Error, input: &str, declarer: &str, origin: &str) -> anyhow::Error {
+        let (input, declarer) = (a(input), a(declarer));
+        MissingDep::wrap_or(
+            e,
+            &input,
+            &declarer,
+            || origin.to_owned(),
+            |e| {
+                e.context(InputDefFailed {
+                    input: input.clone(),
+                    declarer: declarer.clone(),
+                    origin_id: origin.to_owned(),
+                })
+            },
+        )
+    }
+
+    /// `e` handed back through a memoizer cell another waiter also holds.
+    fn shared(e: anyhow::Error) -> (anyhow::Error, Arc<anyhow::Error>) {
+        let arc = Arc::new(e);
+        let other = Arc::clone(&arc);
+        (unwrap_arc_err(arc), other)
+    }
+
+    fn broken_file(file: &str) -> anyhow::Error {
+        anyhow::anyhow!("fail: boom").context(FileEvalFailed {
+            file: Arc::from(file),
+        })
+    }
+
+    #[track_caller]
+    fn blamed(addr: &str, e: &anyhow::Error) -> (Culprit, Addr) {
+        match failure_fate(&a(addr), e) {
+            FailureFate::Blame { culprit, entry } => (culprit, entry),
+            FailureFate::Propagate => panic!("propagated: {e:#}"),
+            FailureFate::Cancelled => panic!("cancelled: {e:#}"),
+            FailureFate::Upstream(root) => panic!("upstream of {root}: {e:#}"),
+            FailureFate::Shell(_) => panic!("shell: {e:#}"),
+            FailureFate::Each { culprit, .. } => panic!("each, led by {culprit}: {e:#}"),
+        }
+    }
+
+    #[track_caller]
+    fn blames_target(addr: &str, e: &anyhow::Error, culprit: &str) {
+        let (c, entry) = blamed(addr, e);
+        assert_eq!(c, Culprit::Target(a(culprit)), "{e:#}");
+        assert_eq!(entry, a(culprit), "{e:#}");
+    }
+
+    // --- D1.b: who a not-found blames ---------------------------------------
+
+    /// `//c:y` declares `//d:missing`; `d/BUILD` evaluates.
+    #[test]
+    fn d1b_attribution_declarer_of_missing_dep() {
+        let e = at_input(not_found("//d:missing"), "//d:missing", "//c:y", "deps");
+        let e = at_input(e, "//c:y", "//b:x", "deps");
+        let e = at_input(e, "//b:x", "//a:root", "deps");
+        blames_target("//a:root", &e, "//c:y");
+        let m = downcast_chain_ref::<MissingDep>(&e).expect("a MissingDep");
+        assert_eq!(m.dep, a("//d:missing"));
+    }
+
+    /// `//c:y` → `//d:t`, which declares `//e:missing`: `//d:t`.
+    #[test]
+    fn d1b_attribution_deeper_declarer() {
+        let e = at_input(not_found("//e:missing"), "//e:missing", "//d:t", "deps");
+        let e = at_input(e, "//d:t", "//c:y", "deps");
+        blames_target("//c:y", &e, "//d:t");
+    }
+
+    /// The same, `//d:t`'s failure reaching `//c:y` through a memoizer cell
+    /// shared with another waiter (`SharedAnyhow`): still `//d:t`.
+    #[test]
+    fn d1b_attribution_shared_anyhow_flattened() {
+        let e = at_input(not_found("//e:missing"), "//e:missing", "//d:t", "deps");
+        let (e, _other) = shared(e);
+        let e = at_input(e, "//d:t", "//c:y", "deps");
+        let (e, _other2) = shared(e);
+        blames_target("//c:y", &e, "//d:t");
+    }
+
+    /// `//c:y` declares `//p:ab`; the not-found raised deeper names `//p:a`
+    /// (declared by `//p:ab`): never `//c:y`.
+    #[test]
+    fn d1b_attribution_near_miss_name() {
+        let e = at_input(not_found("//p:a"), "//p:a", "//p:ab", "deps");
+        let e = at_input(e, "//p:ab", "//c:y", "deps");
+        blames_target("//c:y", &e, "//p:ab");
+        // A not-found of `//p:a` is not one of `//p:ab`, even with no
+        // declarer of its own on the chain.
+        let e = at_input(not_found("//p:a"), "//p:ab", "//c:y", "deps");
+        assert!(downcast_chain_ref::<MissingDep>(&e).is_none(), "{e:#}");
+        blames_target("//c:y", &e, "//p:ab");
+    }
+
+    /// `//c:y` → `//d:t`; `d/BUILD` does not evaluate: the file, entered
+    /// through `//d:t`.
+    #[test]
+    fn d1b_attribution_broken_file() {
+        let e =
+            hplugin::diagnostic::with_stage(broken_file("d/BUILD"), Boundary::GetSpec, &a("//d:t"));
+        let e = at_input(e, "//d:t", "//c:y", "deps");
+        let (e, _other) = shared(e);
+        let e = at_input(e, "//c:y", "//a:x", "deps");
+        let (c, entry) = blamed("//a:x", &e);
+        assert_eq!(c, Culprit::File(Arc::from("d/BUILD")), "{e:#}");
+        assert_eq!(entry, a("//d:t"), "{e:#}");
+    }
+
+    /// `//a:x` → group `//g:grp`, whose member `//d:missing` is missing:
+    /// the group, which named it.
+    #[test]
+    fn d1b_attribution_group_member() {
+        let e = at_input(not_found("//d:missing"), "//d:missing", "//g:grp", "dep||0");
+        let e = at_input(e, "//g:grp", "//a:x", "deps");
+        blames_target("//a:x", &e, "//g:grp");
+    }
+
+    /// `//c:y` declares `//d:t|out` and `//d:t` is missing: `//c:y`, the ref
+    /// compared without its output group.
+    #[test]
+    fn d1b_attribution_output_group() {
+        let r = crate::engine::driver::TargetAddr::parse("//d:t|out", &a("//c:y").package)
+            .expect("ref");
+        let e = at_input(not_found("//d:t"), &r.r#ref.format(), "//c:y", "deps");
+        let e = at_input(e, "//c:y", "//a:x", "deps");
+        blames_target("//a:x", &e, "//c:y");
+    }
+
+    /// `${read://p:missing}` in `//c:y`: `//c:y`, under `${read://}`.
+    #[test]
+    fn d1b_attribution_read_producer() {
+        let e = at_input(
+            not_found("//p:missing"),
+            "//p:missing",
+            "//c:y",
+            "${read://}",
+        );
+        let e = at_input(e, "//c:y", "//a:x", "deps");
+        blames_target("//a:x", &e, "//c:y");
+        let m = downcast_chain_ref::<MissingDep>(&e).expect("a MissingDep");
+        assert_eq!(m.origin_id, "${read://}");
+    }
+
+    /// A `CancelledError` and a not-found in one `MultiError`: a
+    /// cancellation, no culprit.
+    #[test]
+    fn d1b_attribution_cancel_and_not_found() {
+        let missing = at_input(not_found("//d:missing"), "//d:missing", "//c:y", "deps");
+        let e: anyhow::Error = MultiError(vec![anyhow::Error::new(CancelledError), missing]).into();
+        assert!(
+            matches!(failure_fate(&a("//c:y"), &e), FailureFate::Cancelled),
+            "{e:#}"
+        );
+    }
+
+    // --- D1.c rule order ----------------------------------------------------
+
+    /// A stop on the chain is propagated, whatever blame sits above it.
+    #[test]
+    fn failure_fate_top_level_cancel_propagates() {
+        let e = at_input(anyhow::Error::new(CancelledError), "//d:t", "//c:y", "deps");
+        let e = e.context(MissingDep {
+            dep: a("//d:t"),
+            declarer: a("//c:y"),
+            origin_id: "deps".to_owned(),
+        });
+        assert!(
+            matches!(failure_fate(&a("//c:y"), &e), FailureFate::Propagate),
+            "{e:#}"
+        );
+    }
+
+    /// Every member a stop: a cancellation, never `UpstreamFailed` naming
+    /// this target (RUN-22).
+    #[test]
+    fn failure_fate_all_cancelled_multi_is_cancelled() {
+        let e: anyhow::Error = MultiError(vec![
+            anyhow::Error::new(CancelledError),
+            anyhow::Error::new(CancelledError).context("meta: //d:t"),
+        ])
+        .into();
+        assert!(
+            matches!(failure_fate(&a("//c:y"), &e), FailureFate::Cancelled),
+            "{e:#}"
+        );
+    }
+
+    /// A cycle is structural: propagated, even under an input frame.
+    #[test]
+    fn failure_fate_cycle_under_input_def_propagates() {
+        let cycle: anyhow::Error = CycleError {
+            from: a("//d:t"),
+            to: a("//c:y"),
+        }
+        .into();
+        let e = at_input(cycle, "//d:t", "//c:y", "deps");
+        assert!(
+            matches!(failure_fate(&a("//c:y"), &e), FailureFate::Propagate),
+            "{e:#}"
+        );
+    }
+
+    /// A marker is collateral: its root, never this target, never recorded.
+    #[test]
+    fn failure_fate_marker_is_upstream() {
+        let root = Culprit::File(Arc::from("d/BUILD"));
+        let e = at_input(
+            UpstreamFailed { root: root.clone() }.into(),
+            "//c:y",
+            "//b:x",
+            "deps",
+        );
+        match failure_fate(&a("//b:x"), &e) {
+            FailureFate::Upstream(r) => assert_eq!(r, root),
+            _ => panic!("not upstream: {e:#}"),
+        }
+    }
+
+    /// A requested target in a broken file: the file, entered through the
+    /// target itself.
+    #[test]
+    fn failure_fate_file_eval_on_own_spec_blames_file() {
+        let e = broken_file("d/BUILD").context("get spec");
+        let (c, entry) = blamed("//d:t", &e);
+        assert_eq!(c, Culprit::File(Arc::from("d/BUILD")), "{e:#}");
+        assert_eq!(entry, a("//d:t"));
+    }
+
+    /// One broken file reached through two of its targets, shared or not:
+    /// one culprit, entered through the first member, never `Each` (whose
+    /// regrouping of the two met this aggregate again, without end).
+    #[test]
+    fn failure_fate_one_file_two_entries_blames_the_file() {
+        for share in [false, true] {
+            let member = |input: &str, declarer: &str| {
+                let e = at_input(broken_file("e/BUILD"), input, declarer, "deps");
+                if share { shared(e).0 } else { e }
+            };
+            let e: anyhow::Error =
+                MultiError(vec![member("//e:a", "//d:x"), member("//e:b", "//d:y")]).into();
+            let (c, entry) = blamed("//top:t", &e);
+            assert_eq!(
+                c,
+                Culprit::File(Arc::from("e/BUILD")),
+                "shared {share}: {e:#}"
+            );
+            assert_eq!(entry, a("//e:a"), "shared {share}");
+        }
+    }
 }
 
 #[cfg(test)]
