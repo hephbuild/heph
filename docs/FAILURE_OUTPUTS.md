@@ -42,9 +42,11 @@ filename-safe, followed by a digest. A slot can hold:
 
 | Part | What | Written when |
 | --- | --- | --- |
-| `log.txt` | The run's full process log | The run produced a log (never for credential material) |
+| `manifest.json` | The address, the revision, when it failed, the fill's id | Always, last: a slot is complete exactly when it exists |
+| `log.txt` | The run's full process log | The run had a log, an empty one included (never for credential material) |
 | `out/` | The `failure_out` matches | The run exited non-zero and a declared path matched |
 | `fixes.txt` | Every path an `in_place` write-back changed, one per line | Fixes were written back on failure |
+| `diagnostic.json` | The failure's record: its diagnostic, causes, exit, path | Every recorded failure (never for credential material) |
 
 There is one slot per address (per variant). It has no history:
 
@@ -52,6 +54,47 @@ There is one slot per address (per variant). It has no history:
 - The slot is cleared when the target next resolves, on a cache hit or when
   its next run starts. A passing run therefore leaves no slot behind.
 - `heph tool gc --failure-max-age-days N` drops old slots, 7 days by default.
+
+### The manifest and the diagnostic
+
+Each fill of a slot mints a **fill id** (a uuid) and writes it into the
+manifest. A failure's record names its log by that id, so a reader holding an
+older record can tell the slot was since filled by a newer failed run
+(`log replaced by a newer failed run`) or cleared (`log cleared`), and never
+shows the newer run's log as the older one's. A slot from an older heph has no
+fill id: its log is shown with no claim about whose it is.
+
+`hashin`, the run's revision, is `null` for a failure before the run (which has
+none) and for an invocation (never hashed).
+
+Every failure the request records (each culprit's, once) writes its record
+into the culprit's slot as `diagnostic.json`. It is versioned (`"version": 1`)
+and names the fill it belongs to; a reader ignores one of a version it does
+not know or of another fill. It is the record as compacted for the report:
+scrubbed of credential values and within the same caps, without the log
+reference or what the failure left behind, which are the slot's own files.
+It is written in the background once the failure is recorded, and `heph run`
+does not exit before it lands. A fill or a clear of the same slot waits for
+it.
+
+**A failure before the run** keeps a slot too: no log, no `out/`, a manifest
+with no revision and `diagnostic.json`. That covers a def that does not
+parse, a missing dependency, a run that failed and kept nothing, and a BUILD
+file that did not evaluate. A BUILD file's slot is keyed by the file, not by
+a target: `<home>/failures/file_<path>-<digest>/`, its manifest's `addr` is
+`file:<path>` (workspace-relative), and it lists the packages whose targets
+were reached through the file. Nothing clears it when the file evaluates
+again; `heph tool gc` keeps it while the file exists and drops it once the
+file is gone or the slot is older than the max age.
+
+**Credential material gets no `diagnostic.json`.** A target whose outputs are
+material already keeps no log on disk, and its slot gets no record either.
+The one exception: a material target that fails before it runs carries no
+slot to say it is material, so it gets a slot holding only
+`diagnostic.json`. That record went through the same scrub as the report.
+
+A run that printed nothing keeps an empty `log.txt`: the slot says the run
+ran and printed nothing, rather than reading as a failure that kept no log.
 
 `log.txt` is the engine's own copy of the run's output. A plugin streams its
 output into the engine's live run log (`<home>/runs/<id>/<n>.log`, see
@@ -249,7 +292,7 @@ It keeps what a build keeps, read the same way, with these differences:
   Two invocations of the same target running at once share one slot: the
   last failure to finish is the one kept.
 - **No revision.** An invocation is never hashed, so the manifest's `hashin`
-  is empty.
+  is `null`.
 
 ## `heph inspect failure`
 
@@ -280,8 +323,8 @@ keys and `--jq` filters it, as on every command (`docs/JSON_OUTPUT.md`):
 ```
 
 `failed_at` is in milliseconds since the Unix epoch. `hashin` is the input hash
-of the run that failed, which may no longer be the target's. Both are in the
-JSON only.
+of the run that failed, which may no longer be the target's, and `null` for a
+failure before the run. Both are in the JSON only.
 
 With no recorded failure (the target never failed, or passed or hit the cache
 since):
@@ -409,6 +452,11 @@ This changes what existing targets do.
 - **An older heph removes a newer slot.** A heph from before this change reads
   a slot with `out/` or `fixes.txt` but no `log.txt` as litter and deletes it.
   Going back to an older heph can lose a failure kept by a newer one.
+- **An older heph's gc removes the slots of failures before the run.** A slot
+  holding only `diagnostic.json`, one whose `hashin` is `null`, and a BUILD
+  file's `file:` slot all read as litter to a heph from before fill ids, and
+  its `heph tool gc` deletes them. A newer heph reads an older heph's slots as
+  they were (no fill id, no diagnostic).
 
 ## Hashing
 
