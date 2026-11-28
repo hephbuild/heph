@@ -266,6 +266,88 @@ mod tests {
         Ok(())
     }
 
+    /// A failed process's record, as the engine hands it to the wrapper.
+    fn exec_failure(addr: &str) -> crate::engine::RunEnd {
+        let mut rec = hcore::failure::FailureRecord::new(
+            hcore::diagnostic::Diagnostic::new(hcore::diagnostic::Stage::Run, "process failed")
+                .with_addr(addr),
+        );
+        rec.addr = Some(addr.to_owned());
+        rec.entry = addr.to_owned();
+        rec.failed_in = hcore::events::FailedIn::Exec;
+        rec.exit = Some(hcore::events::ExitData {
+            code: Some(1),
+            signal: None,
+            status: "exit status: 1".into(),
+        });
+        crate::engine::RunEnd {
+            exec_failure: Some(Box::new(rec)),
+        }
+    }
+
+    /// D6.1c, U6: a run that streamed and whose process failed gets its one
+    /// line on heph's stderr, after the target's own bytes and after the
+    /// break that ends a line it left open. A run that streamed nothing, or
+    /// whose process did not fail, gets no line; an error from the run is
+    /// handed back after the streams are finished.
+    #[tokio::test]
+    async fn finish_run_tells_a_streamed_exec_failure_once() -> anyhow::Result<()> {
+        // Streamed and failed: the line, after the open line's break.
+        let tap = TerminalTap::new();
+        let (mut out, mut err) = (in_memory(Some(&tap)), in_memory(Some(&tap)));
+        out.write_all(b"half a line").await?;
+        let used = finish_run(&tap, &mut out, &mut err, Ok(exec_failure("//p:t"))).await?;
+        assert!(used.streamed);
+        assert_eq!(out.inner, b"half a line");
+        // Coloured when the test's own stderr is a terminal: compare the text.
+        let mut told = String::new();
+        let mut rest = String::from_utf8(err.inner)?;
+        while let Some(at) = rest.find('\x1b') {
+            told.push_str(rest.get(..at).unwrap_or_default());
+            let end = rest
+                .get(at..)
+                .and_then(|s| s.find('m'))
+                .map_or(rest.len(), |m| at + m + 1);
+            rest = rest.get(end..).unwrap_or_default().to_owned();
+        }
+        told.push_str(&rest);
+        assert_eq!(told, "\n✗ //p:t · exit status 1 · heph log //p:t\n");
+
+        // Failed, but every byte went to files: the box tells it, not a line.
+        let dir = tempfile::tempdir()?;
+        let tap = TerminalTap::new();
+        let mut out = Tapped::new(file_in(dir.path(), "out"), &tap);
+        let mut err = Tapped::new(file_in(dir.path(), "err"), &tap);
+        out.write_all(b"to a file\n").await?;
+        let used = finish_run(&tap, &mut out, &mut err, Ok(exec_failure("//p:t"))).await?;
+        assert!(!used.streamed);
+        assert_eq!(std::fs::read_to_string(dir.path().join("err"))?, "");
+
+        // Streamed, and the process did not fail (a later step may yet):
+        // nothing added.
+        let tap = TerminalTap::new();
+        let (mut out, mut err) = (in_memory(Some(&tap)), in_memory(Some(&tap)));
+        out.write_all(b"ok\n").await?;
+        let used = finish_run(
+            &tap,
+            &mut out,
+            &mut err,
+            Ok(crate::engine::RunEnd::default()),
+        )
+        .await?;
+        assert!(used.streamed);
+        assert!(err.inner.is_empty());
+
+        // The run's own error comes back, the open line still ended.
+        let tap = TerminalTap::new();
+        let (mut out, mut err) = (in_memory(Some(&tap)), in_memory(Some(&tap)));
+        out.write_all(b"open").await?;
+        let res = finish_run(&tap, &mut out, &mut err, Err(anyhow::anyhow!("spawn"))).await;
+        assert!(res.is_err());
+        assert_eq!(err.inner, b"\n");
+        Ok(())
+    }
+
     /// A writer that takes at most `max` bytes per write.
     struct Short {
         got: Vec<u8>,

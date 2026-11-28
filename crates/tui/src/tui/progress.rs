@@ -5048,6 +5048,52 @@ mod tests {
         );
     }
 
+    /// D6.1c, U6 in the line backend: a culprit whose process failed while
+    /// its output streamed was told in the CLI's one line, so the view prints
+    /// no box for it, yet still counts it in the totals line. One that
+    /// streamed and then failed after the run (its outputs, the cache store)
+    /// gets its box, and so does one that failed before it ran.
+    #[test]
+    fn ci_view_told_streamed_no_box_but_counted() {
+        let run = |events: &[BuildEventKind]| -> Vec<String> {
+            let sink = crate::tui::log_sink::LogSink::new_direct_with(std::sync::Arc::new(
+                crate::tui::session::SessionSlot::new(),
+            ));
+            let mut rx = sink.switch_to_buffered();
+            let mut v = CiProgressView::new("Running");
+            v.set_sink(sink);
+            for e in events {
+                v.apply(&ev(1, e.clone()));
+            }
+            v.finish();
+            let mut out = Vec::new();
+            while let Ok(line) = rx.try_recv() {
+                out.push(String::from_utf8(line.bytes).expect("utf-8"));
+            }
+            out
+        };
+        let streamed = |addr: &str, failed_in| {
+            let mut rec = record_of(addr, &format!("{addr} message"));
+            rec.streamed = true;
+            rec.failed_in = failed_in;
+            failed_end_with(addr, rec)
+        };
+        let lines = run(&[
+            streamed("//a:exec", hcore::events::FailedIn::Exec),
+            streamed("//a:after", hcore::events::FailedIn::AfterRun),
+            streamed("//a:before", hcore::events::FailedIn::BeforeRun),
+        ]);
+        let all = lines.concat();
+        assert!(!all.contains("//a:exec message"), "a told box: {lines:#?}");
+        assert!(all.contains("//a:after message"), "{lines:#?}");
+        assert!(all.contains("//a:before message"), "{lines:#?}");
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("3 failed: //a:exec, //a:after, //a:before\n"),
+            "{lines:#?}"
+        );
+    }
+
     /// The block ends with the rows the end-of-run box would have carried,
     /// after the tail and in the box's order, and the view says it printed
     /// it: the end of the run then leaves the box out. A collateral failure
