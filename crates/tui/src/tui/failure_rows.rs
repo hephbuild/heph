@@ -63,7 +63,7 @@ pub fn left_behind_rows_in(
         }
     }
     if let Some(fixes) = &left.fixes {
-        fixes_rows(&mut out, fixes);
+        fixes_rows(&mut out, fixes, (!paths).then_some(addr));
     }
     if !log_row {
         return out;
@@ -293,7 +293,20 @@ pub fn tail_rows<'a>(
 /// and with `--literal-pathspecs`, since git reads a pathspec as a glob:
 /// `web/[id].ts` would also revert `web/i.ts`. It restores the index version,
 /// so it says that uncommitted edits to those files go with it.
-fn fixes_rows(out: &mut String, fixes: &FixesData) {
+/// `+N more (full list: where)`, or `(full list: where)` when every path
+/// was named.
+fn push_full_list(out: &mut String, more: usize, where_: &str) {
+    if more > 0 {
+        out.push_str(&format!("    +{more} more (full list: {where_})\n"));
+    } else {
+        out.push_str(&format!("    (full list: {where_})\n"));
+    }
+}
+
+/// The write-back's rows. `inspect` is the failure's address on a screen
+/// that names no path into heph's home (I9): the slot's fixes list is then
+/// named by the command that prints it, never by its path.
+fn fixes_rows(out: &mut String, fixes: &FixesData, inspect: Option<&str>) {
     const RESTORE: &str =
         "  restore with (takes the index version; uncommitted edits to these files are lost):\n";
     match fixes {
@@ -305,12 +318,24 @@ fn fixes_rows(out: &mut String, fixes: &FixesData) {
                  codegen = \"in_place_on_success\" opts out):\n",
             );
             for p in paths.iter().take(FIXES_SHOWN) {
-                out.push_str(&format!("    {p}\n"));
+                out.push_str(&format!("    {}\n", crate::tui::text::clean_inline(p)));
             }
             let more = paths.len().saturating_sub(FIXES_SHOWN);
+            // A path a terminal cannot show as typed goes through the list
+            // too: the restore below would not paste back as written.
+            let unprintable = paths.iter().any(|p| p.chars().any(char::is_control));
             match list {
-                Some(list) if more > 0 => {
-                    out.push_str(&format!("    +{more} more (full list: {list})\n"));
+                Some(_) if (more > 0 || unprintable) && inspect.is_some() => {
+                    let addr = shell_quote(inspect.unwrap_or_default());
+                    push_full_list(out, more, &format!("heph inspect failure {addr}"));
+                    out.push_str(RESTORE);
+                    out.push_str(&format!(
+                        "    {git} --pathspec-from-file=<the fixes file heph inspect failure \
+                         {addr} names>\n"
+                    ));
+                }
+                Some(list) if more > 0 || unprintable => {
+                    push_full_list(out, more, list);
                     // The list is one path per line, which is what git's
                     // `--pathspec-from-file` reads: no xargs word splitting.
                     out.push_str(RESTORE);

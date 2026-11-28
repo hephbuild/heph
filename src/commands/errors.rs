@@ -466,7 +466,8 @@ pub(crate) trait FinalizeRequest {
         wanted: impl Fn(&TargetFailure) -> bool,
     ) -> Vec<Arc<TargetFailure>>;
     fn emit(&self, kind: crate::engine::event::BuildEventKind);
-    fn took_down(&self, root: &str) -> crate::engine::request_state::TookDown;
+    /// The most log lines a box shows (`--log-lines`).
+    fn log_tail_lines(&self) -> usize;
     fn was_cancelled(&self, addr: &str) -> bool;
     fn heph_home(&self) -> Option<std::path::PathBuf>;
     fn workspace_root(&self) -> Option<std::path::PathBuf>;
@@ -483,8 +484,8 @@ impl FinalizeRequest for Arc<crate::engine::request_state::RequestState> {
     fn emit(&self, kind: crate::engine::event::BuildEventKind) {
         crate::engine::request_state::RequestState::emit(self, kind)
     }
-    fn took_down(&self, root: &str) -> crate::engine::request_state::TookDown {
-        crate::engine::request_state::RequestState::took_down(self, root)
+    fn log_tail_lines(&self) -> usize {
+        crate::engine::request_state::RequestState::log_tail_lines(self)
     }
     fn was_cancelled(&self, addr: &str) -> bool {
         crate::engine::request_state::RequestState::was_cancelled(self, addr)
@@ -598,9 +599,9 @@ async fn take_failure_outcome(
         let home = rs.heph_home();
         let report = ReportContext::gather(
             &failures,
-            |addr| rs.took_down(addr),
             |addr| rs.was_cancelled(addr),
             home.as_deref(),
+            rs.log_tail_lines(),
         )
         .with_workspace(rs.workspace_root().as_deref());
         Err(FailedTargets::deferred(failures)
@@ -1275,8 +1276,8 @@ mod tests {
         fn emit(&self, kind: crate::engine::event::BuildEventKind) {
             self.1.borrow_mut().push(kind);
         }
-        fn took_down(&self, _root: &str) -> crate::engine::request_state::TookDown {
-            crate::engine::request_state::TookDown::default()
+        fn log_tail_lines(&self) -> usize {
+            crate::engine::Engine::DEFAULT_LOG_TAIL_LINES
         }
         fn was_cancelled(&self, addr: &str) -> bool {
             self.2.contains(&addr)
@@ -1421,8 +1422,10 @@ mod tests {
             .await
             .unwrap_err();
         let out = render_anyhow_to_string(&e, false).expect("claimed");
-        assert!(out.contains("\n✗ //simple_fail:d1\n  │ boom a\n"), "{out}");
-        assert!(out.contains("\n✗ //simple_fail:d2\n  │ boom b\n"), "{out}");
+        // The report draws each failure's record; these were never compacted,
+        // so their records name only the target.
+        assert!(out.contains("\n✗ //simple_fail:d1\n"), "{out}");
+        assert!(out.contains("\n✗ //simple_fail:d2\n"), "{out}");
         assert!(!out.contains("//simple_fail:stopped"), "{out}");
         assert!(!out.contains("stopped"), "{out}");
         Ok(())
