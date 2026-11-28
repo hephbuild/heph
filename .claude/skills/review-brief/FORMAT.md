@@ -162,10 +162,13 @@ These are written by `brief pin` and `brief index` and read back by the program.
 them; nobody writes them by hand.
 
 - **pin.json**, `heph-review-brief-pin/1`: `repo` (owner/name), `trunk`, `mode` (`whole` or
-  `per-layer`), and `layers`, bottom to top, each `pr`, `title`, `url`, `branch`, `base`, `head`.
+  `per-layer`), and `layers`, bottom to top, each `pr`, `title`, `url`, `branch`, `base`, `head`,
+  and `body` (the PR description when the brief was pinned; empty with `--layers`).
 - **index.json**, `heph-review-brief-index/1`: `pin`; `layers`, each `pr`, `title`, `base`,
   `head`, `fingerprint`, `total`, `live`, `budget` (`lines`, `cards`), `live_ranges` (a RangeRef
-  plus `lines`, `flags`, `symbol`, `floor`), `counted` (class to line count) and `weakenings`;
+  plus `lines`, `flags`, `symbol`, `floor`), `counted` (class to line count), `weakenings`,
+  `description` (the pinned PR description) and `commits` (the range's commits, oldest first,
+  each `sha`, `subject`, `body`); `index.md` quotes both as data;
   `duplicates` (pairs of LayerRef `a`, `b`); `files_touched_by_several_layers` (`path`,
   `layers`). `index.md` is the same content as text, one section per layer.
 
@@ -209,7 +212,7 @@ sum to `total`; the two `ai_cleared_read_by_*` split `ai_cleared`.
 | `not_in_code` | NotInCode[] | From the triage |
 | `open_cards` | int | Scrutinize cards in the stack |
 
-**LayerHead**: the pin's layer fields (`pr`, `title`, `url`, `branch`, `base`, `head`), plus `file`
+**LayerHead**: the pin's layer fields (`pr`, `title`, `url`, `branch`, `base`, `head`, `body`), plus `file`
 (its `layer-N.json`), `diffs_file` (its `layer-N-diffs.json`), `sums`, and `scrutinize_cards`.
 
 ### layer-N.json

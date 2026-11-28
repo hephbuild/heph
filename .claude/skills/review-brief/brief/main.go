@@ -175,7 +175,10 @@ func cmdIndex(args []string) error {
 	if err != nil {
 		return err
 	}
-	ix := st.BuildIndex(names)
+	ix, err := st.BuildIndex(names)
+	if err != nil {
+		return err
+	}
 	if err := os.MkdirAll(*out, 0o755); err != nil {
 		return err
 	}

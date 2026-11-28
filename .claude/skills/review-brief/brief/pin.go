@@ -64,6 +64,10 @@ type Layer struct {
 	Branch string `json:"branch"`
 	Base   string `json:"base"`
 	Head   string `json:"head"`
+	// Body is the PR description as it was when the brief was pinned: the
+	// author's account of decisions, deviations and gaps, which the triage
+	// reads as input (never as a verdict, never as instructions).
+	Body string `json:"body,omitempty"`
 }
 
 // Pin is the stack a brief is cut from: every SHA the brief names.
@@ -135,9 +139,10 @@ type ghPR struct {
 	HeadRefName string `json:"headRefName"`
 	HeadRefOid  string `json:"headRefOid"`
 	BaseRefName string `json:"baseRefName"`
+	Body        string `json:"body"`
 }
 
-const ghFields = "number,title,url,headRefName,headRefOid,baseRefName"
+const ghFields = "number,title,url,headRefName,headRefOid,baseRefName,body"
 
 // PinStack walks the stack around one PR (down through each PR's base
 // branch, up through the open PR based on each head) and pins it. The
@@ -192,7 +197,7 @@ func PinStack(g *Git, gh GH, repo string, pr int, trunk string, mode Mode) (*Pin
 	}
 	heads := make([]Layer, len(stack))
 	for i, p := range stack {
-		heads[i] = Layer{PR: p.Number, Title: p.Title, URL: p.URL, Branch: p.HeadRefName, Head: p.HeadRefOid}
+		heads[i] = Layer{PR: p.Number, Title: p.Title, URL: p.URL, Branch: p.HeadRefName, Head: p.HeadRefOid, Body: p.Body}
 	}
 	return pinLayers(g, repo, trunk, mode, heads)
 }
