@@ -380,12 +380,22 @@ fn exit_code_for(
         report(e, session);
         return code;
     }
-    // `heph tool codegen`: 1 for findings, 2 for a failure (Decision 20).
+    // `heph tool codegen`: 1 for findings, 2 for a failure (Decision 20),
+    // and 130 for a cancel, as every command (I6).
     if let Some(exit) = e.downcast_ref::<commands::tool::codegen::CodegenExit>() {
         if let Some(err) = &exit.error {
             report(err, session);
         }
-        return exit.code;
+        let cancelled = cancel_requested
+            || exit
+                .error
+                .as_ref()
+                .is_some_and(hcore::hmemoizer::only::<heph::engine::error::CancelledError>);
+        return if cancelled {
+            commands::run::EXIT_CANCELLED
+        } else {
+            exit.code
+        };
     }
     // `heph session`: 125 for its own failures, else the code `attach`
     // mirrors from the session it followed. The code comes from
@@ -658,6 +668,28 @@ mod tests {
             1,
             "an ordinary failure"
         );
+    }
+
+    /// `heph tool codegen` keeps 1 for findings and 2 for a failure, but a
+    /// cancel exits 130 there too (I6): a failure that is only a cancel, or
+    /// any end the user stopped.
+    #[test]
+    fn exit_code_for_maps_a_codegen_cancel_to_130() {
+        use heph::commands::tool::codegen::{CodegenExit, wrap_exit};
+        use heph::engine::error::CancelledError;
+        let session = SessionSlot::new();
+        let code = |e: anyhow::Result<()>, stopped: bool| {
+            exit_code_for(&wrap_exit(e).unwrap_err(), None, &session, stopped)
+        };
+        let cancel = || Err(anyhow::Error::new(CancelledError).context("running //p:a"));
+        let boom = || Err(anyhow::anyhow!("boom"));
+        let findings = || Err(CodegenExit::findings().into());
+
+        assert_eq!(code(cancel(), false), 130, "a cancel");
+        assert_eq!(code(boom(), true), 130, "a failure, then a stop");
+        assert_eq!(code(findings(), true), 130, "findings of a stopped check");
+        assert_eq!(code(boom(), false), 2, "a failure");
+        assert_eq!(code(findings(), false), 1, "findings");
     }
 
     fn soft(args: &[&str]) -> Result<clap::ArgMatches, clap::Error> {

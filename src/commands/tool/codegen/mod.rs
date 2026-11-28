@@ -9,7 +9,8 @@
 //!
 //! Exit codes are 0 / 1 / 2 (Decision 20), unlike every other heph command:
 //! `--check` must tell findings from failures. A command ends in a typed
-//! [`CodegenExit`], which `main.rs` downcasts.
+//! [`CodegenExit`], which `main.rs` downcasts; a cancel exits 130 there, as
+//! on every command.
 
 pub mod gitignore;
 pub mod import;
@@ -34,7 +35,7 @@ use crate::tui::{BufferedStdout, LogSink};
 pub use paths::{ResolvedPath, resolve_path, root_hint, with_hint};
 
 /// The `--help` epilogue every codegen subcommand carries.
-pub const EXIT_CODES_HELP: &str = "Exit codes:\n  0  OK\n  1  findings (--check), or a refused or unknown path\n  2  error; a usage error (an unknown flag, a missing argument) also exits 2";
+pub const EXIT_CODES_HELP: &str = "Exit codes:\n  0    OK\n  1    findings (--check), or a refused or unknown path\n  2    error; a usage error (an unknown flag, a missing argument) also exits 2\n  130  cancelled";
 
 /// How a codegen command ended, when not with 0. `main.rs` exits with
 /// `code`; `error`, when set, is rendered first (any failure that is not a

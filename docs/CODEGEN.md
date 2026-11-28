@@ -310,6 +310,7 @@ exits 1, so that `--check` can tell findings from failures):
 | 0 | OK |
 | 1 | findings (`--check`), or a refused or unknown path |
 | 2 | an error, including a usage error (unknown flag, missing argument) |
+| 130 | cancelled (Ctrl-C, SIGTERM, SIGHUP), as every heph command |
 
 ### `heph tool codegen gitignore [--check] [MATCHER]`
 
