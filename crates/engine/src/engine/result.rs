@@ -7212,6 +7212,7 @@ impl Engine {
                                 dep,
                                 declarer,
                                 || crate::engine::deferred::declared_origin(&input.origin_id),
+                                |_| rs.decl_loc(declarer),
                                 |e| hplugin::diagnostic::with_stage(e, Boundary::GetSpec, dep),
                             )
                         })?;
@@ -7552,6 +7553,7 @@ mod failure_fate_tests {
             &input,
             &declarer,
             || origin.to_owned(),
+            |_| None,
             |e| {
                 e.context(InputDefFailed {
                     input: input.clone(),
@@ -7711,6 +7713,7 @@ mod failure_fate_tests {
             dep: a("//d:t"),
             declarer: a("//c:y"),
             origin_id: "deps".to_owned(),
+            at: None,
         });
         assert!(
             matches!(failure_fate(&a("//c:y"), &e), FailureFate::Propagate),

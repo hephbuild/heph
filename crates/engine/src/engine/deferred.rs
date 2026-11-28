@@ -567,6 +567,7 @@ impl Engine {
                             &p.addr.r#ref,
                             consumer,
                             || format!("${{{READ}://}}"),
+                            |_| rs.decl_loc(consumer),
                             |e| e.context(format!("{consumer}: `{}` in `{}`", r.raw, r.path)),
                         )
                     })?;
