@@ -3031,7 +3031,8 @@ fn tty_printed_nothing() {
     let b = boxed(TTY_BUILD, r#""$HEPH" run //pkg:empty"#);
     b.assert_failed();
     assert!(
-        b.rows().iter().any(|r| r.contains("│ (no output)")),
+        // A note with no line is one row of its own, not framed (D6.1).
+        b.rows().iter().any(|r| r.trim() == "(no output)"),
         "a target that printed nothing says so\n{}",
         b.report()
     );
