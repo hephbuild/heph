@@ -93,6 +93,7 @@ mod tests {
             ev(BuildEventKind::ResultStart { addr: a.into() });
         }
         ev(BuildEventKind::ResultEnd {
+            failure: None,
             duplicate: false,
             upstream_file: None,
             path: Vec::new(),

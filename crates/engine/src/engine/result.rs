@@ -2473,12 +2473,17 @@ fn announce_culprit(
 ) {
     use crate::engine::event::BuildEventKind;
     let path = path.iter().map(Addr::format).collect();
+    // Announced by the claim's winner, after the claim: the record is there.
+    let record = rs
+        .get_culprit_failure(culprit)
+        .map(|f| Arc::clone(&f.record));
     match culprit {
         Culprit::File(file) => rs.emit(BuildEventKind::FileFailed {
             file: file.to_string(),
             entry: entry.format(),
             error: detail.message,
             path,
+            failure: record.map(|r| Box::new((*r).clone())),
         }),
         Culprit::Target(addr) => {
             // A culprit whose own scope already opened (its locked
@@ -2500,7 +2505,7 @@ fn announce_culprit(
                 rs,
                 addr,
                 Some(detail),
-                EndBlame::Culprit { path },
+                EndBlame::Culprit { path, record },
                 None,
             ));
         }
@@ -2599,16 +2604,20 @@ fn result_end_event(
         Some(mut d) => {
             d.upstream_of = None;
             let duplicate = matches!(blame, EndBlame::Duplicate { .. });
-            let (upstream_file, path) = match blame {
-                EndBlame::Unknown => (None, Vec::new()),
-                EndBlame::Duplicate { file } => (file, Vec::new()),
+            let (upstream_file, path, record) = match blame {
+                EndBlame::Unknown => (None, Vec::new(), None),
+                EndBlame::Duplicate { file } => (file, Vec::new(), None),
                 EndBlame::Skipped { of, file } => {
                     d.upstream_of = Some(of);
-                    (file, Vec::new())
+                    (file, Vec::new(), None)
                 }
-                EndBlame::Culprit { path } => (None, path),
+                EndBlame::Culprit { path, record } => (None, path, record),
             };
             let cancelled = rs.end_is_cancelled(&addr, &d);
+            // The record is the culprit's box: a stop is no failure to box.
+            let failure = record
+                .filter(|_| !cancelled)
+                .map(|r| Box::new((*r).clone()));
             // The final report's `took down:` row reads the same
             // `upstream_of` the event carries.
             if let Some(root) = &d.upstream_of
@@ -2633,6 +2642,7 @@ fn result_end_event(
                 cancelled,
                 duplicate: duplicate && !cancelled,
                 left_behind: left_behind(d.left_behind, log_readable),
+                failure,
             }
         }
         None => crate::engine::event::BuildEventKind::ResultEnd {
@@ -2648,6 +2658,7 @@ fn result_end_event(
             log_tail: None,
             timed_out: None,
             left_behind: None,
+            failure: None,
         },
     }
 }
@@ -2664,8 +2675,13 @@ enum EndBlame {
     /// led into `file`, a BUILD file that did not evaluate.
     Skipped { of: String, file: Option<String> },
     /// This end is the culprit's: the shortest path from a requested target,
-    /// inclusive.
-    Culprit { path: Vec<String> },
+    /// inclusive, and its record once the claim is decided
+    /// ([`with_record`](Self::with_record)): what the end carries as
+    /// `failure`.
+    Culprit {
+        path: Vec<String>,
+        record: Option<Arc<hplugin::error::FailureRecord>>,
+    },
     /// A culprit's own end that lost the claim (another end, a synthetic
     /// pair or a `FileFailed` announced the culprit first): it closes the
     /// row, flagged so no consumer boxes or counts it (D1.d). `file` is set
@@ -2676,6 +2692,19 @@ enum EndBlame {
 }
 
 impl EndBlame {
+    /// A culprit end with `addr`'s recorded failure attached, read once the
+    /// claim is decided (after `classify_failure_fresh`): the record the
+    /// end's `failure` carries. Every other end is returned unchanged.
+    fn with_record(self, rs: &RequestState, addr: &Addr) -> Self {
+        match self {
+            Self::Culprit { path, record: None } => Self::Culprit {
+                path,
+                record: rs.get_failure(addr).map(|f| Arc::clone(&f.record)),
+            },
+            other => other,
+        }
+    }
+
     /// The end `fate` gives `addr`. Walks the request's `DepDag` for a
     /// culprit's path: never call it holding the failures lock.
     fn of(rs: &RequestState, addr: &Addr, fate: &FailureFate<'_>) -> Self {
@@ -2709,6 +2738,7 @@ impl EndBlame {
             },
             FailureFate::Blame { .. } | FailureFate::Each { .. } => Self::Culprit {
                 path: rs.culprit_path_strings(addr),
+                record: None,
             },
             FailureFate::Propagate | FailureFate::Cancelled | FailureFate::Shell(_) => {
                 Self::Unknown
@@ -3087,7 +3117,7 @@ impl Engine {
                 rs,
                 addr_str,
                 Some(detail),
-                EndBlame::Culprit { path },
+                EndBlame::Culprit { path, record: None }.with_record(rs, addr),
                 Some(readable),
             ));
         }
@@ -3897,6 +3927,7 @@ impl Engine {
             let detail = ErrorDetail::from_error(&e);
             let end = EndBlame::of(rs, &addr, &failure_fate(&addr, &e));
             let (marker, _) = classify_failure_fresh(rs, &addr, e);
+            let end = end.with_record(rs, &addr);
             rs.emit(result_end_event(rs, addr_str, Some(detail), end, None));
             gaps.withdraw(
                 crate::engine::discovery::Stage::Probe,
@@ -3988,7 +4019,7 @@ impl Engine {
                 *blame.lock() = if own && !fresh {
                     EndBlame::Duplicate { file: None }
                 } else {
-                    end
+                    end.with_record(&fate_rs, addr)
                 };
                 let more = (own && fresh).then_some(async move {
                     // Set once: this scope ends once.

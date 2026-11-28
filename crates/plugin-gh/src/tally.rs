@@ -411,6 +411,9 @@ impl Tally {
                 // The job summary names the failure; where its log is
                 // stays in the step's own output.
                 left_behind: _,
+                // The summary names the failure by its message; the record's
+                // box is the job log's.
+                failure: _,
                 duplicate,
             } => {
                 // Another end announced this culprit: close the row, count
@@ -610,6 +613,7 @@ impl Tally {
                 file,
                 // The report names no path: the job log's block has it.
                 path: _,
+                failure: _,
             } => self.record_root(
                 entry,
                 Failure {
@@ -1057,6 +1061,7 @@ mod tests {
         t.apply(&ev(
             end,
             BuildEventKind::ResultEnd {
+                failure: None,
                 duplicate: false,
                 upstream_file: None,
                 path: Vec::new(),
@@ -1081,6 +1086,7 @@ mod tests {
         t.apply(&ev(
             10,
             BuildEventKind::ResultEnd {
+                failure: None,
                 duplicate: false,
                 upstream_file: None,
                 path: Vec::new(),
@@ -1099,6 +1105,7 @@ mod tests {
             t.apply(&ev(
                 20,
                 BuildEventKind::ResultEnd {
+                    failure: None,
                     duplicate: false,
                     upstream_file: None,
                     path: Vec::new(),
@@ -1149,6 +1156,7 @@ mod tests {
         t.apply(&ev(
             10,
             BuildEventKind::FileFailed {
+                failure: None,
                 file: "d/BUILD".into(),
                 entry: "//d:t1".into(),
                 error: "evaluating d/BUILD: name 'nope' is not defined".into(),
@@ -1157,6 +1165,7 @@ mod tests {
         ));
         let end =
             |addr: &str, upstream_of: Option<&str>, duplicate: bool| BuildEventKind::ResultEnd {
+                failure: None,
                 duplicate,
                 upstream_file: Some("d/BUILD".into()),
                 path: Vec::new(),
@@ -1234,6 +1243,7 @@ mod tests {
             t.apply(&ev(
                 5,
                 BuildEventKind::ResultEnd {
+                    failure: None,
                     duplicate: false,
                     upstream_file: None,
                     path: Vec::new(),
@@ -1904,6 +1914,7 @@ mod tests {
         t.apply(&ev(
             5,
             BuildEventKind::ResultEnd {
+                failure: None,
                 duplicate: false,
                 upstream_file: None,
                 path: Vec::new(),
@@ -1928,6 +1939,7 @@ mod tests {
             t.apply(&ev(
                 0,
                 BuildEventKind::ResultEnd {
+                    failure: None,
                     duplicate: false,
                     upstream_file: None,
                     path: Vec::new(),
@@ -1956,6 +1968,7 @@ mod tests {
             t.apply(&ev(
                 0,
                 BuildEventKind::ResultEnd {
+                    failure: None,
                     duplicate: false,
                     upstream_file: None,
                     path: Vec::new(),
@@ -1983,6 +1996,7 @@ mod tests {
         t.apply(&ev(
             10,
             BuildEventKind::ResultEnd {
+                failure: None,
                 duplicate: false,
                 upstream_file: None,
                 path: Vec::new(),
@@ -2035,6 +2049,7 @@ mod tests {
         t.apply(&ev(
             5_000,
             BuildEventKind::ResultEnd {
+                failure: None,
                 duplicate: false,
                 upstream_file: None,
                 path: Vec::new(),

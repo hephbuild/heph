@@ -297,6 +297,7 @@ mod tests {
 
     fn end(error: Option<ErrorDetail>) -> BuildEventKind {
         BuildEventKind::ResultEnd {
+            failure: None,
             duplicate: false,
             left_behind: None,
             cancelled: false,

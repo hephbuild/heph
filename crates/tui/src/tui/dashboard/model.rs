@@ -1197,6 +1197,7 @@ mod tests {
         let redact = Redact::default();
         let mut m = Model::default();
         let end = |error: Option<&str>| BuildEventKind::ResultEnd {
+            failure: None,
             duplicate: false,
             upstream_file: None,
             path: Vec::new(),
@@ -1360,6 +1361,7 @@ mod tests {
                     _ => (Some("boom".to_owned()), Some(addr(rng)), false),
                 };
                 BuildEventKind::ResultEnd {
+                    failure: None,
                     duplicate: false,
                     upstream_file: None,
                     path: Vec::new(),
