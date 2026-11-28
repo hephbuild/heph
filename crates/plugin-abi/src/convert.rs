@@ -1859,20 +1859,41 @@ pub fn diagnostic_to_pb(err: &anyhow::Error) -> PbDiagnostic {
 /// plugin's text).
 ///
 /// Lenient, as the failure path is everywhere on the wire: nothing in it fails
-/// the decode, since the error it rides says what failed either way. An absent
-/// or unknown stage is `stage`, the stage of the call that failed; an unknown
+/// the decode, since the error it rides says what failed either way. An unknown
 /// hint kind is [`HintKind::Other`]; a location whose line or column is 0
 /// (both are 1-based) or whose file is not workspace-relative
 /// ([`SourceLoc::checked`]: empty, absolute, `..`, over the cap, a control
 /// character) is dropped with a `debug!` and the rest kept. Then every text is
 /// capped and escaped ([`Diagnostic::bounded`]).
-pub fn diagnostic_from_pb(d: PbDiagnostic, stage: Stage) -> Option<Diagnostic> {
-    diagnostic_from_pb_unbounded(d, stage).map(Diagnostic::bounded)
+///
+/// **The host says who and when, never the plugin.** The stage is always
+/// `stage`, the stage of the call that failed, and the plugin is always
+/// `plugin`, the name the host loaded it under: whatever the plugin wrote in
+/// either is dropped, so a plugin cannot pass its failure off as another
+/// stage's or another plugin's. `None` (a caller that does not know the
+/// name) leaves the plugin unnamed.
+pub fn diagnostic_from_pb_of(
+    d: PbDiagnostic,
+    stage: Stage,
+    plugin: Option<&str>,
+) -> Option<Diagnostic> {
+    diagnostic_from_pb_unbounded(d, stage, plugin).map(Diagnostic::bounded)
 }
 
-/// [`diagnostic_from_pb`] before [`Diagnostic::bounded`]: the text the
-/// plugin's own chain ended with, which [`plugin_error`] cuts off its message.
-fn diagnostic_from_pb_unbounded(d: PbDiagnostic, stage: Stage) -> Option<Diagnostic> {
+/// [`diagnostic_from_pb_of`] for a caller that does not know the plugin's
+/// name.
+pub fn diagnostic_from_pb(d: PbDiagnostic, stage: Stage) -> Option<Diagnostic> {
+    diagnostic_from_pb_of(d, stage, None)
+}
+
+/// [`diagnostic_from_pb_of`] before [`Diagnostic::bounded`]: the text the
+/// plugin's own chain ended with, which [`plugin_error_of`] cuts off its
+/// message.
+fn diagnostic_from_pb_unbounded(
+    d: PbDiagnostic,
+    stage: Stage,
+    plugin: Option<&str>,
+) -> Option<Diagnostic> {
     let d = d.into_option()?;
     let message = d.message.filter(|m| !m.trim().is_empty())?;
     let location = d.location.into_option().and_then(|l| {
@@ -1897,25 +1918,27 @@ fn diagnostic_from_pb_unbounded(d: PbDiagnostic, stage: Stage) -> Option<Diagnos
             Some(Hint::new(kind, h.text?))
         })
         .collect();
+    if let Some(claimed) = d.stage.as_deref()
+        && claimed != stage.as_str()
+    {
+        tracing::debug!(claimed, host = %stage, "plugin diagnostic's stage replaced by the host's");
+    }
     let diagnostic = Diagnostic {
-        stage: d
-            .stage
-            .as_deref()
-            .and_then(Stage::from_name)
-            .unwrap_or(stage),
+        stage,
         addr: None,
         message,
         location,
         snippet: d.snippet,
         hints,
-        plugin: d.plugin,
+        plugin: plugin.map(str::to_owned),
         truncated: d.truncated.unwrap_or_default(),
     };
     Some(diagnostic)
 }
 
 /// The host's error for a plugin's `message` (its whole flattened chain) and
-/// the diagnostic beside it, decoded at `stage` ([`diagnostic_from_pb`]).
+/// the diagnostic beside it, decoded at `stage` for `plugin`
+/// ([`diagnostic_from_pb_of`]).
 ///
 /// Without one it is the message alone, as before 0.21.4. With one, the
 /// plugin's chain ends with the diagnostic's text: that tail (and the `: `
@@ -1925,8 +1948,13 @@ fn diagnostic_from_pb_unbounded(d: PbDiagnostic, stage: Stage) -> Option<Diagnos
 /// diagnostic once and [`find_diagnostic`](hplugin::diagnostic::find_diagnostic)
 /// finds it. A message that does not end with it (a plugin that wrote both
 /// apart, or a location the decode dropped) is kept whole.
-pub fn plugin_error(message: String, diagnostic: PbDiagnostic, stage: Stage) -> anyhow::Error {
-    let Some(d) = diagnostic_from_pb_unbounded(diagnostic, stage) else {
+pub fn plugin_error_of(
+    message: String,
+    diagnostic: PbDiagnostic,
+    stage: Stage,
+    plugin: Option<&str>,
+) -> anyhow::Error {
+    let Some(d) = diagnostic_from_pb_unbounded(diagnostic, stage, plugin) else {
         return anyhow::Error::msg(message);
     };
     let (own, d) = split_diagnostic(&message, d);
@@ -1938,8 +1966,13 @@ pub fn plugin_error(message: String, diagnostic: PbDiagnostic, stage: Stage) -> 
     }
 }
 
+/// [`plugin_error_of`] for a caller that does not know the plugin's name.
+pub fn plugin_error(message: String, diagnostic: PbDiagnostic, stage: Stage) -> anyhow::Error {
+    plugin_error_of(message, diagnostic, stage, None)
+}
+
 /// `message` without its trailing copy of `d`'s text (compared before
-/// bounding), and `d` bounded: the two halves [`plugin_error`] stacks.
+/// bounding), and `d` bounded: the two halves [`plugin_error_of`] stacks.
 fn split_diagnostic(message: &str, d: Diagnostic) -> (String, Diagnostic) {
     let own = hcore::hmemoizer::own_part(message, &d.to_string()).to_owned();
     (own, d.bounded())
@@ -1954,11 +1987,16 @@ pub fn error_to_pb(kind: pb::error::Kind, err: &anyhow::Error) -> pb::Error {
     }
 }
 
-/// The host's error for a wire `Error` from a call at `stage` (the stage a
-/// diagnostic that names none is given): [`plugin_error`]. A missing message
+/// The host's error for a wire `Error` from `plugin`'s call at `stage` (the
+/// stage its diagnostic is given): [`plugin_error_of`]. A missing message
 /// is an error with no text, an honest default unlike a missing kind.
+pub fn error_from_pb_of(e: pb::Error, stage: Stage, plugin: Option<&str>) -> anyhow::Error {
+    plugin_error_of(e.message.unwrap_or_default(), e.diagnostic, stage, plugin)
+}
+
+/// [`error_from_pb_of`] for a caller that does not know the plugin's name.
 pub fn error_from_pb(e: pb::Error, stage: Stage) -> anyhow::Error {
-    plugin_error(e.message.unwrap_or_default(), e.diagnostic, stage)
+    error_from_pb_of(e, stage, None)
 }
 
 /// A run's failure as the wire carries it: `message` (the plugin's whole
@@ -2027,8 +2065,9 @@ fn failure_artifacts_from_pb(artifacts: Vec<pb::OutputArtifactRef>) -> Vec<Outpu
 /// Lenient on both artifact lists, as nowhere else on the wire: this is the failure
 /// path, and an artifact that does not decode must not cost the message that
 /// says what failed. It is dropped with a `debug!`; message and exit are kept.
-/// The diagnostic is as lenient ([`diagnostic_from_pb`]).
-pub fn run_failure_from_pb(failure: pb::RunFailure) -> anyhow::Error {
+/// The diagnostic is as lenient ([`diagnostic_from_pb_of`]), at the run stage
+/// and named for `plugin`.
+pub fn run_failure_from_pb_of(failure: pb::RunFailure, plugin: Option<&str>) -> anyhow::Error {
     let pb::RunFailure {
         message,
         exit,
@@ -2039,8 +2078,8 @@ pub fn run_failure_from_pb(failure: pb::RunFailure) -> anyhow::Error {
     } = failure;
     let message = message.unwrap_or_default();
     let err = match exit_from_pb(exit) {
-        None => plugin_error(message, diagnostic, Stage::Run),
-        Some(exit) => match diagnostic_from_pb_unbounded(diagnostic, Stage::Run) {
+        None => plugin_error_of(message, diagnostic, Stage::Run, plugin),
+        Some(exit) => match diagnostic_from_pb_unbounded(diagnostic, Stage::Run, plugin) {
             None => anyhow::Error::new(hplugin::error::RemoteProcessFailed::new(message, exit)),
             // The exit rides as a context over the diagnostic, with the
             // message's own part as its text (empty when the message was the
@@ -2055,6 +2094,12 @@ pub fn run_failure_from_pb(failure: pb::RunFailure) -> anyhow::Error {
     let err = hplugin::error::with_failure_artifacts(err, failure_artifacts_from_pb(artifacts));
     // Absent — what every plugin before 0.21.0 sends — is no write-back.
     hplugin::error::with_failure_write_back(err, failure_artifacts_from_pb(write_back))
+}
+
+/// [`run_failure_from_pb_of`] for a caller that does not know the plugin's
+/// name.
+pub fn run_failure_from_pb(failure: pb::RunFailure) -> anyhow::Error {
+    run_failure_from_pb_of(failure, None)
 }
 
 /// `addr`, `raw_def`, `cache` and `hash` are required; `pty` and `transparent`
@@ -4830,11 +4875,16 @@ nested: { a: 1, b: [x, y] }
         let text = hcore::hmemoizer::chain_message(&err);
         let expected = full_diagnostic();
         let check = |back: &anyhow::Error| {
-            assert_eq!(
-                hplugin::diagnostic::find_diagnostic(back),
-                Some(&expected),
-                "{back:#}"
-            );
+            // The stage and the plugin are the host's, not the plugin's
+            // (`host_overwrites_plugin_and_stage`); every other field crosses.
+            let got = hplugin::diagnostic::find_diagnostic(back)
+                .cloned()
+                .map(|d| Diagnostic {
+                    stage: expected.stage,
+                    plugin: expected.plugin.clone(),
+                    ..d
+                });
+            assert_eq!(got.as_ref(), Some(&expected), "{back:#}");
             assert_eq!(format!("{back:#}"), text, "the plugin's chain, said once");
             assert_eq!(hcore::hmemoizer::chain_message(back), text);
             assert_eq!(
@@ -4871,8 +4921,15 @@ nested: { a: 1, b: [x, y] }
             hplugin::error::ProcessFailed::new("exit status: 2", Some(Exit::Code(2))),
         );
         let run_text = hcore::hmemoizer::chain_message(&run_err);
-        let back = run_failure_from_pb(via_bytes(&run_failure_to_pb(&run_err, run_text.clone())));
-        assert_eq!(hplugin::diagnostic::find_diagnostic(&back), Some(&expected));
+        let back = run_failure_from_pb_of(
+            via_bytes(&run_failure_to_pb(&run_err, run_text.clone())),
+            Some("myplugin"),
+        );
+        let ran = Diagnostic {
+            stage: Stage::Run,
+            ..expected.clone()
+        };
+        assert_eq!(hplugin::diagnostic::find_diagnostic(&back), Some(&ran));
         assert_eq!(hplugin::error::process_exit(&back), Some(Exit::Code(2)));
         assert_eq!(hcore::hmemoizer::chain_message(&back), run_text);
         assert_eq!(format!("{back:#}"), run_text);
@@ -5061,7 +5118,7 @@ nested: { a: 1, b: [x, y] }
             "{}",
             d.message.get(..16).unwrap_or_default()
         );
-        assert!(d.plugin.as_ref().is_some_and(|p| p.len() <= HINT_CAP));
+        assert_eq!(d.plugin, None, "the plugin's own claim is dropped");
         assert_eq!(d.hints.len(), HINTS_CAP);
         assert_eq!(
             d.hints[0].kind,
@@ -5089,11 +5146,29 @@ nested: { a: 1, b: [x, y] }
             );
         }
 
-        // An absent stage is the failed call's too; a known one is kept.
+        // An absent stage is the failed call's too.
         let absent = diagnostic_from_pb(pb_diagnostic(|d| d.stage = None), Stage::Spec);
         assert_eq!(absent.map(|d| d.stage), Some(Stage::Spec));
-        let known = diagnostic_from_pb(pb_diagnostic(|_| {}), Stage::Spec);
-        assert_eq!(known.map(|d| d.stage), Some(Stage::Eval));
+    }
+
+    /// The host says which stage failed and which plugin raised it: a
+    /// plugin's own claim of either is replaced, never kept.
+    #[test]
+    fn host_overwrites_plugin_and_stage() {
+        let d = diagnostic_from_pb_of(
+            pb_diagnostic(|d| d.plugin = Some("someone_else".into())),
+            Stage::Spec,
+            Some("loaded"),
+        )
+        .expect("decodes");
+        assert_eq!(
+            (d.stage, d.plugin.as_deref()),
+            (Stage::Spec, Some("loaded"))
+        );
+        let unnamed =
+            diagnostic_from_pb(pb_diagnostic(|d| d.plugin = Some("x".into())), Stage::Link)
+                .expect("decodes");
+        assert_eq!((unnamed.stage, unnamed.plugin), (Stage::Link, None));
     }
 
     /// D2, P17: a location the plugin sends that is not workspace-relative is
