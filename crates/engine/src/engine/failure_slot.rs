@@ -3,7 +3,8 @@
 //! When a target's run fails, the engine copies the log the driver returned
 //! (its `Log` failure artifact, [`hplugin::error::failure_log`]) into
 //! `<home>/failures/<addr-key>/`: a `log.txt`, and a `manifest.json` written
-//! **last** naming the address, the revision and when it failed. The failure box
+//! **last** naming the address, the revision (none for a failure before the
+//! run), when it failed and the fill's own id (P12). The failure box
 //! renders the tail from the copy and points at it (`full log: <path>`).
 //!
 //! When the run kept `failure_out` matches (the managed layer packed them into
@@ -61,9 +62,9 @@ pub(crate) const FAILURES_DIR: &str = "failures";
 /// Name prefix of a slot being built or being discarded. A key never starts
 /// with a dot, so no key is ever taken for one.
 pub(crate) const TEMP_PREFIX: &str = ".tmp-";
-const MANIFEST: &str = "manifest.json";
 /// The kept log, inside a slot.
-pub const LOG: &str = "log.txt";
+pub use hcore::failure_log::LOG;
+use hcore::failure_log::MANIFEST;
 /// The kept `failure_out` matches, inside a slot, by workspace-relative path.
 pub const OUT: &str = "out";
 /// Every path a failed `in_place` run wrote back over the tree, one per line,
@@ -127,9 +128,22 @@ pub struct SlotManifest {
     /// The full address, variant included — the only place a reader takes it
     /// from; the directory name is not parsed.
     pub addr: String,
-    pub hashin: String,
+    /// The run's revision; `None` for a failure before the run, which has
+    /// none, and for an invocation, which is never hashed.
+    #[serde(default)]
+    pub hashin: Option<String>,
     /// Milliseconds since the Unix epoch.
     pub failed_at: u64,
+    /// This fill's id, a uuid minted per fill (P12): what a record's log
+    /// reference is compared against to tell the slot was since replaced.
+    /// `None` in a slot from an older heph. Never hashed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fill_id: Option<String>,
+    /// For a BUILD file's slot (`addr` is `file:<path>`): the packages whose
+    /// targets were reached through it, so `inspect failure //d:t` finds the
+    /// file's slot when `//d:t` has none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub packages: Vec<String>,
 }
 
 /// The engine's record of a failure's log on the error chain: what
@@ -160,6 +174,12 @@ pub struct FailureSlot {
     ///
     /// [`TerminalUse`]: crate::engine::TerminalUse
     pub streamed: bool,
+    /// The id of the fill that put the slot in place, when one did: what the
+    /// failure's record names its log by ([`hcore::failure::LogRef`]).
+    pub fill_id: Option<String>,
+    /// How many lines the slot's `log.txt` has, counted after the copy; 0
+    /// with no log on disk.
+    pub log_lines: u64,
 }
 
 impl FailureSlot {
@@ -389,8 +409,10 @@ impl FailureSlots {
         let manifest = SlotManifest {
             version: MANIFEST_VERSION,
             addr: fill.addr.format(),
-            hashin: fill.hashin.to_owned(),
+            hashin: (!fill.hashin.is_empty()).then(|| fill.hashin.to_owned()),
             failed_at: crate::engine::event::now_unix_ms(),
+            fill_id: Some(new_fill_id()),
+            packages: Vec::new(),
         };
         let (root, lines, material, roots) =
             (self.root.clone(), fill.lines, fill.material, fill.roots);
@@ -446,9 +468,11 @@ impl FailureSlots {
                     }
                     Filled {
                         key: Some(key),
+                        fill_id: manifest.fill_id,
+                        log_lines: built.log.as_ref().map_or(0, |l| l.2),
                         log: built
                             .log
-                            .map(|(path, file)| FailureLog::open(path, file, lines))
+                            .map(|(path, file, _)| FailureLog::open(path, file, lines))
                             .or(memory),
                         out: built.out,
                         out_error: built.out_error.map(|e| format!("{e:#}")),
@@ -489,8 +513,15 @@ impl FailureSlots {
             fixes,
             sandbox: None,
             streamed: false,
+            fill_id: filled.fill_id,
+            log_lines: filled.log_lines,
         }
     }
+}
+
+/// A new fill's id (P12).
+fn new_fill_id() -> String {
+    uuid::Uuid::new_v4().as_simple().to_string()
 }
 
 /// What a fill kept.
@@ -498,6 +529,10 @@ impl FailureSlots {
 struct Filled {
     /// The slot's name, when one was renamed into place.
     key: Option<String>,
+    /// The id of the fill that was renamed into place.
+    fill_id: Option<String>,
+    /// The lines of the slot's `log.txt`.
+    log_lines: u64,
     log: Option<FailureLog>,
     out: Option<PathBuf>,
     out_error: Option<String>,
@@ -681,8 +716,8 @@ fn temp_name(key: &str) -> String {
 struct Built {
     /// The log's final path and the log opened for reading — opened before
     /// the rename, so it is this fill's copy whatever replaces the slot
-    /// afterwards.
-    log: Option<(PathBuf, std::fs::File)>,
+    /// afterwards — and its line count.
+    log: Option<(PathBuf, std::fs::File, u64)>,
     /// The slot's `out/`, when the `failure_out` tar was unpacked in.
     out: Option<PathBuf>,
     /// Why the `failure_out` tar was not unpacked in, when the slot was kept
@@ -725,10 +760,11 @@ fn fill_slot(
                 LogSource::Fd(from) => copy_fd(from, &path)
                     .with_context(|| format!("copying the live log to {}", path.display()))?,
             }
-            Some(
-                std::fs::File::open(&path)
-                    .with_context(|| format!("opening {}", path.display()))?,
-            )
+            let file = std::fs::File::open(&path)
+                .with_context(|| format!("opening {}", path.display()))?;
+            let lines = hcore::failure_log::count_lines(&file)
+                .with_context(|| format!("counting the lines of {}", path.display()))?;
+            Some((file, lines))
         }
         None => None,
     };
@@ -787,7 +823,7 @@ fn fill_slot(
     temp.disarm();
     drop(old);
     Ok(Built {
-        log: log.map(|file| (dest.join(LOG), file)),
+        log: log.map(|(file, lines)| (dest.join(LOG), file, lines)),
         out: moved.then(|| dest.join(OUT)),
         out_error,
         fixes: wrote_fixes.then(|| dest.join(FIXES)),
@@ -836,8 +872,10 @@ pub(crate) fn write_test_slot(root: &Path, addr: &Addr, failed_at: u64, log: &[u
     let m = SlotManifest {
         version: MANIFEST_VERSION,
         addr: addr.format(),
-        hashin: "h".into(),
+        hashin: Some("h".into()),
         failed_at,
+        fill_id: Some(new_fill_id()),
+        packages: Vec::new(),
     };
     std::fs::write(dir.join(MANIFEST), serde_json::to_vec(&m).expect("json")).expect("manifest");
     dir
@@ -867,8 +905,10 @@ mod tests {
         SlotManifest {
             version: MANIFEST_VERSION,
             addr: a.format(),
-            hashin: "h".into(),
+            hashin: Some("h".into()),
             failed_at: 1,
+            fill_id: Some("f".into()),
+            packages: Vec::new(),
         }
     }
 
@@ -1057,7 +1097,7 @@ mod tests {
         let src = home.path().join("log.txt");
         std::fs::write(&src, "kept\n").expect("src");
         let a = addr("//p:a");
-        let (path, _file) = fill_slot(
+        let (path, _file, lines) = fill_slot(
             &home.path().join(FAILURES_DIR),
             &addr_key(&a),
             &manifest_for(&a),
@@ -1071,6 +1111,7 @@ mod tests {
         .expect("a log");
         assert_eq!(std::fs::read(&src).expect("source still there"), b"kept\n");
         assert_eq!(std::fs::read(&path).expect("copy"), b"kept\n");
+        assert_eq!(lines, 1, "the copy's lines are counted");
     }
 
     fn raw_log(data: &[u8]) -> OutputArtifact {
@@ -1159,6 +1200,41 @@ mod tests {
             );
         }
         assert_eq!(std::fs::read(&secret).expect("untouched"), b"outside\n");
+    }
+
+    /// Every fill mints its own id, written to the manifest and handed back
+    /// on the slot with the copy's line count; an invocation's fill (no
+    /// revision) writes no `hashin`.
+    #[tokio::test]
+    async fn each_fill_mints_its_fill_id() {
+        let home = tempfile::tempdir().expect("home");
+        let slots = FailureSlots::new(home.path());
+        let a = addr("//p:a");
+        let mut ids = Vec::new();
+        for hashin in ["h", ""] {
+            let err = with_failure_artifacts(anyhow::anyhow!("boom"), vec![raw_log(b"a\nb\nc")]);
+            let slot = slots
+                .fill(Fill {
+                    addr: &a,
+                    hashin,
+                    roots: Vec::new(),
+                    err: &err,
+                    lines: 10,
+                    material: false,
+                    fixes: None,
+                    keep_log: true,
+                })
+                .await;
+            let m = slots.read(&a).expect("a slot");
+            assert_eq!(
+                m.fill_id, slot.fill_id,
+                "the slot names the manifest's fill"
+            );
+            assert_eq!(m.hashin.as_deref(), (!hashin.is_empty()).then_some(hashin));
+            assert_eq!(slot.log_lines, 3);
+            ids.push(slot.fill_id.expect("a fill id"));
+        }
+        assert_ne!(ids.first(), ids.get(1), "two fills, two ids");
     }
 
     /// Credential material never gets a slot: the tail is read into memory.

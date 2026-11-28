@@ -549,7 +549,13 @@ impl Engine {
                 newest = Some(s);
             }
         };
-        if let Some(slot) = self.failure_slots.read(addr).filter(|m| wanted(&m.hashin)) {
+        // A slot from before the run has no revision, and no log: only an
+        // unfiltered ask finds it.
+        if let Some(slot) = self
+            .failure_slots
+            .read(addr)
+            .filter(|m| wanted(m.hashin.as_deref().unwrap_or_default()))
+        {
             consider(Stored::Slot(slot));
         }
         if let Some(entry) = self.newest_cached_log(addr, hashin)? {
@@ -618,7 +624,7 @@ impl Engine {
                 let path = self.failure_slots.slot_dir(addr).join(failure_slot::LOG);
                 let info = LogInfo {
                     source: LogSource::FailureSlot,
-                    hashin: slot.hashin,
+                    hashin: slot.hashin.unwrap_or_default(),
                     at_unix_ms: slot.failed_at,
                 };
                 return hcore::blocking::run(move || match open_plain(&path)? {
@@ -1171,7 +1177,7 @@ impl LogFollower {
                 .engine
                 .failure_slots
                 .read(&self.addr)
-                .filter(|m| m.hashin == hashin)
+                .filter(|m| m.hashin.as_deref() == Some(hashin))
                 .map(Stored::Slot),
         };
         let opened = stored.and_then(|s| self.open_local(s));
@@ -1205,7 +1211,7 @@ impl LogFollower {
                     OpenLog::plain(
                         LogInfo {
                             source: LogSource::FailureSlot,
-                            hashin: slot.hashin,
+                            hashin: slot.hashin.unwrap_or_default(),
                             at_unix_ms: slot.failed_at,
                         },
                         f,

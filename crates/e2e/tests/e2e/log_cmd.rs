@@ -283,6 +283,10 @@ async fn log_cmd_current_is_meta() -> anyhow::Result<()> {
         .read(&parse_addr("//p:bad")?)
         .expect("a slot");
     let (current, _, _) = log(&e, "//p:bad", true).await?;
-    assert_eq!(hashin_of(&current), slot.hashin, "the slot's hash");
+    assert_eq!(
+        Some(hashin_of(&current)),
+        slot.hashin.as_deref(),
+        "the slot's hash"
+    );
     Ok(())
 }

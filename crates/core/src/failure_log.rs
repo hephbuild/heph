@@ -251,6 +251,22 @@ fn read_exact_at(
     Ok(())
 }
 
+/// How many lines `file` holds, as `str::lines` counts them: every line
+/// break, plus an unterminated last line. Positional reads in
+/// [`COUNT_CHUNK`] steps, so the cursor is untouched and memory constant.
+pub fn count_lines(file: &File) -> io::Result<u64> {
+    use std::os::unix::fs::FileExt as _;
+    let len = file.metadata()?.len();
+    let mut read_at = |buf: &mut [u8], off: u64| file.read_at(buf, off);
+    let breaks = count_lines_before(&mut read_at, len)? as u64;
+    let open = len > 0 && {
+        let mut last = [0u8; 1];
+        read_exact_at(&mut read_at, &mut last, len - 1)?;
+        last != *b"\n"
+    };
+    Ok(breaks + u64::from(open))
+}
+
 /// What [`stream_tail`] wrote.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TailStats {
@@ -485,6 +501,25 @@ mod tests {
         let mut out = Vec::new();
         let stats = stream_tail(&file, n, &mut out).expect("stream");
         (out, stats)
+    }
+
+    /// `count_lines` agrees with `str::lines` on every shape of log, one
+    /// that spans several count chunks included.
+    #[test]
+    fn count_lines_matches_str_lines() {
+        let long: String = (0..20_000).map(|i| format!("line {i}\n")).collect();
+        for log in ["", "\n", "a", "a\n", "a\nb", "a\n\nb\n", long.as_str()] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join(LOG);
+            std::fs::write(&path, log).expect("write log");
+            let file = File::open(&path).expect("open log");
+            assert_eq!(
+                count_lines(&file).expect("count"),
+                log.lines().count() as u64,
+                "{:?}",
+                log.get(..20)
+            );
+        }
     }
 
     /// 1000 lines of 1 KiB are ~1 MiB: the tail keeps the last 256 KiB. A cut

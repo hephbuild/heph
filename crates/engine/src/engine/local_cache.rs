@@ -3834,7 +3834,8 @@ mod tests {
             .failure_slots()
             .read(&addr)
             .expect("the failure filled its slot")
-            .hashin;
+            .hashin
+            .expect("a run's slot names its revision");
         assert!(
             engine.read_manifest(&addr, &hashin)?.is_none(),
             "a failed run filed a manifest"
