@@ -467,6 +467,41 @@ async fn broken_build_one_box_for_two_requested_targets() -> anyhow::Result<()> 
     Ok(())
 }
 
+/// CQ-M1: the selection's walk fails on `d/BUILD`, whose loaded
+/// `tools/defs.star` is the broken file. The record is entered through the
+/// requested target of the package the walk was scanning (`//d:t`), not one
+/// guessed from the broken file's directory, which holds none of them.
+#[tokio::test]
+async fn walk_into_broken_loaded_file_enters_through_the_scanned_package() -> anyhow::Result<()>
+{
+    let ws = build_ws(&[
+        ("a", &t("t", "")),
+        (
+            "d",
+            &format!("load(\"//tools/defs.star\", \"x\")\n{}\n", t("t", "")),
+        ),
+    ]);
+    ws.write_file("tools/defs.star", "x = 1\nfail(\"boom\")\n");
+    let r = run_matcher(
+        &ws.engine,
+        &Matcher::Or(vec![
+            Matcher::Addr(addr("//a:t")),
+            Matcher::Addr(addr("//d:t")),
+        ]),
+    )
+    .await;
+    let err = r.err.as_ref().expect("the selection must fail");
+    assert_eq!(
+        r.culprits(),
+        ["tools/defs.star"],
+        "{}\nerr: {err:#}",
+        r.describe()
+    );
+    assert_eq!(r.failures[0].addr.format(), "//d:t", "{}", r.describe());
+    assert_eq!(r.path("tools/defs.star"), ["//d:t"]);
+    Ok(())
+}
+
 /// D1.c rule 5: `a → b → c → d` with `d/BUILD` failing at evaluation (not
 /// parse): the file, never `//c:t`, which only resolved it.
 #[tokio::test]
