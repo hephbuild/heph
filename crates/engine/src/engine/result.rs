@@ -2579,7 +2579,7 @@ impl EndBlame {
                 file: Some(file.to_string()),
             },
             FailureFate::Blame { .. } | FailureFate::Each { .. } => Self::Culprit {
-                path: rs.culprit_path(addr).iter().map(Addr::format).collect(),
+                path: rs.culprit_path_strings(addr),
             },
             FailureFate::Propagate | FailureFate::Cancelled | FailureFate::Shell(_) => {
                 Self::Unknown
@@ -2930,7 +2930,7 @@ impl Engine {
                 addr: addr_str.clone(),
             });
             let readable = self.log_readable(addr).await;
-            let path = rs.culprit_path(addr).iter().map(Addr::format).collect();
+            let path = rs.culprit_path_strings(addr);
             rs.emit(result_end_event(
                 rs,
                 addr_str,

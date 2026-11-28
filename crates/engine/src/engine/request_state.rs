@@ -369,17 +369,35 @@ impl DepDag {
     /// is its smallest-addressed neighbour one step closer, and the path
     /// starts at the smallest requested address at the shortest distance.
     /// The same graph gives the same path, whatever order its edges came in.
-    /// Each visited node is formatted once; nothing is visited twice.
+    /// Each visited node is formatted once for the sort; nothing is visited
+    /// twice.
+    ///
+    /// The claim-time walk, for one culprit while the graph still grows: it
+    /// visits every ancestor nearer than the nearest requested target, so a
+    /// culprit under a wide layer costs that layer. The request end asks for
+    /// every culprit at once through [`culprit_paths`](Self::culprit_paths),
+    /// one pass whatever the count.
+    pub fn culprit_path(&self, culprit: &Addr) -> Vec<Addr> {
+        self.culprit_path_with(culprit, Addr::clone)
+    }
+
+    /// [`culprit_path`](Self::culprit_path) formatted: each address on the
+    /// path is formatted straight from the graph, with no `Vec<Addr>` in
+    /// between. What an event's `path` carries.
+    pub fn culprit_path_strings(&self, culprit: &Addr) -> Vec<String> {
+        self.culprit_path_with(culprit, Addr::format)
+    }
+
     #[expect(
         clippy::indexing_slicing,
         reason = "node indices come from index_of or the adjacency lists, both bound to the vectors' lengths"
     )]
-    pub fn culprit_path(&self, culprit: &Addr) -> Vec<Addr> {
+    fn culprit_path_with<T>(&self, culprit: &Addr, each: impl Fn(&Addr) -> T) -> Vec<T> {
         let Some(c) = self.index(culprit) else {
             return Vec::new();
         };
         if self.requested.contains(&c) {
-            return vec![culprit.clone()];
+            return vec![each(culprit)];
         }
         // Each visited node's next hop toward the culprit (`UNSEEN` at it).
         let mut next: FxHashMap<u32, u32> = FxHashMap::default();
@@ -398,26 +416,96 @@ impl DepDag {
             }
             above.sort_by_cached_key(|&n| self.nodes[n as usize].format());
             if let Some(&start) = above.iter().find(|n| self.requested.contains(n)) {
-                return self.follow(start, |n| next.get(&n).copied().unwrap_or(UNSEEN));
+                let mut path = Vec::new();
+                let mut n = start;
+                while n != UNSEEN {
+                    path.push(each(&self.nodes[n as usize]));
+                    n = next.get(&n).copied().unwrap_or(UNSEEN);
+                }
+                return path;
             }
             std::mem::swap(&mut level, &mut above);
         }
         Vec::new()
     }
 
-    /// `start`'s addresses along `next` until it reaches `UNSEEN`.
+    /// Every one of `culprits`' [`culprit_path`](Self::culprit_path), in
+    /// their order, from one pass over the graph: what the request end hands
+    /// out once the graph is complete.
+    ///
+    /// One multi-source BFS forward from every requested target, level by
+    /// level. Level 0 is the requested targets by address; each later level
+    /// is sorted by (its parent's position, its address), and a node's
+    /// parent is the first node of the level above that leads to it. So a
+    /// node's path from its parent's is the shortest one, and of those the
+    /// smallest hop by hop from the requested end: the smallest requested
+    /// address at the shortest distance, then at each hop the smallest
+    /// address still on a shortest path, which is the path `culprit_path`
+    /// picks. O(nodes + edges) plus the level sorts, each node formatted
+    /// once, however many culprits there are; each path then costs its own
+    /// length. Memory is two `u32` per node.
     #[expect(
         clippy::indexing_slicing,
-        reason = "every hop is a node index a walk over this graph recorded"
+        reason = "node indices come from index_of or the adjacency lists, and every parent is one, all bound to the vectors' lengths"
     )]
-    fn follow(&self, start: u32, next: impl Fn(u32) -> u32) -> Vec<Addr> {
-        let mut path = Vec::new();
-        let mut n = start;
-        while n != UNSEEN {
-            path.push(self.nodes[n as usize].clone());
-            n = next(n);
+    pub fn culprit_paths<'a>(
+        &self,
+        culprits: impl IntoIterator<Item = &'a Addr>,
+    ) -> Vec<Vec<Addr>> {
+        /// A requested target's parent: where a path starts.
+        const START: u32 = UNSEEN - 1;
+        let mut parent = vec![UNSEEN; self.nodes.len()];
+        let mut rank = vec![UNSEEN; self.nodes.len()];
+        let mut order: Vec<u32> = self.requested.iter().copied().collect();
+        for &r in &order {
+            parent[r as usize] = START;
         }
-        path
+        order.sort_by_cached_key(|&n| self.nodes[n as usize].format());
+        let mut start = 0;
+        while start < order.len() {
+            let end = order.len();
+            for (i, &n) in order[start..].iter().enumerate() {
+                rank[n as usize] = (start + i) as u32;
+            }
+            for i in start..end {
+                let v = order[i];
+                for &s in &self.succ[v as usize] {
+                    if parent[s as usize] == UNSEEN {
+                        parent[s as usize] = v;
+                        order.push(s);
+                    }
+                }
+            }
+            let (_, level) = order.split_at_mut(end);
+            level.sort_by_cached_key(|&n| {
+                (
+                    rank[parent[n as usize] as usize],
+                    self.nodes[n as usize].format(),
+                )
+            });
+            start = end;
+        }
+        culprits
+            .into_iter()
+            .map(|culprit| {
+                let Some(mut n) = self.index(culprit) else {
+                    return Vec::new();
+                };
+                let mut path = Vec::new();
+                if parent[n as usize] == UNSEEN {
+                    return path;
+                }
+                loop {
+                    path.push(self.nodes[n as usize].clone());
+                    match parent[n as usize] {
+                        START => break,
+                        p => n = p,
+                    }
+                }
+                path.reverse();
+                path
+            })
+            .collect()
     }
 
     /// The request-end pass: for each of `skipped` that reaches one of
@@ -766,6 +854,9 @@ pub struct RequestStateData {
     /// How many request-end passes ([`RequestState::skipped_report`]) ran:
     /// one per failed request is the budget.
     report_passes: std::sync::atomic::AtomicUsize,
+    /// How many request-end path passes ([`DepDag::culprit_paths`]) ran: one
+    /// per handing-out of the failures, however many there are.
+    path_passes: std::sync::atomic::AtomicUsize,
     /// What each root failure took down, keyed by the root's formatted addr:
     /// the targets whose `ResultEnd` named it as `upstream_of`. Read by the
     /// interactive failure report's `took down:` row.
@@ -1380,15 +1471,20 @@ impl RequestState {
     /// depended on what had resolved by then; at request end the graph is
     /// complete and the shortest path is the same on every run. Called with
     /// the failures lock released: `dep_dag` stays a leaf. A failure whose
-    /// path did not move keeps its `Arc`.
+    /// path did not move keeps its `Arc`. One pass over the graph for all of
+    /// them ([`DepDag::culprit_paths`]), counted by
+    /// [`path_passes`](Self::path_passes): a walk per failure would cost
+    /// failures × ancestors under the lock.
     fn with_final_paths(&self, failures: Vec<Arc<TargetFailure>>) -> Vec<Arc<TargetFailure>> {
         if failures.is_empty() {
             return failures;
         }
-        let paths: Vec<Vec<Addr>> = {
-            let dag = self.data.dep_dag.lock();
-            failures.iter().map(|f| dag.culprit_path(&f.addr)).collect()
-        };
+        self.data.path_passes.fetch_add(1, Ordering::Relaxed);
+        let paths = self
+            .data
+            .dep_dag
+            .lock()
+            .culprit_paths(failures.iter().map(|f| &f.addr));
         failures
             .into_iter()
             .zip(paths)
@@ -1470,6 +1566,11 @@ impl RequestState {
         self.data.dep_dag.lock().culprit_path(addr)
     }
 
+    /// [`culprit_path`](Self::culprit_path), formatted: an event's `path`.
+    pub fn culprit_path_strings(&self, addr: &Addr) -> Vec<String> {
+        self.data.dep_dag.lock().culprit_path_strings(addr)
+    }
+
     /// The request-end pass over `failures` (what the run recorded, e.g.
     /// from [`take_failures`](Self::take_failures)): each of `skipped`'s
     /// nearest culprit, path to it and count of other culprits reached; see
@@ -1490,6 +1591,13 @@ impl RequestState {
     /// How many request-end passes this request ran.
     pub fn report_passes(&self) -> usize {
         self.data.report_passes.load(Ordering::Relaxed)
+    }
+
+    /// How many request-end path passes this request ran: one per
+    /// [`take_failures`](Self::take_failures) or
+    /// [`failures`](Self::failures) that had failures to hand out.
+    pub fn path_passes(&self) -> usize {
+        self.data.path_passes.load(Ordering::Relaxed)
     }
 
     /// Commit `from → to` to the request's graph as a real resolution would.
@@ -2206,6 +2314,7 @@ impl Engine {
             failures: Mutex::new(indexmap::IndexMap::new()),
             transitive_declarers: Mutex::new(FxHashMap::default()),
             report_passes: std::sync::atomic::AtomicUsize::new(0),
+            path_passes: std::sync::atomic::AtomicUsize::new(0),
             took_down: Mutex::new(FxHashMap::default()),
             cancelled: Mutex::new(FxHashSet::default()),
             approval,
@@ -2916,6 +3025,57 @@ mod tests {
         Ok(())
     }
 
+    /// FQ-2: 2000 culprits under a 17,997-wide layer, 20k nodes in all.
+    /// A walk per culprit visits the whole layer each time: 36M visits
+    /// under the `dep_dag` lock, 10 s in a debug build when measured. The
+    /// request end makes one pass per hand-out instead, and each path is
+    /// its own four hops.
+    #[tokio::test]
+    async fn final_paths_are_one_pass_for_2000_culprits() -> anyhow::Result<()> {
+        const WIDE: usize = 17_997;
+        const CULPRITS: usize = 2_000;
+        let (_tmp, engine) = test_engine()?;
+        let rs = engine.new_state_with_fail_fast(false);
+        let (r, hub) = (addr("r"), addr("hub"));
+        let wide: Vec<Addr> = (0..WIDE).map(|i| addr(&format!("m{i:05}"))).collect();
+        let culprits: Vec<Addr> = (0..CULPRITS).map(|i| addr(&format!("c{i:04}"))).collect();
+        rs.mark_requested(&r);
+        for m in &wide {
+            rs.add_dep_for_test(&r, m)?;
+        }
+        for m in &wide {
+            rs.add_dep_for_test(m, &hub)?;
+        }
+        for c in &culprits {
+            rs.add_dep_for_test(&hub, c)?;
+            rs.record_failure(
+                c.clone(),
+                Arc::new(TargetFailure::new(c.clone(), None, anyhow::anyhow!("boom"))),
+            );
+        }
+        assert_eq!(rs.path_passes(), 0, "recording walks nothing");
+
+        let seen = rs.failures();
+        assert_eq!(rs.path_passes(), 1, "one pass for {CULPRITS} failures");
+        let taken = rs.take_failures();
+        assert_eq!(rs.path_passes(), 2, "one more for the drain");
+        for fs in [&seen, &taken] {
+            assert_eq!(fs.len(), CULPRITS);
+            for (f, c) in fs.iter().zip(&culprits) {
+                assert_eq!(
+                    f.path,
+                    [r.clone(), wide[0].clone(), hub.clone(), c.clone()],
+                    "through the smallest of the wide layer"
+                );
+            }
+            let total: usize = fs.iter().map(|f| f.path.len()).sum();
+            assert_eq!(total, 4 * CULPRITS);
+        }
+        assert!(rs.take_failures().is_empty());
+        assert_eq!(rs.path_passes(), 2, "nothing to hand out walks nothing");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_cancel_all_requests_cancels_live_tokens() -> anyhow::Result<()> {
         let (_tmp, engine) = test_engine()?;
@@ -3469,6 +3629,80 @@ mod tests {
             assert_eq!(
                 record(&r, "s"),
                 ("d/BUILD".into(), names_of(&["s", "entry"]), 0)
+            );
+        }
+
+        /// The request end's one pass picks, for every node, the path the
+        /// claim-time walk picks: on the fixtures above, on a graph whose
+        /// two tie rules (by the requested end, by the culprit end) differ,
+        /// and on a seeded random DAG whose address order is scrambled
+        /// against its topological order.
+        #[test]
+        fn culprit_paths_agree_with_culprit_path() {
+            // Tie by the culprit end would take `b → x` (x < y); by the
+            // requested end, `a` comes first.
+            let ties = dag(
+                &[
+                    ("r", "a"),
+                    ("r", "b"),
+                    ("a", "y"),
+                    ("b", "x"),
+                    ("x", "c"),
+                    ("y", "c"),
+                ],
+                &["r"],
+            );
+            assert_eq!(
+                names(&ties.culprit_paths([&addr("c")])[0]),
+                ["r", "a", "y", "c"]
+            );
+
+            const N: usize = 300;
+            let name = |i: usize| format!("n{:03}", (i * 7919) % N);
+            let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+            let mut rand = move || {
+                seed = seed
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                (seed >> 33) as usize
+            };
+            let mut edges = Vec::new();
+            for i in 0..N {
+                for _ in 0..4 {
+                    let j = i + 1 + rand() % 40;
+                    if j < N {
+                        edges.push((name(i), name(j)));
+                    }
+                }
+            }
+            let edges: Vec<(&str, &str)> = edges
+                .iter()
+                .map(|(a, b)| (a.as_str(), b.as_str()))
+                .collect();
+            let requested = [name(0), name(3), name(17), name(150)];
+            let requested: Vec<&str> = requested.iter().map(String::as_str).collect();
+            let random = dag(&edges, &requested);
+
+            let fixtures = [
+                dag(&[("r", "a"), ("a", "b"), ("b", "c"), ("r", "c")], &["r"]),
+                dag(&[("r2", "x"), ("r1", "x"), ("x", "c")], &["r2", "r1"]),
+                dag(&[("z", "c"), ("a", "m"), ("m", "c")], &["z", "a"]),
+                dag(&[("p", "c")], &[]),
+                ties,
+                random,
+            ];
+            let mut deep = 0;
+            for d in &fixtures {
+                let all: Vec<Addr> = d.nodes.iter().cloned().chain([addr("absent")]).collect();
+                let once = d.culprit_paths(&all);
+                for (a, path) in all.iter().zip(&once) {
+                    assert_eq!(path, &d.culprit_path(a), "{}", a.format());
+                    deep += usize::from(path.len() > 3);
+                }
+            }
+            assert!(
+                deep > 100,
+                "the random DAG has deep paths to compare: {deep}"
             );
         }
     }
