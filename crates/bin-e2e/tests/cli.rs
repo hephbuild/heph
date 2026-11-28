@@ -121,6 +121,38 @@ fn succeeding_target_exits_zero() {
     assert!(out.status.success(), "{}", describe(&out));
 }
 
+/// A BUILD file that does not parse.
+const BROKEN_BUILD: &str = "target(name = \"t\", driver = \"bash\", run = \"true\")\nbroken(\n";
+
+/// D5: `heph query <addr>` on a target whose BUILD file does not evaluate
+/// fails as `run` does: one box for the file, and exit 1, never the
+/// "selection incomplete" gap report. The exit code is `main`'s, past the
+/// last function an in-process test can call; the culprit it records is
+/// `crates/e2e`'s `query_records_the_broken_file_as_culprit`.
+#[test]
+fn query_on_broken_file_one_box_exits_1() {
+    let dist = Dist::locate();
+    let ws = Workspace::new().expect("workspace");
+    ws.write("d/BUILD", BROKEN_BUILD).expect("write BUILD");
+
+    let out = ws.run(&dist, &["query", "//d:t"]).expect("query");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{}", describe(&out));
+    assert!(out.stdout.is_empty(), "{}", describe(&out));
+    assert_eq!(
+        stderr.matches("✗ ").count(),
+        1,
+        "one box: {}",
+        describe(&out)
+    );
+    assert!(stderr.contains("✗ d/BUILD"), "{}", describe(&out));
+    assert!(
+        !stderr.contains("selection incomplete"),
+        "{}",
+        describe(&out)
+    );
+}
+
 /// With stderr piped rather than attached to a terminal, the interactive
 /// renderer must stay off. A tool that drives a viewport when its output is
 /// being captured corrupts every CI log and every `heph … | tee` — and the tty
