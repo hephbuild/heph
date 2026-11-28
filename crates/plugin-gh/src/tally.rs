@@ -172,6 +172,10 @@ impl RootFailure {
     /// root, never the text; an older host's tail as it sent it. `None` when
     /// there is none, or the slot now holds another run's log.
     pub(crate) fn tail(&self, max_bytes: usize) -> Option<Cow<'_, str>> {
+        // An event's own tail comes only from a host that predates
+        // `failure.log`: this one sends none, and the tail is read from the
+        // log file below. Kept so a plugin-gh newer than the heph running it
+        // still renders that heph's tails.
         if let Some(t) = &self.log_tail {
             return Some(Cow::Borrowed(t.text.as_str()));
         }
