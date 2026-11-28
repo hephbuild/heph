@@ -853,6 +853,14 @@ pub struct RequestStateData {
     /// execution for rendering. Shared via `Arc<RequestStateData>`, so
     /// `with_parent` / `with_skip_provider` children record into the same map.
     pub failures: Mutex<indexmap::IndexMap<Culprit, Arc<TargetFailure>>>,
+    /// The secret values each target was handed this request (its
+    /// credentials' values when it ran, the deferred values it read), which
+    /// its recorded failure is scrubbed of
+    /// ([`compact`](crate::engine::failure_record::compact), I7). Request
+    /// state only: never on a def, never hashed (I1), dropped with the
+    /// request. Written only by a target that has some to scrub, read only on
+    /// a failure.
+    scrubs: Mutex<FxHashMap<Addr, crate::engine::failure_record::Scrub>>,
     /// The target behind each `_transitive_<hash>_<i>` origin id a
     /// dependent's merged transitive inputs carry, keyed by `<hash>`
     /// (`Addr::hash_str`): who declared a merged input, for a failure that
@@ -1454,6 +1462,49 @@ impl RequestState {
                 true
             }
         }
+    }
+
+    /// Scrub `values` out of `addr`'s recorded failure, and out of any
+    /// failure reached through it. A value under
+    /// [`REDACT_MIN_LEN`](hplugin::driver::REDACT_MIN_LEN) is never scrubbed
+    /// (it would corrupt ordinary text), so it is not kept; nothing is kept
+    /// for no values.
+    pub(crate) fn add_scrub(&self, addr: &Addr, values: impl IntoIterator<Item = String>) {
+        let mut values = values
+            .into_iter()
+            .filter(|v| v.len() >= hplugin::driver::REDACT_MIN_LEN)
+            .peekable();
+        if values.peek().is_none() {
+            return;
+        }
+        self.data
+            .scrubs
+            .lock()
+            .entry(addr.clone())
+            .or_default()
+            .extend(values);
+    }
+
+    /// Every value `addrs` were handed to scrub, together: what a failure
+    /// recorded against one of them and entered through another is
+    /// scrubbed of. Empty when none has any.
+    pub(crate) fn scrub_for(&self, addrs: &[&Addr]) -> crate::engine::failure_record::Scrub {
+        let scrubs = self.data.scrubs.lock();
+        let mut out = crate::engine::failure_record::Scrub::default();
+        if scrubs.is_empty() {
+            return out;
+        }
+        let mut seen: Vec<&Addr> = Vec::with_capacity(addrs.len());
+        for addr in addrs {
+            if seen.contains(addr) {
+                continue;
+            }
+            seen.push(addr);
+            if let Some(s) = scrubs.get(*addr) {
+                out.extend_from(s);
+            }
+        }
+        out
     }
 
     /// Drains and returns all recorded failures in insertion order, leaving the
@@ -2331,6 +2382,7 @@ impl Engine {
             bg_pending: Arc::clone(&bg_pending),
             sandbox_removals: crate::engine::sandbox_cleaner::PendingCounter::default(),
             failures: Mutex::new(indexmap::IndexMap::new()),
+            scrubs: Mutex::new(FxHashMap::default()),
             transitive_declarers: Mutex::new(FxHashMap::default()),
             report_passes: std::sync::atomic::AtomicUsize::new(0),
             path_passes: std::sync::atomic::AtomicUsize::new(0),
@@ -2394,6 +2446,32 @@ mod tests {
         });
         assert_eq!(claims, 1);
         assert!(!once(&flag), "a set flag is never claimed again");
+    }
+
+    /// A failure is scrubbed of every value each named target was handed,
+    /// a target named twice counted once, and a value too short to scrub is
+    /// not kept.
+    #[test]
+    fn scrub_for_unions_the_named_targets_values() -> anyhow::Result<()> {
+        let (_dir, engine) = test_engine()?;
+        let rs = engine.new_state();
+        let (a, b, c) = (addr("a"), addr("b"), addr("c"));
+        rs.add_scrub(&a, ["secret-of-a".to_owned(), "short".to_owned()]);
+        rs.add_scrub(&b, ["secret-of-b".to_owned()]);
+        rs.add_scrub(&c, ["secret-of-c".to_owned()]);
+        rs.add_scrub(&c, std::iter::empty());
+
+        let scrub = rs.scrub_for(&[&a, &b, &a]);
+        assert_eq!(format!("{scrub:?}"), "Scrub(2 values)");
+        let e = anyhow::anyhow!("secret-of-a secret-of-b secret-of-c short");
+        let culprit = Culprit::Target(a.clone());
+        let rec = crate::engine::failure_record::compact(&e, &culprit, &a, &scrub, None);
+        assert_eq!(
+            rec.diagnostic.message,
+            "[redacted] [redacted] secret-of-c short"
+        );
+        assert!(rs.scrub_for(&[&addr("d")]).is_empty());
+        Ok(())
     }
 
     /// A node's index in the DAG's parallel vectors, for white-box assertions.

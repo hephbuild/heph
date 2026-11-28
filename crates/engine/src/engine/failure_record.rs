@@ -47,6 +47,11 @@ impl Scrub {
         self.0.extend(values);
     }
 
+    /// Also scrub what `other` scrubs.
+    pub fn extend_from(&mut self, other: &Self) {
+        self.0.extend(other.0.iter().cloned());
+    }
+
     /// Whether there is nothing to scrub.
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
