@@ -2640,11 +2640,10 @@ fn result_end_event(
                 path,
                 exit_status: d.exit_status,
                 exit_code: d.exit_code,
-                log_tail: crate::engine::event::ErrorDetail::result_log_tail(
-                    d.log_tail,
-                    d.log.as_ref(),
-                    d.streamed,
-                ),
+                // Never the text (P13): the record names the log
+                // (`failure.log`), and a reader streams it from the slot.
+                // Kept on the wire, `None`, for an older reader.
+                log_tail: None,
                 timed_out: d.timed_out,
                 cancelled,
                 duplicate: duplicate && !cancelled,
@@ -12431,9 +12430,7 @@ mod tests {
         else {
             panic!("not a ResultEnd: {end:?}");
         };
-        let log_tail = log_tail.expect("ResultEnd keeps the tail");
-        assert_eq!(log_tail.text, "line9\nline10");
-        assert!(log_tail.streamed, "ResultEnd says it streamed");
+        assert!(log_tail.is_none(), "ResultEnd never carries the text (P13)");
         assert!(
             left_behind.and_then(|l| l.log_path).is_some(),
             "and keeps the log's path"

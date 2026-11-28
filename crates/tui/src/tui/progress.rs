@@ -2782,6 +2782,30 @@ fn live_failure_block(
     out
 }
 
+/// The tail of the slot log an end with no record names, read once when its
+/// block prints ([`hcore::failure_log::read_tail`]): at most `lines` lines,
+/// none when the end names no log or the slot holds none now. The end names
+/// no fill, so a newer run's log reads as whatever the slot holds.
+fn slot_tail(
+    left_behind: Option<&hcore::events::LeftBehindData>,
+    lines: usize,
+) -> Option<hcore::events::LogTailData> {
+    let path = left_behind?.log_path.clone()?;
+    if lines == 0 {
+        return None;
+    }
+    let log = hcore::events::LogRef {
+        path: Some(path),
+        ..Default::default()
+    };
+    let tail = hcore::failure_log::read_tail(&log, lines, hcore::failure_log::TAIL_MAX_BYTES)?;
+    Some(hcore::events::LogTailData {
+        text: tail.text,
+        start_line: tail.start_line,
+        streamed: false,
+    })
+}
+
 /// `block` followed by the box's last rows, so the end of the run need not
 /// print the box. Not redacted: they are paths to open and commands to run,
 /// which the box prints whole too.
@@ -3036,8 +3060,10 @@ impl CIAppView for CiProgressView {
             } if !self.failures_printed.contains(addr) => {
                 self.failures_printed.insert(addr.clone());
                 // The record's box, the one the end of the run would have
-                // drawn. An older host's end carries no record: the block
-                // built from the end's own fields.
+                // drawn. An end with no record (an older host's, or one this
+                // host sends without, a cycle's): the block built from the
+                // end's own fields, its tail the one an older host sent, else
+                // read from the slot the end names (P13).
                 let block = match failure {
                     Some(rec) => crate::tui::failure_report::render_box(rec, &self.render_ctx()),
                     None => with_left_behind(
@@ -3046,7 +3072,10 @@ impl CIAppView for CiProgressView {
                             error,
                             exit_status.as_deref(),
                             timed_out.as_ref(),
-                            log_tail.as_ref(),
+                            log_tail
+                                .clone()
+                                .or_else(|| slot_tail(left_behind.as_deref(), self.log_lines))
+                                .as_ref(),
                             left_behind.as_deref(),
                             (path, false),
                             self.log_lines,

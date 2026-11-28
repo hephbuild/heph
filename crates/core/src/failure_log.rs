@@ -420,6 +420,34 @@ pub fn open_tail(log: &LogRef, lines: usize, max_bytes: usize) -> TailRead {
     }
 }
 
+/// The tail of the log `log` names as text, for a consumer that has to hold
+/// it (a PR comment's code block), within `lines` and `max_bytes`: the
+/// record's in-memory tail when it has one (credential material, E2), else
+/// what [`open_tail`] streams of this record's log. `None` when the log was
+/// replaced, cleared or cannot be read: that consumer shows no tail rather
+/// than another run's.
+///
+/// Read once per call and dropped by the caller: nothing keeps it.
+pub fn read_tail(log: &LogRef, lines: usize, max_bytes: usize) -> Option<LogTail> {
+    if let Some(tail) = &log.memory_tail {
+        let (text, start) = last_n_lines_with_start(tail, lines.min(TAIL_LINES_CAP));
+        return Some(LogTail {
+            text,
+            start_line: start,
+        });
+    }
+    let open = match open_tail(log, lines, max_bytes) {
+        TailRead::Stream(open) | TailRead::CannotTell(open) => open,
+        TailRead::Replaced | TailRead::Cleared | TailRead::Unreadable(_) => return None,
+    };
+    let mut bytes = Vec::new();
+    let stats = open.stream(&mut bytes).ok()?;
+    Some(LogTail {
+        text: String::from_utf8_lossy(&bytes).into_owned(),
+        start_line: usize::try_from(stats.start_line).unwrap_or(usize::MAX),
+    })
+}
+
 /// [`DIAGNOSTIC`]'s envelope, as written.
 #[derive(Serialize)]
 struct DiagnosticOut<'a> {
@@ -721,6 +749,28 @@ mod tests {
             open_tail(&LogRef::default(), 10, 100),
             TailRead::Cleared
         ));
+    }
+
+    /// `read_tail` gives the record's own log as text, its in-memory tail
+    /// first, and nothing for another fill's log or a cleared slot.
+    #[test]
+    fn read_tail_reads_only_the_records_own_log() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("k");
+        let mine = slot(&dir, Some("a"), "one\ntwo\nthree\n");
+        let tail = read_tail(&mine, 2, TAIL_MAX_BYTES).expect("own log");
+        assert_eq!((tail.text.as_str(), tail.start_line), ("two\nthree", 2));
+
+        let memory = LogRef {
+            memory_tail: Some("x\ny".into()),
+            ..mine.clone()
+        };
+        assert_eq!(read_tail(&memory, 1, 100).expect("memory").text, "y");
+
+        slot(&dir, Some("b"), "newer\n");
+        assert_eq!(read_tail(&mine, 2, 100), None, "replaced");
+        std::fs::remove_dir_all(&dir).expect("rm slot");
+        assert_eq!(read_tail(&mine, 2, 100), None, "cleared");
     }
 
     /// `diagnostic.json` round-trips without the slot's own files, and reads

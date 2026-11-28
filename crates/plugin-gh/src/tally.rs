@@ -28,8 +28,11 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
-use hcore::events::{BuildEvent, BuildEventKind, CacheCounts, CacheOutcomeKind, LogTailData};
+use hcore::events::{
+    BuildEvent, BuildEventKind, CacheCounts, CacheOutcomeKind, LogRef, LogTailData,
+};
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::borrow::Cow;
 
 /// How many completed targets to retain for the "slowest" table. The heap is
 /// capped at this, so the memory is constant regardless of graph size.
@@ -137,10 +140,13 @@ pub(crate) struct RootFailure {
     pub message: String,
     /// The subprocess's exit status, when the failure was a subprocess.
     pub exit_status: Option<String>,
-    /// The last lines of the target's log — the part that actually says what
-    /// went wrong. This is what makes a red build diagnosable from the report
-    /// rather than only from the job log.
+    /// The last lines of the target's log, as an older host's `ResultEnd`
+    /// carried them. A current host sends none (P13): [`log`](Self::log)
+    /// names the log instead.
     pub log_tail: Option<LogTailData>,
+    /// Where the target's log is (the record's reference, never its text):
+    /// read when a report is rendered ([`tail`](Self::tail)), never held.
+    pub log: Option<LogRef>,
     pub driver: Option<String>,
     pub duration_ms: Option<u64>,
     /// Targets that failed solely because this one did.
@@ -155,6 +161,22 @@ impl RootFailure {
     /// target.
     pub(crate) fn culprit(&self) -> &str {
         self.file.as_deref().unwrap_or(&self.addr)
+    }
+
+    /// The last lines of the target's log, at most `max_bytes` of them — the
+    /// part that actually says what went wrong, which makes a red build
+    /// diagnosable from the report rather than only from the job log. Read
+    /// from the failure slot each time a report renders
+    /// ([`hcore::failure_log::read_tail`]), so the tally holds a path per
+    /// root, never the text; an older host's tail as it sent it. `None` when
+    /// there is none, or the slot now holds another run's log.
+    pub(crate) fn tail(&self, max_bytes: usize) -> Option<Cow<'_, str>> {
+        if let Some(t) = &self.log_tail {
+            return Some(Cow::Borrowed(t.text.as_str()));
+        }
+        let log = self.log.as_ref()?;
+        hcore::failure_log::read_tail(log, hcore::failure_log::TAIL_LINES_CAP, max_bytes)
+            .map(|t| Cow::Owned(t.text))
     }
 }
 
@@ -334,6 +356,8 @@ pub(crate) struct Failure<'a> {
     pub upstream_of: Option<&'a str>,
     pub exit_status: Option<&'a str>,
     pub log_tail: Option<&'a LogTailData>,
+    /// The record's log reference, from a current host.
+    pub log: Option<&'a LogRef>,
 }
 
 /// The package part of `//pkg/sub:name`, or the whole addr if it has no `:`.
@@ -412,8 +436,9 @@ impl Tally {
                 // stays in the step's own output.
                 left_behind: _,
                 // The summary names the failure by its message; the record's
-                // box is the job log's.
-                failure: _,
+                // box is the job log's. Its log reference is where the
+                // report reads the tail from.
+                failure,
                 duplicate,
             } => {
                 // Another end announced this culprit: close the row, count
@@ -430,6 +455,7 @@ impl Tally {
                         upstream_of: upstream_of.as_deref(),
                         exit_status: exit_status.as_deref(),
                         log_tail: log_tail.as_ref(),
+                        log: failure.as_ref().and_then(|f| f.log.as_ref()),
                     }),
                     ev.at_unix_ms,
                 );
@@ -622,6 +648,7 @@ impl Tally {
                     upstream_of: None,
                     exit_status: None,
                     log_tail: None,
+                    log: None,
                 },
                 None,
                 ev.at_unix_ms,
@@ -764,6 +791,7 @@ impl Tally {
             message: failure.message.to_string(),
             exit_status: failure.exit_status.map(str::to_string),
             log_tail: failure.log_tail.cloned(),
+            log: failure.log.cloned(),
             driver: rec.and_then(|r| r.driver.as_deref().map(str::to_string)),
             duration_ms: rec.map(|r| at.saturating_sub(r.started_ms)),
             blocked: 0,
