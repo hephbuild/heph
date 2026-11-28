@@ -1571,8 +1571,23 @@ impl RequestState {
     /// resolves anything: a spec not yet resolved, or resolved with an error,
     /// has no location here.
     pub(crate) fn decl_loc(&self, addr: &Addr) -> Option<hcore::diagnostic::SourceLoc> {
-        let spec = self.data.mem_spec.peek(&AddrKey(addr.clone()))?.ok()?;
-        Some(spec.spec.source.as_ref()?.call_loc())
+        Some(self.resolved_spec(addr)?.spec.source.as_ref()?.call_loc())
+    }
+
+    /// `addr`'s spec, when this request already resolved it. Never
+    /// resolves anything.
+    pub(crate) fn resolved_spec(&self, addr: &Addr) -> Option<Arc<EngineTargetSpec>> {
+        self.data.mem_spec.peek(&AddrKey(addr.clone()))?.ok()
+    }
+
+    /// Clear `addr`'s failure slot, and the source file slots its resolved
+    /// spec says evaluated again (`FailureSlots::clear`).
+    pub(crate) async fn clear_failure(
+        &self,
+        slots: &crate::engine::failure_slot::FailureSlots,
+        addr: &Addr,
+    ) {
+        slots.clear(addr, || self.resolved_spec(addr)).await;
     }
 
     /// Drains and returns all recorded failures in insertion order, leaving the

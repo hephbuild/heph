@@ -2399,6 +2399,14 @@ fn record_culprit(
                 Culprit::File(_) => vec![entry.package.as_str().to_owned()],
                 Culprit::Target(_) => Vec::new(),
             },
+            // The provider whose `get` evaluated the file (H-M3).
+            provider: match &culprit {
+                Culprit::File(_) => {
+                    hcore::hmemoizer::innermost::<crate::engine::discovery::InProvider>(&e)
+                        .map(|p| p.provider.clone())
+                }
+                Culprit::Target(_) => None,
+            },
         });
     let mut failure = TargetFailure::new(entry);
     if let Some(record) = record {
@@ -4897,7 +4905,7 @@ impl Engine {
         read: ResultReadGuard,
     ) -> (Arc<LockedResolution>, Option<Arc<ResultReadGuard>>) {
         // The target resolved: its last failure is stale. Under the read.
-        self.failure_slots.clear(addr).await;
+        rs.clear_failure(&self.failure_slots, addr).await;
         let (slot, read) = GuardSlot::new(addr, hashin, Resolved::Hit(Arc::clone(&manifest)), read);
         (
             Arc::new(LockedResolution {
@@ -5307,7 +5315,7 @@ impl Engine {
         // A hit after all (the re-check, or the remote): the last failure is
         // stale. Under the write lock. An execute cleared it itself.
         if executed.is_none() {
-            self.failure_slots.clear(addr).await;
+            rs.clear_failure(&self.failure_slots, addr).await;
         }
 
         // Downgrade to an upgradable read, then take a plain read while still
@@ -12718,14 +12726,14 @@ mod tests {
         assert!(!slot.join(hcore::failure_log::LOG).exists());
         let diag = hcore::failure_log::read_diagnostic(&slot).expect("diagnostic.json");
         assert!(diag.diagnostic.message.contains("def failed"), "{diag:?}");
-        engine.failure_slots.clear(&addr).await;
+        engine.failure_slots.clear(&addr, || None).await;
         assert!(!slot.exists());
 
         // An engine that has listed `failures/` (empty) and has not seen the
         // write land: the clear must still wait for it.
         let rs = engine.new_state();
         let _ = classify_failure(&rs, &addr, anyhow::anyhow!("def failed again"));
-        engine.failure_slots.clear(&addr).await;
+        engine.failure_slots.clear(&addr, || None).await;
         engine.failure_slots.writes_drained().await;
         assert!(!slot.exists(), "the write landed after the clear");
         Ok(())

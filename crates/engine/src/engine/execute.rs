@@ -141,7 +141,7 @@ impl Engine {
         // This target resolves again: its last failure no longer describes it.
         // Under the execute lock, before the sandbox exists, so a failure of
         // this run fills a slot nothing clears behind it.
-        self.failure_slots.clear(addr).await;
+        rs.clear_failure(&self.failure_slots, addr).await;
 
         // Counted once the reservation is actually in hand.
         let _running = crate::engine::diag::RunningPermit::new();
