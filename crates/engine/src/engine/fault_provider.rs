@@ -15,7 +15,7 @@ use crate::engine::error::{CancelledError, MultiError};
 use crate::engine::provider::{
     ConfigRequest, ConfigResponse, GetError, GetRequest, GetResponse, ListPackageResponse,
     ListPackagesRequest, ListRequest, ListResponse, ListedFacts, ProbeRequest, ProbeResponse,
-    Provider, State,
+    Provider, SourceIndex, SpecSource, State,
 };
 use futures::future::BoxFuture;
 use hbuiltins::pluginstatictarget;
@@ -95,6 +95,32 @@ pub struct Faults {
     /// timing. Size the barrier to the addr count; resolving them one at a
     /// time hangs, so wrap the call in a timeout.
     pub rendezvous: Option<(Vec<Addr>, Arc<tokio::sync::Barrier>)>,
+    /// The [`SpecSource`] `get` reports for each of these addrs; every other
+    /// spec has none, as the static provider reports.
+    pub sources: Vec<(Addr, SpecSource)>,
+    /// What [`Provider::source_index`] answers for a file; `None` keeps the
+    /// trait's default (no index), as a cdylib provider does.
+    pub source_index: Option<SourceIndexFn>,
+}
+
+/// [`Faults::source_index`]: the index of a file, called as the engine
+/// calls [`Provider::source_index`].
+#[derive(Clone)]
+pub struct SourceIndexFn(pub Arc<SourceIndexFnInner>);
+
+/// The function behind a [`SourceIndexFn`].
+pub type SourceIndexFnInner = dyn Fn(&str) -> Option<Arc<dyn SourceIndex>> + Send + Sync;
+
+impl SourceIndexFn {
+    pub fn new(f: impl Fn(&str) -> Option<Arc<dyn SourceIndex>> + Send + Sync + 'static) -> Self {
+        Self(Arc::new(f))
+    }
+}
+
+impl std::fmt::Debug for SourceIndexFn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SourceIndexFn(..)")
+    }
 }
 
 /// [`Faults::listed_facts`]: what `list` says about an entry.
@@ -416,8 +442,17 @@ impl Provider for FaultProvider {
                         .map_err(GetError::Other)?;
                 }
             }
-            self.inner.get(req, ctoken).await
+            let addr = req.addr.clone();
+            let mut res = self.inner.get(req, ctoken).await?;
+            if let Some((_, source)) = self.faults.sources.iter().find(|(a, _)| *a == addr) {
+                res.target_spec.source = Some(source.clone());
+            }
+            Ok(res)
         })
+    }
+
+    fn source_index(&self, file: &str) -> Option<Arc<dyn SourceIndex>> {
+        self.faults.source_index.as_ref().and_then(|f| (f.0)(file))
     }
 
     fn probe<'a>(
@@ -632,6 +667,141 @@ mod tests {
             .await
             .expect("a second failing get waited on the gate forever")?;
         assert_eq!(gaps.report().skipped, 2);
+        Ok(())
+    }
+
+    /// An index that puts every option at `at`.
+    struct FixedIndex(hcore::diagnostic::Span);
+
+    impl SourceIndex for FixedIndex {
+        fn locate(
+            &self,
+            _source: &SpecSource,
+            _name: &str,
+            _field: &str,
+        ) -> Option<hcore::diagnostic::Span> {
+            Some(self.0)
+        }
+    }
+
+    fn span(line: u32, col: u32) -> hcore::diagnostic::Span {
+        hcore::diagnostic::Span {
+            start_line: line,
+            start_col: col,
+            end_line: line,
+            end_col: col + 1,
+        }
+    }
+
+    fn source(file: &str, line: u32) -> SpecSource {
+        SpecSource::checked(Arc::from(file), span(line, 1)).expect("a source")
+    }
+
+    /// An engine whose `//a:x` and `//b:x` name a driver no plugin registered,
+    /// each declared in its own file (`a/BUILD`, `b/BUILD`) at line 2.
+    fn located_engine(
+        source_index: SourceIndexFn,
+    ) -> anyhow::Result<(Arc<Engine>, tempfile::TempDir)> {
+        let root = tempfile::tempdir()?;
+        let mut engine = Engine::new(Config::for_tests(root.path()))?;
+        let nope = |a: &str| pluginstatictarget::Target {
+            addr: a.to_string(),
+            driver: "nope".to_string(),
+            ..Default::default()
+        };
+        let provider = FaultProvider::new(
+            vec![nope("//a:x"), nope("//b:x")],
+            Faults {
+                sources: vec![
+                    (addr("//a:x"), source("a/BUILD", 2)),
+                    (addr("//b:x"), source("b/BUILD", 2)),
+                ],
+                source_index: Some(source_index),
+                ..Default::default()
+            },
+        )?;
+        engine.register_provider(move |_| Box::new(provider))?;
+        Ok((Arc::new(engine), root))
+    }
+
+    /// `targets`, which must fail, in a fresh request: each failure's culprit
+    /// and location, sorted, and how many indexes the request loaded.
+    async fn locations(
+        engine: &Arc<Engine>,
+        targets: &[&str],
+    ) -> (Vec<(String, Option<(String, u32, u32)>)>, usize) {
+        use crate::engine::result::{OutputMatcher, ResultOptions};
+        let rs = engine.new_state_with_events(false, None);
+        let m = Matcher::Or(targets.iter().map(|a| Matcher::Addr(addr(a))).collect());
+        let res = Arc::clone(engine)
+            .result(
+                Arc::clone(&rs),
+                &m,
+                OutputMatcher::All,
+                &ResultOptions::default(),
+            )
+            .await;
+        assert!(res.map_or(true, |b| !b.errors.is_empty()), "must fail");
+        let mut got: Vec<_> = rs
+            .take_failures()
+            .iter()
+            .map(|f| {
+                let loc = f.record.diagnostic.location.as_ref();
+                (
+                    f.culprit().to_string(),
+                    loc.map(|l| (l.file.clone(), l.line, l.col)),
+                )
+            })
+            .collect();
+        got.sort();
+        (got, rs.source_index_loads())
+    }
+
+    /// The engine asks for a file's index on the blocking pool, never on a
+    /// reactor worker (the provider may read and parse the file), and two
+    /// files' indexes load at the same time: each ask waits until the other
+    /// is in flight, which a lock held across the ask would make impossible.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn source_indexes_load_on_the_blocking_pool_in_parallel() -> anyhow::Result<()> {
+        let met = Arc::new((parking_lot::Mutex::new(0usize), parking_lot::Condvar::new()));
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::<(String, bool, bool)>::new()));
+        let index = SourceIndexFn::new({
+            let (met, seen) = (Arc::clone(&met), Arc::clone(&seen));
+            move |file| {
+                let blocking = hcore::blocking::in_blocking_job();
+                let (count, cv) = &*met;
+                let mut n = count.lock();
+                *n += 1;
+                cv.notify_all();
+                let both = !cv
+                    .wait_while_for(&mut n, |n| *n < 2, Duration::from_secs(10))
+                    .timed_out();
+                drop(n);
+                seen.lock().push((file.to_owned(), blocking, both));
+                Some(Arc::new(FixedIndex(span(3, 7))) as Arc<dyn SourceIndex>)
+            }
+        });
+        let (engine, _root) = located_engine(index)?;
+        let (got, loads) = locations(&engine, &["//a:x", "//b:x"]).await;
+        assert_eq!(
+            got,
+            [
+                ("//a:x".into(), Some(("a/BUILD".into(), 3, 7))),
+                ("//b:x".into(), Some(("b/BUILD".into(), 3, 7))),
+            ],
+            "each failure points where its file's index put `driver`"
+        );
+        assert_eq!(loads, 2, "one load per file");
+        let mut seen = seen.lock().clone();
+        seen.sort();
+        assert_eq!(
+            seen,
+            [
+                ("a/BUILD".to_owned(), true, true),
+                ("b/BUILD".to_owned(), true, true),
+            ],
+            "(file, on the blocking pool, met the other file's load)"
+        );
         Ok(())
     }
 }
