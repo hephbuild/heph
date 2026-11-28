@@ -188,12 +188,9 @@ pub(crate) fn compact(
         rec.timed_out.is_some() || downcast_chain_ref::<ProcessFailed>(e).is_some();
     if !raised
         && local_or_timeout
-        && let Some(end) = rec.process_end()
+        && let Some(end) = rec.process_end_message()
     {
-        rec.diagnostic.message = match &rec.timed_out {
-            Some(t) if t.abandoned => format!("{end}; {}", hcore::failure::ABANDONED),
-            _ => end,
-        };
+        rec.diagnostic.message = end;
     }
     let frozen = downcast_chain_ref::<FrozenCheckError>(e);
     rec.frozen_diff = frozen.map(|f| f.diff.clone());
@@ -274,11 +271,12 @@ fn exec_facts(e: &anyhow::Error) -> (Option<ExitData>, Option<hcore::events::Tim
 }
 
 /// What a terminal wrapper is told of `addr`'s run the moment its process
-/// failed (D6.1c): a record holding the addr, the exit and the timeout as
-/// [`compact`] will record them, scrubbed of `scrub`, [`FailedIn::Exec`].
-/// Enough for the one line a streamed run gets
-/// (`tui::failure_report::streamed_exec_line`), nothing more. `None` when
-/// the run failed some other way, or was stopped: a stop is no failure.
+/// failed (D6.1c): a record holding the addr, the exit, the timeout and the
+/// diagnostic as [`compact`] will record them (it is compact's, scrubbed of
+/// `scrub`), [`FailedIn::Exec`]. Enough for the line a streamed run gets
+/// (`tui::failure_report::streamed_exec_line`), which shows a driver's own
+/// diagnostic and hints, since no box will. `None` when the run failed some
+/// other way, or was stopped: a stop is no failure.
 pub(crate) fn exec_failure(addr: &Addr, e: &anyhow::Error, scrub: &Scrub) -> Option<FailureRecord> {
     if hplugin::error::is_cancelled(e) {
         return None;
@@ -287,21 +285,13 @@ pub(crate) fn exec_failure(addr: &Addr, e: &anyhow::Error, scrub: &Scrub) -> Opt
     if exit.is_none() && timed_out.is_none() {
         return None;
     }
-    let needles = scrub.needles();
-    let addr = addr.format();
-    let mut rec = FailureRecord::new(Diagnostic::new(Stage::Run, String::new()));
-    rec.exit = exit.map(|mut x| {
-        x.status = bound_text(
-            &scrub_text(needles.as_ref(), &x.status),
-            hcore::diagnostic::MESSAGE_CAP,
-            &mut false,
-        );
-        x
-    });
-    rec.timed_out = timed_out;
+    let full = compact(e, &Culprit::Target(addr.clone()), addr, scrub, None);
+    let mut rec = FailureRecord::new(full.diagnostic);
+    rec.exit = full.exit;
+    rec.timed_out = full.timed_out;
     rec.failed_in = FailedIn::Exec;
-    rec.entry = addr.clone();
-    rec.addr = Some(addr);
+    rec.entry = full.entry;
+    rec.addr = full.addr;
     Some(rec)
 }
 
@@ -635,6 +625,32 @@ mod tests {
         let rec = of(&remote);
         assert_eq!(rec.diagnostic.message, "--- FAIL: TestX\nexit status: 1");
         assert_eq!(rec.exit.and_then(|x| x.code), Some(1));
+    }
+
+    /// What a streamed run's wrapper is told carries a driver's own
+    /// diagnostic and hints, scrubbed, as the record will (CQ-1): its line is
+    /// all the run says. A plain exit's message is the status.
+    #[test]
+    fn exec_failure_keeps_a_raised_diagnostic() {
+        let raised = anyhow::Error::new(
+            Diagnostic::new(Stage::Run, "go vet found 2 issues in SECRET-VALUE-1")
+                .with_hint(Hint::new(HintKind::Other, "run go vet")),
+        )
+        .context(ProcessFailed::new("exit status: 1", Some(Exit::Code(1))));
+        let scrub = Scrub::new(["SECRET-VALUE-1".to_owned()]);
+        let told = exec_failure(&addr("//p:t"), &raised, &scrub).expect("a process failure");
+        assert_eq!(
+            told.diagnostic.message,
+            "go vet found 2 issues in [redacted]"
+        );
+        assert_eq!(told.diagnostic.hints.len(), 1);
+        assert!(!told.message_is_status());
+        assert_eq!(told.addr.as_deref(), Some("//p:t"));
+        assert_eq!(told.failed_in, FailedIn::Exec);
+
+        let plain = anyhow::Error::new(ProcessFailed::new("exit status: 1", Some(Exit::Code(1))));
+        let told = exec_failure(&addr("//p:t"), &plain, &scrub).expect("a process failure");
+        assert!(told.message_is_status(), "{told:?}");
     }
 
     #[test]
