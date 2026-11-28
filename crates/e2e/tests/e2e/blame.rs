@@ -58,9 +58,20 @@ impl Run {
             .unwrap_or_else(|| panic!("no failure of {c}:\n{}", self.describe()))
     }
 
-    /// `c`'s recorded path, formatted.
+    /// `c`'s recorded path, formatted. Its compacted record names the same
+    /// culprit, entry and path: the record is the failure's, not a
+    /// placeholder, and the request-end path pass moves both.
     fn path(&self, c: &str) -> Vec<String> {
-        self.failure(c).path.iter().map(Addr::format).collect()
+        let f = self.failure(c);
+        let path: Vec<String> = f.path.iter().map(Addr::format).collect();
+        let rec = &f.record;
+        assert_eq!(rec.path, path, "{c}'s record path");
+        assert_eq!(rec.entry, f.addr.format(), "{c}'s record entry");
+        match &f.file {
+            Some(file) => assert_eq!(rec.file.as_deref(), Some(&**file), "{c}'s record file"),
+            None => assert_eq!(rec.addr.as_deref(), Some(c), "{c}'s record culprit"),
+        }
+        path
     }
 
     /// Skipped `a`'s `(root, path, more)` from the request-end pass.
