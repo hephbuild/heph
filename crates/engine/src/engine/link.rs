@@ -153,7 +153,7 @@ pub(crate) fn check_tool_output_files(
     let tool = tool.format();
     let hint = if files.is_empty() {
         "the tool selected no file. For a `group`, its `include` matched nothing: it matches \
-         a dep's paths as the dep's BUILD file writes them (`<out>/…`) or workspace-relative \
+         a dep's paths as the dep's definition writes them (`<out>/…`) or workspace-relative \
          (`<package>/<out>/…`), and `heph inspect outputs` on the dep lists them"
             .to_owned()
     } else {

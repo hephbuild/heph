@@ -204,7 +204,7 @@ pub fn validate_plugin_name(name: &str) -> anyhow::Result<()> {
     if !is_valid_name_segment(name) {
         anyhow::bail!(
             "invalid plugin name {name:?}: a plugin name must match `{PLUGIN_NAME_RULE}`, \
-             because it is the `heph.<name>` namespace in BUILD files"
+             because it is the plugin's `heph.<name>` namespace"
         );
     }
     Ok(())
@@ -1315,7 +1315,7 @@ impl Engine {
         if self.function_slot.is_sealed() {
             anyhow::bail!(
                 "{source} registered after the engine sealed its function registry; every \
-                 plugin must be registered before the first BUILD evaluation"
+                 plugin must be registered before a provider first evaluates its sources"
             );
         }
         let PluginParts {
@@ -2028,7 +2028,7 @@ mod tests {
                     format!(
                         "registering builtin plugin {name:?}: invalid plugin name {name:?}: a \
                          plugin name must match `[a-z_][a-z0-9_]*`, because it is the \
-                         `heph.<name>` namespace in BUILD files"
+                         plugin's `heph.<name>` namespace"
                     )
                 );
             }

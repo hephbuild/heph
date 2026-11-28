@@ -1376,7 +1376,7 @@ pub fn deferred_to_pb<C: FromIterator<(String, String)>>(
             hplugin::driver::DeferredValue::NeedsSandbox { .. } => anyhow::bail!(
                 "deferred field {k:?} still needs a sandbox path at the plugin ABI — the \
                  managed-driver layer fills those in before a request is serialized, so this is \
-                 a bug in heph rather than in the BUILD file"
+                 a bug in heph rather than in the target's definition"
             ),
         })
         .collect()
