@@ -4,21 +4,33 @@
 
 use crate::pluginbuildfile::ast::walk_expr;
 use hcore::diagnostic::Span;
-use hplugin::provider::{SourceIndex, SpecSource};
+use hplugin::provider::{Located, SourceIndex, SpecSource};
 use starlark::syntax::AstModule;
 use starlark::syntax::ast::{Argument, AstLiteral, Expr};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-/// `file` (workspace-relative, under `root`) parsed as it is on disk now, or
-/// `None` when it is gone or no longer parses: every diagnostic then points
-/// at its call.
-pub(crate) fn index(root: &Path, file: &str) -> Option<Arc<dyn SourceIndex>> {
-    let ast = crate::pluginbuildfile::run_file::parse_build_file(&root.join(file))
-        .inspect_err(|e| tracing::debug!(file, error = %e, "re-parsing for a diagnostic"))
-        .ok()?;
-    Some(Arc::new(Parsed::new(ast)))
+/// `file` (workspace-relative, under `root`) parsed as it is on disk now.
+/// When it is gone or no longer parses, every call in it changed since it
+/// was evaluated ([`Gone`]).
+pub(crate) fn index(root: &Path, file: &str) -> Arc<dyn SourceIndex> {
+    match crate::pluginbuildfile::run_file::parse_build_file(&root.join(file)) {
+        Ok(ast) => Arc::new(Parsed::new(ast)),
+        Err(e) => {
+            tracing::debug!(file, error = %e, "re-parsing for a diagnostic");
+            Arc::new(Gone)
+        }
+    }
+}
+
+/// A file that no longer reads or parses: no call is where it evaluated.
+struct Gone;
+
+impl SourceIndex for Gone {
+    fn locate(&self, _source: &SpecSource, _name: &str, _field: Option<&str>) -> Located {
+        Located::Changed
+    }
 }
 
 /// A parsed file and its calls by where each starts: one walk of the file
@@ -101,21 +113,27 @@ fn to_span(ast: &AstModule, span: starlark::codemap::Span) -> Span {
 }
 
 impl SourceIndex for Parsed {
-    fn locate(&self, source: &SpecSource, name: &str, field: &str) -> Option<Span> {
+    fn locate(&self, source: &SpecSource, name: &str, field: Option<&str>) -> Located {
         let at = source.call();
-        let Call::Target { name: literal, kwargs } =
-            self.calls.get(&(at.start_line, at.start_col))?
-        else {
-            return None;
+        let (literal, kwargs) = match self.calls.get(&(at.start_line, at.start_col)) {
+            // No call starts there any more.
+            None => return Located::Changed,
+            // A plugin function's call, or a `target` reached under another
+            // name: there, but its arguments are not the spec's options.
+            Some(Call::Other) => return Located::Call,
+            Some(Call::Target { name, kwargs }) => (name, kwargs),
         };
         // The call that was there at eval, or the file changed since: a
         // literal `name=` must still be the target's. A computed one (a
         // macro's `name = name`) is not checked.
         if literal.as_deref().is_some_and(|n| n != name) {
-            return None;
+            return Located::Changed;
         }
-        let (_, span) = kwargs.iter().find(|(key, _)| key == field)?;
-        Some(to_span(&self.ast, *span))
+        field
+            .and_then(|field| kwargs.iter().find(|(key, _)| key == field))
+            .map_or(Located::Call, |(_, span)| {
+                Located::Field(to_span(&self.ast, *span))
+            })
     }
 }
 
@@ -128,21 +146,30 @@ mod tests {
         pub(super) static CALLS_VISITED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 
-    fn located(src: &str, call: (u32, u32), name: &str, field: &str) -> Option<Span> {
-        let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(dir.path().join("BUILD"), src).expect("write");
-        let index = index(dir.path(), "BUILD").expect("parses");
-        let source = SpecSource::checked(
+    fn call_at(line: u32, col: u32) -> SpecSource {
+        SpecSource::checked(
             Arc::from("BUILD"),
             Span {
-                start_line: call.0,
-                start_col: call.1,
-                end_line: call.0,
-                end_col: call.1 + 1,
+                start_line: line,
+                start_col: col,
+                end_line: line,
+                end_col: col + 1,
             },
         )
-        .expect("source");
-        index.locate(&source, name, field)
+        .expect("source")
+    }
+
+    fn located(src: &str, call: (u32, u32), name: &str, field: &str) -> Located {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("BUILD"), src).expect("write");
+        index(dir.path(), "BUILD").locate(&call_at(call.0, call.1), name, Some(field))
+    }
+
+    fn field(l: Located) -> Span {
+        match l {
+            Located::Field(span) => span,
+            other => panic!("an option's span, got {other:?}"),
+        }
     }
 
     const SRC: &str = "\
@@ -155,50 +182,72 @@ target(
 
     #[test]
     fn finds_the_kwarg_of_the_call_at_the_source() {
-        let deps = located(SRC, (2, 1), "b", "deps").expect("deps");
+        let deps = field(located(SRC, (2, 1), "b", "deps"));
         assert_eq!(
             (deps.start_line, deps.start_col, deps.end_line, deps.end_col),
             (4, 5, 4, 19),
             "`deps = [\"//x\"]`, its end exclusive"
         );
-        let driver = located(SRC, (1, 1), "a", "driver").expect("driver");
+        let driver = field(located(SRC, (1, 1), "a", "driver"));
         assert_eq!((driver.start_line, driver.start_col), (1, 20));
     }
 
     #[test]
-    fn no_span_off_the_call() {
+    fn the_call_alone_or_changed_off_the_option() {
         assert_eq!(
             located(SRC, (2, 1), "b", "driver"),
-            None,
+            Located::Call,
             "an option not set"
         );
         assert_eq!(
             located(SRC, (3, 5), "b", "deps"),
-            None,
+            Located::Changed,
             "no call starts there"
         );
-        assert_eq!(located(SRC, (2, 1), "a", "deps"), None, "another name");
+        assert_eq!(
+            located(SRC, (2, 1), "a", "deps"),
+            Located::Changed,
+            "another name"
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("BUILD"), SRC).expect("write");
+        assert_eq!(
+            index(dir.path(), "BUILD").locate(&call_at(2, 1), "b", None),
+            Located::Call,
+            "no option asked for: the call, still there"
+        );
+        assert_eq!(
+            index(dir.path(), "BUILD").locate(&call_at(9, 1), "b", None),
+            Located::Changed,
+            "no option asked for, and the call moved"
+        );
     }
 
     #[test]
     fn a_computed_name_is_not_checked() {
         let src = "def m(name):\n    target(name = name, deps = [])\n";
-        assert!(located(src, (2, 5), "anything", "deps").is_some());
+        field(located(src, (2, 5), "anything", "deps"));
     }
 
     /// Only a `target(...)` call's arguments are a spec's options: at a plugin
     /// function's call (the span of a target it declared), the option is not
-    /// looked up among the function's own arguments.
+    /// looked up among the function's own arguments, and the file has not
+    /// changed for it.
     #[test]
     fn only_a_target_call_is_searched() {
         let src = "heph.go.library(name = \"b\", deps = [])\nlib(name = \"b\", deps = [])\n";
-        assert_eq!(located(src, (1, 1), "b", "deps"), None, "a plugin function");
-        assert_eq!(located(src, (2, 1), "b", "deps"), None, "a macro's call");
-        let nested = "f(1)(target(name = \"b\", deps = []))\ntarget(name = \"c\", deps = [])\n";
-        assert!(
-            located(nested, (2, 1), "c", "deps").is_some(),
-            "a target call is found among others"
+        assert_eq!(
+            located(src, (1, 1), "b", "deps"),
+            Located::Call,
+            "a plugin function"
         );
+        assert_eq!(
+            located(src, (2, 1), "b", "deps"),
+            Located::Call,
+            "a macro's call"
+        );
+        let nested = "f(1)(target(name = \"b\", deps = []))\ntarget(name = \"c\", deps = [])\n";
+        field(located(nested, (2, 1), "c", "deps"));
     }
 
     /// The file is walked once, when the index is built: a file of 2,000
@@ -212,22 +261,13 @@ target(
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("BUILD"), &src).expect("write");
         let before = CALLS_VISITED.with(std::cell::Cell::get);
-        let index = index(dir.path(), "BUILD").expect("parses");
+        let index = index(dir.path(), "BUILD");
         let built = CALLS_VISITED.with(std::cell::Cell::get) - before;
         assert_eq!(built, 2_000, "one visit per call");
         for (i, text) in (0..n).zip(src.lines()) {
             let line = i + 1;
             let col = u32::try_from(text.find("deps").expect("deps") + 1).expect("col");
-            let call = Span {
-                start_line: line,
-                start_col: 1,
-                end_line: line,
-                end_col: 2,
-            };
-            let source = SpecSource::checked(Arc::from("BUILD"), call).expect("source");
-            let deps = index
-                .locate(&source, &format!("t{i}"), "deps")
-                .expect("deps");
+            let deps = field(index.locate(&call_at(line, 1), &format!("t{i}"), Some("deps")));
             assert_eq!((deps.start_line, deps.start_col), (line, col));
         }
         assert_eq!(
@@ -237,11 +277,18 @@ target(
         );
     }
 
+    /// A file that no longer parses, or is gone, still indexes: every call in
+    /// it changed since evaluation, so the diagnostic can say so.
     #[test]
-    fn a_file_that_no_longer_parses_has_no_index() {
+    fn a_file_that_no_longer_parses_changed() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("BUILD"), "target(").expect("write");
-        assert!(index(dir.path(), "BUILD").is_none());
-        assert!(index(dir.path(), "gone").is_none());
+        for file in ["BUILD", "gone"] {
+            assert_eq!(
+                index(dir.path(), file).locate(&call_at(1, 1), "a", Some("deps")),
+                Located::Changed,
+                "{file}"
+            );
+        }
     }
 }

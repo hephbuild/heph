@@ -31,6 +31,7 @@ use heph::pluginexec;
 use heph::pluginstatictarget::Target;
 use hplugin::diagnostic::{Boundary, Stage};
 use hplugin::error::{CancelledError, Culprit, MissingDep, TargetFailure};
+use hplugin::provider::DeclAt;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -213,7 +214,10 @@ fn missing_dep(f: &TargetFailure) -> MissingDep {
         dep: addr(&m.dep),
         declarer: addr(&m.declarer),
         origin_id: m.origin_id.clone(),
-        at: f.record.diagnostic.location.clone(),
+        at: f.record.diagnostic.location.clone().map(|loc| DeclAt {
+            changed: f.record.diagnostic.message.contains(DeclAt::CHANGED),
+            loc,
+        }),
     }
 }
 

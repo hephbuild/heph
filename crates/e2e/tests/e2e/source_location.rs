@@ -203,18 +203,27 @@ async fn fail_after_edit(src: &str, edited: &str) -> Arc<TargetFailure> {
     one(fail_in(&ws, &rs, &["//c:y"]).await, "//c:y")
 }
 
+/// `f` points at `//c:y`'s call as evaluated, line 2 of `c/BUILD`, and says
+/// the file changed since, in the message the record and both renderers
+/// carry.
+fn at_call_changed(f: &Arc<TargetFailure>) {
+    assert_eq!(triple(loc(f)), ("c/BUILD".to_owned(), 2, 1), "{}", text(f));
+    assert!(
+        f.record
+            .diagnostic
+            .message
+            .contains("file changed since evaluation"),
+        "{}",
+        f.record.diagnostic.message
+    );
+}
+
 /// The file moved under the call since it evaluated: no call starts where
 /// the spec says, so the diagnostic points at the call as evaluated.
 #[tokio::test]
 async fn edited_file_falls_back_to_call_line() {
     let src = format!("# y\n{}\n", t("y", r#"deps = ["//d:missing"]"#));
-    let f = fail_after_edit(&src, &format!("\n\n\n{src}")).await;
-    assert_eq!(
-        triple(loc(&f)),
-        ("c/BUILD".to_owned(), 2, 1),
-        "{}",
-        text(&f)
-    );
+    at_call_changed(&fail_after_edit(&src, &format!("\n\n\n{src}")).await);
 }
 
 /// The call at the spec's span now declares another name: its options are
@@ -222,10 +231,81 @@ async fn edited_file_falls_back_to_call_line() {
 #[tokio::test]
 async fn call_name_mismatch_falls_back_to_call_line() {
     let src = format!("# y\n{}\n", t("y", r#"deps = ["//d:missing"]"#));
-    let f = fail_after_edit(&src, &src.replace("name = \"y\"", "name = \"z\"")).await;
+    at_call_changed(&fail_after_edit(&src, &src.replace("name = \"y\"", "name = \"z\"")).await);
+}
+
+/// The file no longer parses since it evaluated: nothing in it can be
+/// located, so the diagnostic points at the call as evaluated. A failure
+/// the engine locates (an unknown option), not one a `MissingDep` carries.
+#[tokio::test]
+async fn unparsable_file_falls_back_to_call_line() {
+    let src = format!("# y\n{}\n", t("y", "bogus = 1"));
+    at_call_changed(&fail_after_edit(&src, "target(").await);
+}
+
+/// The file was deleted since it evaluated: the `.bzl` whose macro declared
+/// the target (deleting the BUILD file would drop the package from the
+/// match instead).
+#[tokio::test]
+async fn deleted_file_falls_back_to_call_line() {
+    let bzl = "# m\ndef mk(name):\n    target(name = name, driver = \"bash\", run = \"echo ok > $OUT\", out = \"o.txt\", deps = [\"//d:missing\"])\n";
+    let ws = Workspace::new();
+    ws.write_file("tools/macros.bzl", bzl);
+    ws.write_build_file(
+        "c",
+        "load(\"//tools/macros.bzl\", \"mk\")\n\nmk(name = \"y\")\n",
+    );
+    ws.write_build_file("d", D_PRESENT);
+    let rs = ws.engine.new_state_with_events(false, None);
+    Arc::clone(&ws.engine)
+        .get_spec(rs.clone(), &addr("//c:y"))
+        .await
+        .expect("//c:y resolves");
+    std::fs::remove_file(ws.dir.path().join("tools/macros.bzl")).expect("delete the .bzl");
+    let f = one(fail_in(&ws, &rs, &["//c:y"]).await, "//c:y");
     assert_eq!(
         triple(loc(&f)),
-        ("c/BUILD".to_owned(), 2, 1),
+        ("tools/macros.bzl".to_owned(), 3, 5),
+        "{}",
+        text(&f)
+    );
+    assert!(
+        text(&f).contains("file changed since evaluation"),
+        "{}",
+        text(&f)
+    );
+}
+
+/// An unchanged file says nothing of a change.
+#[tokio::test]
+async fn an_unchanged_file_is_not_called_changed() {
+    let (ws, _) = ws_with("bogus = 1");
+    let f = fail(&ws, "//c:y").await;
+    assert!(
+        !text(&f).contains("file changed since evaluation"),
+        "{}",
+        text(&f)
+    );
+}
+
+/// A target a function declares (a matrix cell), in an unchanged file, is
+/// located at its option and is not called changed: the declaring call the
+/// index finds is the cell's own `target()`, not the function's call site.
+#[tokio::test]
+async fn a_matrix_cell_in_an_unchanged_file_is_not_called_changed() {
+    let src = concat!(
+        "def _cell(v):\n",
+        "    target(name = \"y\", driver = \"bash\", run = \"echo ok > $OUT\", out = \"o.txt\", bogus = 1)\n",
+        "    return \":y\"\n",
+        "\n",
+        "M = heph.core.matrix(axes = {\"v\": [\"one\"]}, cell = _cell)\n",
+    );
+    let ws = Workspace::new();
+    ws.write_build_file("c", src);
+    let f = fail(&ws, "//c:y").await;
+    assert_eq!(triple(loc(&f)), at("c/BUILD", src, "bogus"), "{}", text(&f));
+    assert!(
+        !text(&f).contains("file changed since evaluation"),
         "{}",
         text(&f)
     );

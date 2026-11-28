@@ -1587,9 +1587,10 @@ impl RequestState {
     /// span its provider's [`SourceIndex`](hplugin::provider::SourceIndex)
     /// finds in the declaring call, else that call's start (its spec's
     /// [`SpecSource`](hplugin::provider::SpecSource)); `field` `None` is the
-    /// call. Error path only, and never asks the provider: the index is the
-    /// one [`load_source_index`](Self::load_source_index) loaded, and a file
-    /// whose index was not loaded points at the call.
+    /// call. Marked changed when the index finds the file no longer holds
+    /// the call as evaluated. Error path only, and never asks the provider:
+    /// the index is the one [`load_source_index`](Self::load_source_index)
+    /// loaded, and a file whose index was not loaded points at the call.
     ///
     /// Never resolves anything: a spec not yet resolved, resolved with an
     /// error, or whose provider reported no source has no location here.
@@ -1597,17 +1598,15 @@ impl RequestState {
         &self,
         addr: &Addr,
         field: Option<&str>,
-    ) -> Option<hcore::diagnostic::SourceLoc> {
+    ) -> Option<hplugin::provider::DeclAt> {
         let spec = self.resolved_spec(addr)?;
         let source = spec.spec.source.as_ref()?;
-        let found = field.and_then(|field| {
-            let index = self.source_index(&spec.provider, source.file_arc())?;
-            index.locate(source, &addr.name, field)
-        });
-        Some(match found {
-            Some(span) => span.start_in(source.file()),
-            None => source.call_loc(),
-        })
+        let located = self
+            .source_index(&spec.provider, source.file_arc())
+            .map_or(hplugin::provider::Located::Call, |index| {
+                index.locate(source, &addr.name, field)
+            });
+        Some(hplugin::provider::DeclAt::new(source, located))
     }
 
     /// `provider`'s index of `file`, when [`load_source_index`]
