@@ -88,10 +88,12 @@ const hostile = `<img src=x onerror="document.title='pwned'"></script><script>do
 func servedBrief(t *testing.T, api func(w http.ResponseWriter, head string)) (dir, url string) {
 	t.Helper()
 	f := newFixture(t)
-	f.write("src/a.rs", "fn a() {}\n")
+	f.write("src/a.rs", "fn a() {}\n// keep\n")
 	f.write("src/use.rs", "fn caller() {\n    a();\n}\n\n#[test]\nfn pins_a() {}\n")
 	f.trunk(f.commit("base"))
-	f.write("src/a.rs", "fn a() {}\nconst S: &str = \"</script><b>bold</b>\";\n")
+	// Two separate live ranges at one anchor (src/a.rs, top level): the
+	// second becomes an AI-cleared item beside the card.
+	f.write("src/a.rs", "fn a() {}\nconst S: &str = \"</script><b>bold</b>\";\n// keep\nconst T: u8 = 1;\n")
 	st := f.stack(ModeWhole, f.commit("layer"))
 	head := st.Layers[0].Head
 	// The handler is complete before the server starts: setting it after
@@ -178,7 +180,8 @@ func Test_card_reads_top_to_bottom(t *testing.T) {
 // writes what it saw into its own DOM.
 const reviewDriver = `<!doctype html><meta charset="utf-8"><title>driver</title>
 <pre id="gh"></pre><pre id="prompt"></pre><pre id="progress"></pre><pre id="persist"></pre><pre id="err"></pre>
-<iframe id="f" src="index.html"></iframe>
+<pre id="anchors"></pre><pre id="before"></pre><pre id="earlier"></pre><pre id="after"></pre>
+<iframe id="f"></iframe>
 <script>
 const f = document.getElementById("f");
 const put = (id, v) => { document.getElementById(id).textContent = v; };
@@ -186,8 +189,22 @@ const until = (cond, then, n = 0) => { const v = cond(); if (v) then(v); else if
 const doc = () => f.contentDocument;
 const card = () => doc() && doc().querySelector("article.card");
 const button = (text) => [...doc().querySelectorAll("button")].find((b) => b.textContent === text);
-until(card, (c) => {
+const copied = (text) => { button(text).click(); return doc().getElementById("review-text").value; };
+// Seed a note on code that is gone, at the anchor both ranges share, as an
+// earlier round would have left it.
+(async () => {
+  const stack = await (await fetch("stack.json")).json();
+  const layer = await (await fetch(stack.layers[0].file)).json();
+  const anchors = layer.cards.map((c) => c.ranges[0].anchor);
+  put("anchors", anchors.join("|"));
+  localStorage.setItem("brief:" + stack.stack_key + ":anchor:" + anchors[0], JSON.stringify({ hashes: { stale0: "old note" } }));
+  f.src = "index.html";
+  until(card, drive);
+})().catch((e) => put("err", e.message));
+function drive(c) {
   try {
+    put("before", copied("Copy GitHub review"));
+    put("earlier", (c.querySelector(".earlier-notes") || { textContent: "" }).textContent);
     c.querySelectorAll("button.option")[1].click();
     const note = c.querySelector(".review-note textarea");
     note.value = "Drop it: nobody reads S.\n\nAnd rename a().";
@@ -201,9 +218,10 @@ until(card, (c) => {
     f.src = "index.html?again";
     setTimeout(() => until(() => card() && card().querySelector(".review-note textarea") && f.contentWindow.location.search === "?again" && card(), (c2) => {
       put("persist", [c2.querySelector(".review-note textarea").value, c2.querySelector('button.option[aria-pressed="true"] .choice').textContent, c2.dataset.state].join("|"));
+      put("after", copied("Copy GitHub review"));
     }), 50);
   } catch (e) { put("err", e.message); }
-});
+}
 </script>`
 
 // A reviewer picks an answer, writes a note and marks a concern; both copied
@@ -253,6 +271,27 @@ func Test_review_answers_and_notes_reach_the_copied_review(t *testing.T) {
 	}
 	if p := field("persist"); p != "Drop it: nobody reads S.\n\nAnd rename a().|Drop it|concern" {
 		t.Errorf("after a reload the card holds %q", p)
+	}
+
+	// The two ranges share an anchor, which is what made one note repeat.
+	if a := strings.Split(field("anchors"), "|"); len(a) != 2 || a[0] != a[1] {
+		t.Fatalf("anchors %q: the fixture needs two cards at one anchor", a)
+	}
+	// A note on code that is gone shows as an earlier note, and is nobody's
+	// note: nothing is copied for it.
+	if b := field("before"); b != "No card has a concern, an answer or a note yet." {
+		t.Errorf("before any review, the copy holds %q", b)
+	}
+	if e := field("earlier"); !strings.Contains(e, "old note") {
+		t.Errorf("the card does not show the earlier note: %q", e)
+	}
+	// One note on one card is copied once, before and after a reload, and
+	// the earlier note is dropped once a range there is reviewed.
+	for _, id := range []string{"gh", "after"} {
+		got := field(id)
+		if n := strings.Count(got, "nobody reads S."); n != 1 || strings.Count(got, "### ") != 1 || strings.Contains(got, "old note") {
+			t.Errorf("%s: the note appears %d times in %d items:\n%s", id, n, strings.Count(got, "### "), got)
+		}
 	}
 }
 

@@ -103,7 +103,7 @@ details.layer[open] > summary { margin-bottom: 1rem; }
 .options .choice { font-weight: 600; }
 .options .impact { color: var(--muted); max-width: 62ch; }
 @media (max-width: 560px) { .options button.option { grid-template-columns: 1.1rem 1fr; } .options .impact { grid-column: 2; } }
-.review-note { display: grid; gap: 0.3rem; font-size: 0.85rem; }
+.review-note, .earlier-notes { display: grid; gap: 0.3rem; font-size: 0.85rem; }
 .review-note textarea { font: inherit; font-size: 0.9rem; min-height: 2.6rem; padding: 0.4rem 0.55rem; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--fg); resize: vertical; width: 100%; max-width: 70ch; box-sizing: border-box; }
 .card[data-answered="true"][data-state="unread"] { opacity: 0.85; }.examples { display: grid; gap: 0.6rem; }
 figure { margin: 0; display: grid; gap: 0.3rem; min-width: 0; }
@@ -259,6 +259,8 @@ textarea#review-text { width: 100%; min-height: 8rem; font: 0.8rem var(--mono); 
   function anchorKey(stack, anchor) { return "brief:" + stack.stack_key + ":anchor:" + anchor; }
 
   function draw(stack, layers, manifest) {
+    liveHashes = new Set();
+    for (const l of stack.layers) for (const c of layers[l.pr].cards) for (const r of c.ranges) liveHashes.add(r.hash);
     const kids = [];
     kids.push(drawHeader(stack, layers));
     if (stack.assessment) kids.push(drawAssessment(stack));
@@ -478,33 +480,59 @@ textarea#review-text { width: 100%; min-height: 8rem; font: 0.8rem var(--mono); 
   // A card's state derives from its ranges' content hashes, so regrouping
   // cards resets nothing and a changed range reopens its card.
   // A card's review is its state (fine, concern or none), the answer picked
-  // from its options and the user's note. A note outlives a change to the
-  // code: the anchor keeps it, and a reopened card shows it again.
+  // from its options and the user's note, stored under each range's content
+  // hash: it is this card's alone.
+  //
+  // An anchor (path#symbol) is shared by every range in one function, so it
+  // never holds a card's review. It records which hashes were reviewed there,
+  // each with its note. A range is reopened when its anchor recorded a hash
+  // that no range in this brief has any more: that code was reviewed and is
+  // gone. Its note is shown as an earlier note, never taken as this card's.
+  let liveHashes = new Set();
+
+  function anchorHashes(stack, anchor) {
+    const a = store.get(anchorKey(stack, anchor));
+    if (!a) return {};
+    if (a.hashes) return a.hashes;
+    return a.hash ? { [a.hash]: a.note || "" } : {}; // the record before notes were kept per hash
+  }
+
   function cardState(stack, c) {
     let state = null, reopened = false, surroundings = false, choice = null, note = "";
     let first = true;
     for (const r of c.ranges) {
       const s = store.get(stateKey(stack, r.hash));
       if (!s) {
-        const a = store.get(anchorKey(stack, r.anchor));
-        if (a && a.hash !== r.hash) reopened = true;
-        return { state: null, choice: null, note: (a && a.note) || "", reopened, surroundings };
+        const earlier = [];
+        for (const [h, n] of Object.entries(anchorHashes(stack, r.anchor))) {
+          if (liveHashes.has(h)) continue;
+          reopened = true;
+          if (n) earlier.push(n);
+        }
+        return { state: null, choice: null, note: "", earlier, reopened, surroundings };
       }
       if (s.context !== r.context) surroundings = true;
       state = first || state === s.state ? s.state : "mixed";
       if (first) { choice = s.choice || null; note = s.note || ""; }
       first = false;
     }
-    return { state: state === "mixed" ? null : state, choice, note, reopened, surroundings };
+    return { state: state === "mixed" ? null : state, choice, note, earlier: [], reopened, surroundings };
   }
 
   function setCardReview(stack, c, patch) {
     const cur = cardState(stack, c);
     const v = { state: cur.state, choice: cur.choice, note: cur.note, ...patch };
+    const kept = !!(v.state || v.choice || v.note);
     for (const r of c.ranges) {
-      if (v.state || v.choice || v.note) store.set(stateKey(stack, r.hash), { state: v.state, choice: v.choice, note: v.note, context: r.context });
+      if (kept) store.set(stateKey(stack, r.hash), { state: v.state, choice: v.choice, note: v.note, context: r.context });
       else store.del(stateKey(stack, r.hash));
-      store.set(anchorKey(stack, r.anchor), { hash: r.hash, note: v.note || undefined });
+      // Record this hash at the anchor, and drop the hashes no range has any
+      // more: once a range at this place is reviewed, they are superseded.
+      const hashes = {};
+      for (const [h, n] of Object.entries(anchorHashes(stack, r.anchor))) if (liveHashes.has(h)) hashes[h] = n;
+      if (kept) hashes[r.hash] = v.note || ""; else delete hashes[r.hash];
+      if (Object.keys(hashes).length) store.set(anchorKey(stack, r.anchor), { hashes });
+      else store.del(anchorKey(stack, r.anchor));
     }
   }
 
@@ -554,7 +582,9 @@ textarea#review-text { width: 100%; min-height: 8rem; font: 0.8rem var(--mono); 
       usesOf(stack, l, manifest, c),
       c.title ? el("div", { class: "why" }, el("span", { class: "label", text: "Why it's flagged" }), el("p", { class: "prose", text: c.claim })) : null,
       cardFoot(c),
-      el("label", { class: "review-note" }, el("span", { class: "label", text: st.reopened && st.note ? "Your note (written on earlier code)" : "Your note" }), noteBox),
+      st.earlier.length ? el("div", { class: "earlier-notes" }, el("span", { class: "label", text: "Your notes on the earlier code here" }),
+        st.earlier.map((n) => el("p", { class: "prose muted", text: n }))) : null,
+      el("label", { class: "review-note" }, el("span", { class: "label", text: "Your note" }), noteBox),
       el("div", { class: "states" }, buttons));
     return card;
   }
@@ -719,7 +749,7 @@ textarea#review-text { width: 100%; min-height: 8rem; font: 0.8rem var(--mono); 
         el("ul", {}, nic.map((n) => el("li", {}, n.text, " ", link(n.link, "where it was raised"))))) : null,
       el("div", { class: "row" }, copyGitHub, copyPrompt, note),
       out,
-      el("p", { text: "Each card's state, the answer you picked and your note are kept in this browser only, keyed by each range's content: a rebase keeps them, and a change to the code reopens the card with your note kept. No agent can read them. The copied review lists every card with a concern, an answer or a note. Paste the GitHub review into the PR's \"Review changes\" box (request changes there), or paste the fix prompt into a new Claude session to have the changes made." }),
+      el("p", { text: "Each card's state, the answer you picked and your note are kept in this browser only, keyed by each range's content: a rebase keeps them, and a change to the code reopens the card and shows your note on the earlier code. No agent can read them. The copied review lists every card with a concern, an answer or a note. Paste the GitHub review into the PR's \"Review changes\" box (request changes there), or paste the fix prompt into a new Claude session to have the changes made." }),
       el("p", { text: "Format " + stack.format + ". Approval and merge stay on GitHub." }));
   }
 
