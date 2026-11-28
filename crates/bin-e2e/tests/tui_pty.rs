@@ -3058,9 +3058,21 @@ fn teardown_tail_cr() {
 }
 
 /// Invalid UTF-8 in a tail is shown as U+FFFD.
+///
+/// vt100 never draws a U+FFFD it is sent: its `print` hands the character
+/// to the `unhandled_char` callback instead of a cell (vt100 0.18
+/// `perform.rs`), so the cells read `td-badutf8-end` whatever heph wrote.
+/// The cells prove the rest of the line reached the box; the bytes heph
+/// wrote to the terminal prove the U+FFFD did.
 #[test]
 fn teardown_tail_invalid_utf8() {
-    teardown_tail(r"td-bad\\377utf8-end\\n", "td-bad\u{FFFD}utf8-end");
+    let b = teardown_tail(r"td-bad\\377utf8-end\\n", "td-badutf8-end");
+    let want = "td-bad\u{FFFD}utf8-end".as_bytes();
+    assert!(
+        b.pty.output().windows(want.len()).any(|w| w == want),
+        "heph should have written the tail's invalid byte as U+FFFD\n{}",
+        b.report()
+    );
 }
 
 /// E9: a target whose output streamed to the PTY and the same target run
