@@ -321,7 +321,10 @@ func (st *Stack) Render(in RenderInput, pagePath, outDir string) error {
 	if files["manifest.json"], err = json.MarshalIndent(manifest, "", "  "); err != nil {
 		return err
 	}
-	files["index.html"] = page
+	// The title names the artifact in the gallery: one per stack, not one
+	// "Review brief" for all of them.
+	title := fmt.Sprintf("<title>Review brief #%d</title>", st.Layers[0].PR)
+	files["index.html"] = []byte(strings.Replace(string(page), "<title>Review brief</title>", title, 1))
 	if err := writeAtomically(outDir, files); err != nil {
 		return err
 	}

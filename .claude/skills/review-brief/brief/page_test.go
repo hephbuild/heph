@@ -101,7 +101,7 @@ func Test_page_draws_a_valid_brief(t *testing.T) {
 		fmt.Fprintf(w, `{"head":{"sha":%q}}`, head)
 	})
 	dom := dumpDOM(t, url)
-	for _, want := range []string{`id="ledger"`, `data-state="verified"`, "1 card open", ">current<"} {
+	for _, want := range []string{`id="ledger"`, `data-state="verified"`, "1 card open", ">current<", "<title>Review brief #1</title>"} {
 		if !strings.Contains(dom, want) {
 			t.Errorf("page DOM lacks %q", want)
 		}
