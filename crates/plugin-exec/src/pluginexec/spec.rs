@@ -453,9 +453,9 @@ mod tests {
             Err(e) => e,
         };
         // `cache` dict is a `SpecStruct`: unknown keys are rejected with the
-        // generic "unknown entries found" message.
+        // generic unknown-option message.
         assert!(
-            format!("{err:#}").contains("unknown entries found"),
+            format!("{err:#}").contains("unknown option `bogus`"),
             "{err:#}"
         );
     }

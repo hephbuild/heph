@@ -869,9 +869,13 @@ fn approval_from(v: htvalue::Value) -> anyhow::Result<Approval> {
                 None => vec![],
             };
             if !m.is_empty() {
-                let mut keys: Vec<&String> = m.keys().collect();
-                keys.sort();
-                anyhow::bail!("approval has unknown entries: {keys:?}");
+                let mut keys: Vec<String> = m.into_keys().collect();
+                keys.sort_unstable();
+                return Err(anyhow::Error::new(hplugin::htspec::UnknownOptions {
+                    keys,
+                    known: &["required", "notice"],
+                })
+                .context("approval"));
             }
             Ok(Approval { required, notice })
         }
@@ -911,14 +915,17 @@ fn sandbox_from(m: htvalue::Value, pkg: &PkgBuf) -> anyhow::Result<Sandbox> {
     };
 
     let mut m: HashMap<&str, &htvalue::Value> = m.iter().map(|(k, v)| (k.as_str(), v)).collect();
-    let mut unknown_keys: Vec<&str> = m
+    let mut unknown_keys: Vec<String> = m
         .keys()
-        .copied()
         .filter(|k| !SANDBOX_KEYS.contains(k))
+        .map(|k| (*k).to_owned())
         .collect();
     if !unknown_keys.is_empty() {
         unknown_keys.sort_unstable();
-        anyhow::bail!("unknown entries found: {:?}", unknown_keys)
+        anyhow::bail!(hplugin::htspec::UnknownOptions {
+            keys: unknown_keys,
+            known: SANDBOX_KEYS,
+        })
     }
 
     let mut sandbox = Sandbox::default();
@@ -3180,7 +3187,11 @@ pub(crate) mod tests {
             htvalue::Value::Bool(true),
         )]));
         let err = approval_from(v).unwrap_err();
-        assert!(format!("{err:#}").contains("unknown entries"), "{err:#}");
+        assert_eq!(
+            format!("{err:#}"),
+            "approval: unknown option `requierd`; did you mean `required`? \
+             (valid options: required, notice)"
+        );
     }
 
     #[test]
@@ -3830,7 +3841,10 @@ target(
 
         let near_miss = htvalue::Value::Map(HashMap::from([("dep".to_string(), address)]));
         let err = sandbox_from(near_miss, &pkg).expect_err("an unlisted key");
-        assert!(format!("{err:#}").contains("unknown entries"), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("unknown option `dep`; did you mean `deps`?"),
+            "{err:#}"
+        );
     }
 
     #[test]

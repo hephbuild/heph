@@ -311,7 +311,10 @@ fn parse_body(cg: &FieldCodegen) -> proc_macro2::TokenStream {
                 .cloned()
                 .collect();
             __unknown.sort_unstable();
-            ::anyhow::bail!(crate::htspec::UnknownOptions { keys: __unknown });
+            ::anyhow::bail!(crate::htspec::UnknownOptions {
+                keys: __unknown,
+                known: __KNOWN,
+            });
         }
     }
 }

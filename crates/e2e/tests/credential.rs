@@ -176,12 +176,40 @@ async fn configuration_has_nowhere_to_hide_in_a_presentation() -> anyhow::Result
         "a region must not be a presentation",
     );
     let msg = format!("{err:#}");
-    // The `SpecStruct` derive names the offending key; the context says where
-    // configuration does belong.
+    // The `SpecStruct` derive names the offending key; the driver's context,
+    // kept as a hint beside the suggestions, says where configuration does
+    // belong.
     assert!(msg.contains("region"), "{msg}");
+    // The recorded failure, as a renderer reads it: `run` flattens it to its
+    // message.
+    let rs = ws.engine.new_state();
+    let addr = heph::htaddr::parse_addr("//auth:t")?;
+    let run = ws
+        .engine
+        .clone()
+        .result_addr(
+            rs.clone(),
+            &addr,
+            heph::engine::OutputMatcher::All,
+            &heph::engine::ResultOptions::default(),
+        )
+        .await;
+    assert!(run.is_err(), "a region must not be a presentation");
+    let failures = rs.take_failures();
+    let failure = failures.first().context("a recorded failure")?;
+    let hints: Vec<&str> = failure
+        .record
+        .diagnostic
+        .hints
+        .iter()
+        .filter(|h| h.kind == hcore::diagnostic::HintKind::Other)
+        .map(|h| h.text.as_str())
+        .collect();
     assert!(
-        msg.contains("hashed input on the consumer"),
-        "the message must say where it does belong: {msg}"
+        hints
+            .iter()
+            .any(|h| h.contains("hashed input on the consumer")),
+        "the failure must say where it does belong: {msg}; hints {hints:?}"
     );
     Ok(())
 }
