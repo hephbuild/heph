@@ -13,7 +13,7 @@ use hcore::htvalue::signature::ParamType;
 use hdriver_support::driver_managed::{
     ManagedDriver, ManagedRunRequest, ManagedRunResponse, single_dep_file,
 };
-use hplugin::driver::targetdef::path::{CodegenMode, Content, Path};
+use hplugin::driver::targetdef::path::{CodegenMode, Content, Path, escape_glob_literal};
 use hplugin::driver::targetdef::{Input, InputMode, Output, TargetDef};
 use hplugin::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
@@ -53,7 +53,10 @@ const INFERENCE_VERSION: u32 = 2;
 /// `bin/*` match something else would serve the old tree. Hashed inside each
 /// pattern section (`include`, an `executable` list), so a target without
 /// patterns keeps its key. `harchive`'s `matching_is_pinned` test fails when
-/// an answer moves.
+/// an answer moves. With `support_files`, the bridge also collects both
+/// lists as `glob`-crate output globs ([`check_collectable`] keeps them to
+/// syntax both read alike); a `glob` change there moves exec's output globs
+/// the same way, keyed by no version either.
 const GLOB_VERSION: u32 = 1;
 
 /// The dep input's origin id.
@@ -79,6 +82,17 @@ struct ExtractSpec {
     /// links that match one are extracted, and each pattern must match one.
     /// Empty (the default): every entry.
     include: Vec<String>,
+    /// Glob patterns (`include`'s syntax and refusals) naming the extracted
+    /// files that are the target's support files rather than its output:
+    /// staged beside the output where a dependent or a tool user gets them,
+    /// but never on `PATH`, in `$TOOL`, `$SRC` or a list file. Each is
+    /// extracted whether or not `include` matches it (so it widens what
+    /// `include` selects), and must match one. Needs `include`, which is
+    /// then the output; a file both match is refused. Both lists are then
+    /// declared as the target's output and support-file globs, collected as
+    /// exec's are, so they are limited to `*`, `?`, `**` and `[…]`. Empty
+    /// (the default): every extracted file is the output.
+    support_files: Vec<String>,
     /// `True`: every extracted file is executable (`0o755`), as a gz's one
     /// file or a zip built on Windows needs. A list of glob patterns: only
     /// the files that match one, and each must match one. The bit is only
@@ -119,6 +133,10 @@ struct ExtractDef {
     /// serialized before it existed.
     #[serde(default)]
     include: Vec<String>,
+    /// The `support_files` patterns, sorted and deduped. Absent from a def
+    /// serialized before it existed.
+    #[serde(default)]
+    support_files: Vec<String>,
     /// Absent from a def serialized before it existed; a bool in one
     /// serialized before it took patterns.
     #[serde(default)]
@@ -198,6 +216,42 @@ fn normalize(mut patterns: Vec<String>) -> Vec<String> {
     patterns
 }
 
+/// Refuse wax syntax the bridge's output globs (the `glob` crate) read
+/// differently, for patterns that are both: with `support_files`, `include`
+/// and `support_files` choose what is extracted (wax) and are then collected
+/// as output globs. Braces, `<…>` repetitions, `(?…)` flags and `\` escapes
+/// are wax syntax that `glob` takes literally; `*`, `?`, `**` and `[…]`
+/// (`[!…]` negated, `[^…]` not) mean the same to both.
+fn check_collectable(patterns: &[String]) -> anyhow::Result<()> {
+    for p in patterns {
+        if let Some(c) = p.chars().find(|c| "{}<>()\\".contains(*c)) {
+            anyhow::bail!(
+                "pattern {p:?} holds {c:?}: with `support_files`, patterns are limited to `*`, \
+                 `?`, `**` and `[…]`, since the output is collected with them too; list each \
+                 alternative as its own pattern, and match a file whose name holds one of \
+                 `{{}}<>()\\` with `?`"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The output globs that collect what the wax pattern `p` (one
+/// [`check_collectable`] passed) extracted. They are `p` itself, except for
+/// a trailing `**`: wax's `x/**` matches every path below `x` and `x`
+/// itself, where `glob`'s matches only the directories, which the collector
+/// skips. It becomes `x/**/*` and `x` (a lone `**` just `**/*`; the output
+/// directory itself is no file), which never match the same path.
+fn collector_globs(p: &str) -> Vec<String> {
+    if p == "**" {
+        return vec!["**/*".to_string()];
+    }
+    match p.strip_suffix("/**") {
+        Some(dir) => vec![format!("{dir}/**/*"), dir.to_string()],
+        None => vec![p.to_string()],
+    }
+}
+
 /// Hash a pattern list, after its section's marker: [`GLOB_VERSION`] (a
 /// pattern's meaning is wax's, not in its text), its length, then each
 /// pattern behind a NUL. The length keeps a list from running into what is
@@ -246,6 +300,31 @@ impl ManagedDriver for Driver {
         }
         let include = normalize(spec.include);
         Globs::new(&include).with_context(|| format!("{}: `include`", addr.format()))?;
+        let support_files = normalize(spec.support_files);
+        Globs::new(&support_files)
+            .with_context(|| format!("{}: `support_files`", addr.format()))?;
+        if !support_files.is_empty() {
+            if format == Some(Format::Gz) {
+                anyhow::bail!(
+                    "{}: `support_files` with `format = \"gz\"` would take its one file, \
+                     leaving no output; drop it",
+                    addr.format()
+                );
+            }
+            if include.is_empty() {
+                anyhow::bail!(
+                    "{}: `support_files` needs `include`: the output is the files `include` \
+                     selects, and without it every file is the output",
+                    addr.format()
+                );
+            }
+            // Both lists are then collected by the bridge as output globs,
+            // so they must mean there what they mean to the unpacker.
+            for (option, patterns) in [("include", &include), ("support_files", &support_files)] {
+                check_collectable(patterns)
+                    .with_context(|| format!("{}: `{option}`", addr.format()))?;
+            }
+        }
         let executable = spec.executable;
 
         let pkg = addr.package.clone();
@@ -295,10 +374,38 @@ impl ManagedDriver for Driver {
             h.update(b"\0include");
             hash_patterns(&mut h, &include);
         }
+        // Moves what is extracted, and which artifact each file lands in.
+        if !support_files.is_empty() {
+            h.update(b"\0support_files");
+            hash_patterns(&mut h, &support_files);
+        }
         // Not `limits`: they decide only whether the run fails, and a failure
         // is never cached; when it succeeds the tree is the same whatever the
         // limits were, so raising one must not re-extract every archive.
         let hash = format!("{:016x}", h.digest()).into_bytes();
+        // Without `support_files`, the whole directory is the output. With
+        // them, the bridge collects `include`'s files as the output and
+        // theirs as the support files, each pattern below `out` (escaped, so
+        // only the pattern is pattern text). The unpacker refused a file
+        // both match, and extracted nothing else, so the two cover the tree.
+        let collected = |content| Path {
+            content,
+            codegen_tree: CodegenMode::None,
+            collect: true,
+        };
+        let (output_paths, support_paths) = if support_files.is_empty() {
+            (vec![collected(Content::DirPath(out_ws))], Vec::new())
+        } else {
+            let prefix = escape_glob_literal(&out_ws);
+            let below_out = |patterns: &[String]| -> Vec<Path> {
+                patterns
+                    .iter()
+                    .flat_map(|p| collector_globs(p))
+                    .map(|g| collected(Content::Glob(format!("{prefix}/{g}"))))
+                    .collect()
+            };
+            (below_out(&include), below_out(&support_files))
+        };
 
         Ok(ParseResponse {
             target_def: TargetDef {
@@ -308,6 +415,7 @@ impl ManagedDriver for Driver {
                     format,
                     strip_components: spec.strip_components,
                     include,
+                    support_files,
                     executable,
                     limits,
                     out,
@@ -322,12 +430,9 @@ impl ManagedDriver for Driver {
                 }],
                 outputs: vec![Output {
                     group: String::new(),
-                    paths: vec![Path {
-                        content: Content::DirPath(out_ws),
-                        codegen_tree: CodegenMode::None,
-                        collect: true,
-                    }],
+                    paths: output_paths,
                 }],
+                support_files: support_paths,
                 hash,
                 // A pure function of the archive's bytes (and `hash` above).
                 cache: spec.cache.into(),
@@ -363,6 +468,8 @@ impl ManagedDriver for Driver {
         let opts = UnpackOptions {
             strip_components: def.strip_components,
             include: Globs::new(&def.include).with_context(|| format!("{addr}: `include`"))?,
+            support: Globs::new(&def.support_files)
+                .with_context(|| format!("{addr}: `support_files`"))?,
             executable: def
                 .executable
                 .to_unpack()
@@ -392,6 +499,8 @@ impl ManagedDriver for Driver {
         })
         .await?;
 
+        // The bridge collects what parse declared: the directory whole, or
+        // `include`'s and `support_files`' globs.
         Ok(ManagedRunResponse::default())
     }
 }
@@ -428,6 +537,13 @@ fn check_inferred(
             "the format was inferred as gz (one gzipped file) from {name:?}, and \
              `strip_components` would remove that file; drop it, or set `format` if the \
              archive is a tar"
+        );
+    }
+    if format == Format::Gz && !opts.support.is_empty() {
+        anyhow::bail!(
+            "the format was inferred as gz (one gzipped file) from {name:?}, and \
+             `support_files` would take that file, leaving no output; drop it, or set \
+             `format` if the archive is a tar"
         );
     }
     Ok(())
@@ -742,6 +858,21 @@ mod tests {
         );
         check_inferred(Format::TarGz, archive, &strip).unwrap();
         check_inferred(Format::Zip, archive, &UnpackOptions::default()).unwrap();
+        // `support_files` would take a gz's one file, as parse refuses for a
+        // named gz; a tar keeps an output beside them.
+        let support = UnpackOptions {
+            support: Globs::new(&["tool".to_string()]).unwrap(),
+            ..UnpackOptions::default()
+        };
+        let msg = format!(
+            "{:#}",
+            check_inferred(Format::Gz, archive, &support).unwrap_err()
+        );
+        assert!(
+            msg.contains("inferred as gz") && msg.contains("`support_files` would take that file"),
+            "{msg}"
+        );
+        check_inferred(Format::TarGz, archive, &support).unwrap();
         // `executable` holds for every format, inferred or not.
         let exe = UnpackOptions {
             executable: harchive::Executable::All,
@@ -971,6 +1102,103 @@ mod tests {
             raw.executable.to_unpack().unwrap(),
             harchive::Executable::Matching(_)
         ));
+    }
+
+    /// `support_files` reaches the def sorted and deduped, moves the hash
+    /// only when set (order-free), and makes `run` pack the directory
+    /// itself: the bridge is told to collect nothing.
+    #[tokio::test]
+    async fn support_files_reach_the_def_and_hash_and_declare_the_collection() {
+        let base = [
+            ("src", s(":a")),
+            ("format", s("zip")),
+            ("include", s("bin/tool")),
+        ];
+        let def = |extra: Vec<(&'static str, Value)>| {
+            let mut cfg = base.to_vec();
+            cfg.extend(extra);
+            async move { parse("//p[1]:t", &cfg).await.unwrap() }
+        };
+        let globs = |paths: &[Path]| -> Vec<String> {
+            paths
+                .iter()
+                .map(|p| {
+                    assert!(p.collect);
+                    match &p.content {
+                        Content::Glob(g) => g.clone(),
+                        other => panic!("not a glob: {other:?}"),
+                    }
+                })
+                .collect()
+        };
+        let plain = def(vec![]).await;
+        assert!(matches!(
+            &plain.outputs[0].paths[..],
+            [Path { content: Content::DirPath(d), collect: true, .. }] if d == "p[1]/t"
+        ));
+        assert!(plain.support_files.is_empty());
+        let with = def(vec![(
+            "support_files",
+            Value::List(vec![s("lib/**"), s("include/**"), s("lib/**")]),
+        )])
+        .await;
+        assert_ne!(with.hash, plain.hash);
+        // Below `out`, the package's `[1]` escaped and the pattern not; a
+        // trailing `**` (wax: everything below, and the path itself) as the
+        // two `glob` patterns that collect those files.
+        assert_eq!(globs(&with.outputs[0].paths), ["p[[]1[]]/t/bin/tool"]);
+        assert_eq!(
+            globs(&with.support_files),
+            [
+                "p[[]1[]]/t/include/**/*",
+                "p[[]1[]]/t/include",
+                "p[[]1[]]/t/lib/**/*",
+                "p[[]1[]]/t/lib"
+            ]
+        );
+        let all = def(vec![("support_files", s("**"))]).await;
+        assert_eq!(globs(&all.support_files), ["p[[]1[]]/t/**/*"]);
+        let raw = with.def_de::<ExtractDef>();
+        assert_eq!(raw.support_files, ["include/**", "lib/**"]);
+        let reordered = def(vec![(
+            "support_files",
+            Value::List(vec![s("include/**"), s("lib/**")]),
+        )])
+        .await;
+        assert_eq!(reordered.hash, with.hash);
+    }
+
+    /// `support_files` patterns are checked as `include`'s are, need
+    /// `include`, keep both lists to what the collector reads alike, and are
+    /// refused with a named `gz`, whose one file they would take.
+    #[tokio::test]
+    async fn bad_support_files_are_refused_at_parse() {
+        let inc = || ("include", s("bin/tool"));
+        for (cfg, want) in [
+            (vec![inc(), ("support_files", s("/abs"))], "`support_files`"),
+            (vec![inc(), ("support_files", s("dir/"))], "matches no file"),
+            (
+                vec![inc(), ("support_files", s("x")), ("format", s("gz"))],
+                "leaving no output",
+            ),
+            (
+                vec![("support_files", s("include/**"))],
+                "`support_files` needs `include`",
+            ),
+            (
+                vec![inc(), ("support_files", s("{lib,include}/**"))],
+                r#"`support_files`: pattern "{lib,include}/**" holds '{'"#,
+            ),
+            (
+                vec![("include", s("bin/\\*")), ("support_files", s("lib/**"))],
+                r#"`include`: pattern "bin/\\*" holds '\\'"#,
+            ),
+        ] {
+            let mut full = vec![("src", s(":a"))];
+            full.extend(cfg);
+            let err = parse("//pkg:t", &full).await.err().expect("refused");
+            assert!(format!("{err:#}").contains(want), "{err:#}");
+        }
     }
 
     /// `include` and `executable` take a string, a list, and (`executable`)
