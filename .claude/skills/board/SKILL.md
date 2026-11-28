@@ -73,7 +73,11 @@ One brief, shared by every agent at this stage, pasted into each prompt. An agen
 ```
 Stage: design | review
 Subject: <spec URL or path> | Base: <sha> Head: <sha> (<N> files, +A/-B)
-Read code: `git show <head>:<path>`, `git grep <pattern> <head>`, `git diff <base>..<head> -- <path>`.
+The diff: <pack>/code.diff (<N> lines), cut once for every agent. <pack>/index.txt gives each
+  file's first line in it: Read the slice you need, do not re-run `git diff`.
+  <pack>/rest.diff holds tests, docs and lockfiles; <pack>/map.md, when present, says what each
+  file's change is and which hunks are in your lane.
+Read code around the diff: `git show <head>:<path>`, `git grep <pattern> <head>`.
   The working tree is not the subject: another session may be editing it or switching branches.
   If you must build, use a detached worktree at <head> and run `gen` there first.
 Scratch: <scratchpad>/review-<agent>-<short head>/ — yours alone.
@@ -87,7 +91,57 @@ Your question: <per agent — the specific thing this agent should judge>
 Answer with: verdict, then findings ranked by severity, each with file:line. At most ~600 words.
 ```
 
-Give the diffstat, not the diff: the agent reads the lines it needs.
+### The pack (review only)
+
+Cut the diff **once**, before any consult, into `<scratchpad>/board-<short head>/`:
+
+```bash
+P=<scratchpad>/board-<short head>; mkdir -p "$P"
+git diff -M --stat=200 <base>..<head> > "$P/stat.txt"
+git diff -M <base>..<head> -- . ':(glob,exclude)**/tests/**' ':(glob,exclude)**/testdata/**' \
+  ':(glob,exclude)**/*.md' ':(glob,exclude)**/*.lock' ':(glob,exclude)gen/**' > "$P/code.diff"
+git diff -M <base>..<head> -- ':(glob)**/tests/**' ':(glob)**/testdata/**' \
+  ':(glob)**/*.md' ':(glob)**/*.lock' ':(glob)gen/**' > "$P/rest.diff"
+rg -n '^diff --git' "$P/code.diff" | sed -E 's|:diff --git a/.* b/| |' > "$P/index.txt"
+wc -l "$P/code.diff" "$P/rest.diff"
+```
+
+Write the two pathspec lists out as above. A zsh substitution that turns one list into the other
+left the excludes off, and `code.diff` came out as the whole diff.
+
+The brief names the pack; it does not paste the diff. Who reads what:
+
+- `code-quality`, `hermeticity`, `compatibility`: `code.diff`. Tests are `feature-quality`'s lane.
+- `feature-quality`: both files.
+- `product-vision`: `stat.txt`, the docs in `rest.diff`, and the hunks of `code.diff` that are the
+  user-facing surface.
+
+`code.diff` still holds inline `#[cfg(test)]` modules. Say so in `code-quality`'s lane.
+
+Why: told "here is the diffstat, read what you need", every reviewer rebuilt the diff by hand.
+Over 30 days to 2026-11-28, `code-quality` and `hermeticity` each made about 40 `git diff/show`
+calls and 40 `rg`/`sed` calls per run, at a median context of 160–180k, and the two of them took
+72% of the board's tokens (5.7M and 4.8M per run, against 1.6M for `feature-quality`).
+
+### The map (review, when `code.diff` is over 800 lines)
+
+Before the consults, run **one** scout: `general-purpose`, `model: "sonnet"`, no worktree. It
+reads the pack and writes `<pack>/map.md`, at most 150 lines:
+
+- per file, one line on what the change is;
+- per triggered agent, the hunks in its lane (`path` + line in `code.diff`), using the table in
+  section 2 and each agent's "Owns" from CLAUDE.md;
+- for each changed public item (a trait method, a `pub fn`, a type's field), where it is used:
+  the `git grep` result as `path:line`, counted when there are more than ten;
+- what looks mechanical, each with the reason: a rename, a moved block, one new argument threaded
+  through call sites.
+
+It returns five lines and the path. It judges nothing: no verdict, no finding.
+
+Tell each reviewer what the map is: **a reading order, not a boundary**. The reviewer owns its
+verdict over its whole lane. A hunk the map calls mechanical can still be opened, and a reviewer
+that finds the map wrong says so in its answer. The map exists so that Opus spends its calls
+judging the code instead of finding it.
 
 **Pin, isolate, fence.** A reviewer reading the live tree while the session edits or switches
 branches reviews a half-written file, or the wrong layer: 89 reads of a tree that changed under
@@ -98,12 +152,22 @@ coverage gaps to it; at review, four findings in one round came from both.
 
 ## 4. Run
 
+At review, in this order: cut the pack, run the scout if `code.diff` is over 800 lines, then the
+consults.
+
 All consults at one stage go in **one message**, in parallel, each with `isolation: "worktree"`
 at review so a reviewer that builds does not touch the session's tree. Model:
 
 - `product-vision` and `feature-quality`: `model: "sonnet"` at both stages. At review,
   `feature-quality` on Sonnet cost ~1.2M tokens a PR and still found the one BLOCKER.
-- `code-quality`, `hermeticity`, `compatibility`: inherit the session model — depth is the point.
+- `code-quality` and `hermeticity`: Opus, pinned in their frontmatter — depth is the point.
+  `compatibility`: Sonnet, pinned the same way.
+
+Every agent's model is pinned in `.claude/agents/<name>.md`; none inherits the session's. Do not
+pass `model` to override a pin. An inherited model follows whatever the session runs: with a
+session on Fable, `code-quality` and `hermeticity` ran on Fable at `xhigh`, and three
+`feature-quality` runs spawned outside this skill landed on Opus at about four times the tokens
+of a Sonnet run.
 
 Fix while the board runs only what no pending reviewer covers; hold the rest for the last report
 (CLAUDE.md, "Workflow").
