@@ -1424,6 +1424,30 @@ mod tests {
         );
     }
 
+    /// `finish` hands each held record out once and keeps none: the held
+    /// set is empty after it, so a second `finish` writes nothing and runs
+    /// no second pass.
+    #[tokio::test]
+    async fn finish_releases_held_records() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine =
+            Arc::new(Engine::new(crate::engine::Config::for_tests(dir.path())).expect("engine"));
+        let rs = engine.new_state_with_events(false, None);
+        let (_, mut f) = fold_with(
+            vec![
+                ev(0, matched(&["//p:a", "//p:b"], true)),
+                ev(1, end("//p:a", Some("dependency failed"), Some("//p:c"))),
+                ev(2, end("//p:b", Some("dependency failed"), Some("//p:c"))),
+            ],
+            &Known::default(),
+        );
+        assert_eq!(f.held.len(), 2);
+        assert_eq!(f.finish(&rs).len(), 2);
+        assert!(f.held.is_empty(), "{:?}", f.held.len());
+        assert!(f.finish(&rs).is_empty(), "each record once");
+        assert_eq!(rs.report_passes(), 1);
+    }
+
     /// FQ-4: a pure chain of 5000 selected targets, all skipped under the
     /// one culprit at its foot. Every node is asked for its record, and each
     /// record carries the whole path down: the output is quadratic in the
