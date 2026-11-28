@@ -3062,6 +3062,75 @@ fn self_cycle_never_drawn_green() {
     );
 }
 
+/// U6/U21's build: `//pkg:bad` fails at once and leaves a marker beside the
+/// gate as it does; `//pkg:gate` holds the run open until the test opens it.
+fn mid_run_failure_build(gate: &std::path::Path) -> String {
+    format!(
+        concat!(
+            "target(name = \"bad\", driver = \"bash\", cache = False,",
+            " run = [\"touch {marker}\", \"exit 3\"])\n",
+            "target(name = \"gate\", driver = \"bash\", cache = False,",
+            " run = [\"while [ ! -e {gate} ]; do sleep 0.1; done\"])\n",
+        ),
+        gate = gate.display(),
+        marker = gate.with_file_name("bad-ran").display(),
+    )
+}
+
+/// U6, U21 (STAGE-19 as kept): while the run goes on past a failure, the TUI
+/// draws no failure rows (no box, no one-liner) for it; the status line,
+/// which carries the spotlight (U24), is the only row that may name it. Once
+/// the run ends, the failure is reported and the end line counts it. The count
+/// is checked at the end only: U21 keeps it moving when the requested target
+/// ends, which under keep-going is late but always right.
+#[test]
+fn tui_no_failure_rows_mid_run_count_right_at_end() {
+    let mut g = Gated::start_build(mid_run_failure_build, "", &[], "//pkg:bad //pkg:gate");
+    let marker = g.gate.with_file_name("bad-ran");
+    let started = Instant::now();
+    while !marker.exists() {
+        assert!(
+            started.elapsed() < DEADLINE,
+            "//pkg:bad never ran\n{}",
+            g.pty.seen()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    g.pty
+        .wait_screen("the status line is up", DEADLINE, on_line);
+    // Frames for the failure's end: a row drawn for it would be in one.
+    std::thread::sleep(Duration::from_millis(1500));
+    let mid_run = g.pty.seen();
+    let stray: Vec<&str> = mid_run
+        .lines()
+        .filter(|r| r.contains("//pkg:bad") && !r.contains(" done"))
+        .collect();
+    assert!(
+        stray.is_empty(),
+        "failure rows were drawn while the run went on: {stray:?}\n{mid_run}"
+    );
+    std::fs::write(&g.gate, b"").expect("open the gate");
+    let ended = g.exit();
+    let rows = g.pty.rows();
+    assert_eq!(
+        ended,
+        common::pty::Ended::Code(1),
+        "a failed run exits 1\n{}",
+        g.pty.seen()
+    );
+    assert!(
+        rows.iter().any(|r| r.starts_with("✗ //pkg:bad")),
+        "the failure is reported once the run ends\n{}",
+        g.pty.seen()
+    );
+    assert!(
+        rows.iter()
+            .any(|r| r.starts_with("✗ ") && r.contains("1 failed (1 root)")),
+        "the end line counts the failure\n{}",
+        g.pty.seen()
+    );
+}
+
 /// EVAL-02 / CLI-14 / STAGE-22: a message wider than the terminal wraps
 /// inside the box instead of being cut at its edge, so its end, where the
 /// cause sits, is on screen. heph wraps it, not the terminal: the row that
