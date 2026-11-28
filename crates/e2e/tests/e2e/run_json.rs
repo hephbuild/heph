@@ -67,14 +67,16 @@ pub(crate) struct JsonRun {
     /// The list got its `]`.
     pub(crate) closed: bool,
     /// The run's own result, which `finalize` turns into the exit code.
-    res: anyhow::Result<()>,
+    pub(crate) res: anyhow::Result<()>,
     /// Every event the display saw.
     events: Vec<heph::engine::event::BuildEvent>,
     /// What `finalize` makes of the walk's skips: an error when it skipped
     /// part of the selection.
-    complete: anyhow::Result<()>,
+    pub(crate) complete: anyhow::Result<()>,
     /// The failure boxes a text run of the same request prints.
     pub(crate) boxes: String,
+    /// The interactive report the TUI prints at the end of the same request.
+    pub(crate) report: String,
 }
 
 impl JsonRun {
@@ -203,6 +205,16 @@ async fn run_json_full(
         },
     ));
     let boxes = String::from_utf8(printed).expect("utf-8 boxes");
+    let failures = rs.take_failures_with_logs().await;
+    let report = heph::commands::errors::ReportContext::gather(
+        &failures,
+        |a| rs.was_cancelled(a),
+        rs.heph_home().as_deref(),
+        rs.log_tail_lines(),
+    )
+    .with_workspace(rs.workspace_root().as_deref())
+    .with_width(200)
+    .render(false);
     drain(rs).await;
     let text = String::from_utf8(buf).expect("utf-8");
     let entries = if closed {
@@ -223,6 +235,7 @@ async fn run_json_full(
         events,
         complete: heph::commands::errors::require_complete_selection(&gaps),
         boxes,
+        report,
     }
 }
 
