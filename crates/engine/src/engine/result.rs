@@ -2409,15 +2409,9 @@ fn record_culprit(
             && let Culprit::Target(c) = &culprit
             && let Some(at) = culprit_location(rs, c, &e, record.diagnostic.stage)
         {
-            // The location is the call as evaluated, which the text may no
-            // longer be at: say so, in the message both renderers show.
-            if at.changed {
-                let message = &mut record.diagnostic.message;
-                message.push_str(" (");
-                message.push_str(hplugin::provider::DeclAt::CHANGED);
-                message.push(')');
-            }
-            record.diagnostic.location = Some(at.loc);
+            // A location the text may no longer be at says so, in the
+            // message both renderers show, within the caps `compact` kept.
+            crate::engine::failure_record::locate(&mut record, at);
         }
         Arc::new(record)
     });
