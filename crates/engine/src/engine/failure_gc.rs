@@ -21,13 +21,21 @@
 //! the slot is skipped. Under the lock the manifest is read again, and a slot a
 //! run refilled since the scan is kept.
 //!
+//! A BUILD file's slot (its manifest names `file:<path>`, keyed by
+//! [`file_key`]) is live while that file exists under the workspace root, and
+//! aged out like any other. Nothing clears it when the file next evaluates. It
+//! has no execute lock: it is removed after its manifest is read again, kept
+//! when a fill replaced it since the scan.
+//!
 //! Never fatal: every error is a `warn!` and a count in [`FailureGcStats`].
 //!
 //! [`failure_slot`]: crate::engine::failure_slot
 
 use crate::engine::Engine;
 use crate::engine::error::TargetNotFoundError;
-use crate::engine::failure_slot::{TEMP_PREFIX, addr_key, read_any_manifest};
+use crate::engine::failure_slot::{
+    FILE_ADDR_PREFIX, TEMP_PREFIX, addr_key, file_key, read_any_manifest,
+};
 use crate::engine::gc::bounded_join;
 use crate::engine::request_state::RequestState;
 use hcore::hmemoizer::downcast_chain_ref;
@@ -63,8 +71,15 @@ pub struct FailureGcStats {
 /// A slot with a readable manifest, found by the scan.
 struct Slot {
     dir: PathBuf,
-    addr: Addr,
+    of: SlotOf,
     failed_at: u64,
+}
+
+/// Whose failure a slot keeps.
+enum SlotOf {
+    Target(Addr),
+    /// A BUILD file that did not evaluate, at this workspace-relative path.
+    File(String),
 }
 
 /// What the scan found.
@@ -158,18 +173,37 @@ impl Engine {
                 let engine = Arc::clone(&self);
                 let rrs = Arc::clone(&resolve_rs);
                 async move {
-                    let verdict = match engine.get_spec(rrs, &slot.addr).await {
-                        Ok(_) => Verdict::Live,
-                        Err(e) if downcast_chain_ref::<TargetNotFoundError>(&e).is_some() => {
-                            Verdict::Dead
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                addr = %slot.addr,
-                                error = %format!("{e:#}"),
-                                "gc: resolving a failure slot's target failed, keeping it",
-                            );
-                            Verdict::Unknown
+                    let verdict = match &slot.of {
+                        SlotOf::Target(addr) => match engine.get_spec(rrs, addr).await {
+                            Ok(_) => Verdict::Live,
+                            Err(e) if downcast_chain_ref::<TargetNotFoundError>(&e).is_some() => {
+                                Verdict::Dead
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    addr = %addr,
+                                    error = %format!("{e:#}"),
+                                    "gc: resolving a failure slot's target failed, keeping it",
+                                );
+                                Verdict::Unknown
+                            }
+                        },
+                        // A file's slot lives while the file does: nothing
+                        // clears it when the file next evaluates.
+                        SlotOf::File(rel) => {
+                            let path = engine.root().join(rel);
+                            match hcore::blocking::run(move || path.try_exists()).await {
+                                Ok(true) => Verdict::Live,
+                                Ok(false) => Verdict::Dead,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        file = %rel,
+                                        error = %e,
+                                        "gc: checking a failure slot's file failed, keeping it",
+                                    );
+                                    Verdict::Unknown
+                                }
+                            }
                         }
                     };
                     (slot, verdict)
@@ -219,18 +253,24 @@ impl Engine {
             }
         }
         for slot in doomed {
-            let _guard = match self.result_lock().try_lock_execute(&slot.addr) {
-                Ok(Some(g)) => g,
-                Ok(None) => {
-                    tracing::debug!(addr = %slot.addr, "gc: failure slot's target is running, kept");
-                    stats.locked += 1;
-                    continue;
-                }
-                Err(e) => {
-                    tracing::warn!(addr = %slot.addr, error = %format!("{e:#}"), "gc: locking a failure slot's target");
-                    stats.errored += 1;
-                    continue;
-                }
+            // A file has no execute lock: its slot is filled by whichever
+            // request fails to evaluate it, and only the re-read below guards
+            // a refill since the scan.
+            let _guard = match &slot.of {
+                SlotOf::File(_) => None,
+                SlotOf::Target(addr) => match self.result_lock().try_lock_execute(addr) {
+                    Ok(Some(g)) => Some(g),
+                    Ok(None) => {
+                        tracing::debug!(addr = %addr, "gc: failure slot's target is running, kept");
+                        stats.locked += 1;
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(addr = %addr, error = %format!("{e:#}"), "gc: locking a failure slot's target");
+                        stats.errored += 1;
+                        continue;
+                    }
+                },
             };
             // A run between the scan and the lock cleared or refilled it.
             match read_any_manifest(&slot.dir) {
@@ -287,11 +327,25 @@ fn scan(root: &Path, now: SystemTime) -> Scan {
             continue;
         }
         let slot = read_any_manifest(&path).and_then(|m| {
-            let addr = parse_addr(&m.addr).ok()?;
             // A manifest under another key reads as absent for its address.
-            (addr_key(&addr) == name).then_some(Slot {
+            let (key, of) = match m.addr.strip_prefix(FILE_ADDR_PREFIX) {
+                // Only a path heph writes: relative, nothing but names.
+                Some(rel)
+                    if Path::new(rel)
+                        .components()
+                        .all(|c| matches!(c, std::path::Component::Normal(_))) =>
+                {
+                    (file_key(rel), SlotOf::File(rel.to_owned()))
+                }
+                Some(_) => return None,
+                None => {
+                    let addr = parse_addr(&m.addr).ok()?;
+                    (addr_key(&addr), SlotOf::Target(addr))
+                }
+            };
+            (key == name).then_some(Slot {
                 dir: path.clone(),
-                addr,
+                of,
                 failed_at: m.failed_at,
             })
         });
@@ -366,7 +420,7 @@ fn tree_size(dir: &Path) -> u64 {
 mod tests {
     use super::*;
     use crate::engine::Config;
-    use crate::engine::failure_slot::write_test_slot;
+    use crate::engine::failure_slot::{write_test_file_slot, write_test_slot};
     use crate::engine::fault_provider::{FaultProvider, Faults};
     use hcore::hasync::StdCancellationToken;
 
@@ -587,5 +641,46 @@ mod tests {
         }
         assert_eq!(stats.removed, 4, "{stats:?}");
         assert_eq!(stats.errored, 0, "zero age never resolves: {stats:?}");
+    }
+
+    /// A BUILD file's slot is not litter: it stays while the file exists,
+    /// however long gc's litter age is passed.
+    #[tokio::test]
+    async fn gc_keeps_file_slot_while_file_exists() {
+        let (engine, dir) = engine();
+        let now = SystemTime::now();
+        std::fs::create_dir_all(dir.path().join("d")).expect("mkdir");
+        std::fs::write(dir.path().join("d/BUILD"), "broken(").expect("BUILD");
+        let slot = write_test_file_slot(&root(&engine), "d/BUILD", ms(now));
+        let stats = sweep(&engine, 7 * DAY, now + 2 * LITTER_MIN_AGE).await;
+        assert!(slot.exists(), "{stats:?}");
+        assert_eq!(
+            stats,
+            FailureGcStats {
+                kept: 1,
+                ..Default::default()
+            }
+        );
+        assert!(
+            engine.failure_slots().read_file("d/BUILD").is_some(),
+            "the slot reads by its file"
+        );
+    }
+
+    /// Once its file is gone, a BUILD file's slot is removed; an aged one
+    /// goes whether or not the file exists.
+    #[tokio::test]
+    async fn gc_removes_file_slot_once_file_is_gone() {
+        let (engine, dir) = engine();
+        let now = SystemTime::now();
+        std::fs::write(dir.path().join("BUILD"), "broken(").expect("BUILD");
+        let root = root(&engine);
+        let gone = write_test_file_slot(&root, "gone/BUILD", ms(now));
+        let aged = write_test_file_slot(&root, "BUILD", ms(now - 8 * DAY));
+        let stats = sweep(&engine, 7 * DAY, now).await;
+        assert!(!gone.exists(), "{stats:?}");
+        assert!(!aged.exists(), "{stats:?}");
+        assert_eq!(stats.removed, 2, "{stats:?}");
+        assert_eq!(stats.errored, 0, "{stats:?}");
     }
 }
