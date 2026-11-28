@@ -257,7 +257,7 @@ Each record is output contract 2 (`heph version --json` reports
 | `selected` | yes | the selector matched it. False only on a culprit written because something selected depends on it; a `file` record is never selected |
 | `failure` | yes | `{log, out, fixes}`, as `heph inspect failure`; null unless it failed running |
 | `stage` | yes | on a failed culprit (a target or a file record): the stage of the build that raised it, `eval`, `spec`, `parse`, `link`, `run`, `cache`, `config` or `cli`; null elsewhere |
-| `location` | yes | on a failed culprit: `{file, line, col}`, where in a source file it was raised, `file` workspace-relative; null when it names no place, and elsewhere |
+| `location` | yes | on a failed culprit: `{file, line, col}`, where in a source file it was raised, `file` workspace-relative, `line` and `col` 1-based, `col` counted in chars. A `parse` or `link` failure points at the target's declaration: the option that caused it, else the call. `file` can be a `.bzl`/`.star` file, for a target a macro declared. Null when it names no place, and elsewhere (`docs/FAILURE_OUTPUTS.md`) |
 | `hints` | yes | on a failed culprit: `[{kind, text}]`, what can be done about it; `kind` is `did_you_mean`, `valid_values`, `declare_tool`, `see_log` or `other`, and `text` is not contract. Empty elsewhere |
 | `truncated` | yes | on a failed culprit: a cap cut something from its record (the message, its causes, a source line); false elsewhere |
 | `log_replaced` | yes | on a failed culprit: a newer failed run filled its failure slot again, so the slot's log is no longer this failure's; false elsewhere |
@@ -429,7 +429,7 @@ has the example).
 | `slot` | the failure slot's directory, absolute |
 | `stage` | `eval`, `spec`, `parse`, `link`, `run`, `cache`, `config` or `cli`; never null. Synthetic on a slot from an older heph, which kept no record: `run` when the target ran, else `eval` |
 | `message` | what went wrong, on one line; never null. Its wording is not contract. Synthetic on a slot from an older heph: `no diagnostic kept (the slot is from an older heph)` |
-| `location` | `{file, line, col}` in a source file; null when it names no place |
+| `location` | `{file, line, col}` in a source file, as on a `run --json` record; null when it names no place |
 | `hints` | `[{kind, text}]`; a hint's wording is not contract |
 | `truncated` | a cap cut something from the record |
 | `hashin` | the input hash of the run that failed; null for a failure before the run |
