@@ -1550,6 +1550,34 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
         )
     }
 
+    /// Write the values, joined by spaces, to heph's debug log with this
+    /// call's file and line (`p/BUILD:12`); seen with debug logging on,
+    /// silent otherwise. It runs when the file is evaluated, so a run that
+    /// reuses an evaluation prints nothing again. It has no effect on any
+    /// target.
+    fn print<'v>(
+        #[starlark(args)] args: starlark::values::tuple::UnpackTuple<Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<starlark::values::none::NoneType> {
+        // Joined as starlark's own `print` does: a string bare, anything
+        // else in its repr.
+        let mut text = String::new();
+        for (i, v) in args.items.iter().enumerate() {
+            if i > 0 {
+                text.push(' ');
+            }
+            text.push_str(&v.to_str());
+        }
+        let span = eval.call_stack_top_location();
+        let site = match eval.extra.and_then(|e| e.downcast_ref::<Extra>()) {
+            Some(extra) => render_span(extra.root, span.as_ref()),
+            None => render_span(Path::new(""), span.as_ref()),
+        };
+        // The user's text is the message; shown escaped, never obeyed (D2).
+        tracing::debug!(site = %site, "{}", hcore::diagnostic::escape_control(&text));
+        Ok(starlark::values::none::NoneType)
+    }
+
     /// Build a struct (dict) from keyword arguments, for nested target config.
     fn r#struct<'v>(
         eval: &mut Evaluator<'v, '_, '_>,

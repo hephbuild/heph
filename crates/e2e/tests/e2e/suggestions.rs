@@ -94,3 +94,45 @@ async fn plugin_option_typo_suggests() {
         "{msg}"
     );
 }
+
+/// A BUILD file calling `print` with a string, an int and a list, on line 2.
+const PRINTS: &str = concat!(
+    "# y\n",
+    "print(\"hello\", 42, [1])\n",
+    r#"target(name = "y", driver = "bash", run = "echo ok > $OUT", out = "o.txt")"#,
+    "\n",
+);
+
+/// EVAL-18 / U12: `print` exists, and an ordinary run (no debug logging)
+/// shows nothing of it.
+#[tokio::test]
+async fn print_silent_in_ordinary_run() {
+    let ws = crate::common::Workspace::new();
+    ws.write_build_file("c", PRINTS);
+    let (res, log) = crate::codegen_index_write::capture_logs(
+        tracing_subscriber::filter::LevelFilter::INFO,
+        ws.run("//c:y"),
+    )
+    .await;
+    res.expect("a BUILD file calling print evaluates");
+    assert!(!log.contains("hello"), "{log}");
+}
+
+/// EVAL-18 / U12: with debug logging, `print` is one debug line with the
+/// call's file and line, its values joined as starlark's `print` joins them.
+#[tokio::test]
+async fn print_debug_line_with_file_line() {
+    let ws = crate::common::Workspace::new();
+    ws.write_build_file("c", PRINTS);
+    let (res, log) = crate::codegen_index_write::capture_logs(
+        tracing_subscriber::filter::LevelFilter::DEBUG,
+        ws.run("//c:y"),
+    )
+    .await;
+    res.expect("run");
+    let lines: Vec<&str> = log.lines().filter(|l| l.contains("hello 42 [1]")).collect();
+    assert_eq!(lines.len(), 1, "{log}");
+    let line = lines.first().copied().unwrap_or_default();
+    assert!(line.contains("DEBUG"), "{line}");
+    assert!(line.contains("site=c/BUILD:2"), "{line}");
+}

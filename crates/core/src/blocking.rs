@@ -158,6 +158,12 @@ where
         .acquire()
         .await
         .expect("heph blocking slots semaphore is never closed");
+    // The caller's tracing dispatcher rides along too, so the job logs where
+    // its caller does: a pool thread has no scoped dispatcher of its own, and
+    // a caller's thread-local one (a test's capture) would otherwise never
+    // see the job's events. With only the global subscriber set, as in
+    // production, this is that same subscriber.
+    let dispatch = tracing::dispatcher::get_default(Clone::clone);
     let handle = tokio::task::spawn_blocking(move || {
         // The permit rides into the job: once spawned, the job occupies a
         // slot until it *finishes*, even when the caller's future is dropped
@@ -166,7 +172,7 @@ where
         // outside the bound.
         let _permit = permit;
         let _marker = JobMarker::set();
-        f()
+        tracing::dispatcher::with_default(&dispatch, f)
     });
     match handle.await {
         Ok(value) => value,
@@ -682,5 +688,37 @@ mod tests {
         let jobs = (0..n).map(|i| run(move || i * 2));
         let out = futures::future::join_all(jobs).await;
         assert_eq!(out, (0..n).map(|i| i * 2).collect::<Vec<_>>());
+    }
+
+    /// Counts the events this module sends it (not the runtime's own).
+    struct Counting(Arc<AtomicUsize>);
+
+    impl tracing::Subscriber for Counting {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            if event.metadata().target() == module_path!() {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// A job's events reach the dispatcher its caller had (D-6): a
+    /// thread-local one, which the pool thread would otherwise not see.
+    #[tokio::test]
+    async fn a_job_logs_to_its_callers_dispatcher() {
+        let seen = Arc::new(AtomicUsize::new(0));
+        let dispatch = tracing::Dispatch::new(Counting(Arc::clone(&seen)));
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        run(|| tracing::info!("from the job")).await;
+        assert_eq!(seen.load(Ordering::Relaxed), 1);
     }
 }
