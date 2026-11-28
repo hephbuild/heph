@@ -2,6 +2,7 @@ pub mod approval;
 pub mod auth;
 pub mod auth_helper;
 pub mod bootstrap;
+pub mod cli_typo;
 pub mod completion;
 pub mod errors;
 pub mod gendocs;
