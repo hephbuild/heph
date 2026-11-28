@@ -7580,6 +7580,16 @@ impl Engine {
                     }));
                 }
             };
+            // Every provider's spec, not only a BUILD file's `target()`: a
+            // cdylib provider never runs that check, and a name is a directory
+            // of the cache (`__target_<name>`), where a `/` nests one target
+            // inside another and `x/../../../y` climbs out of `<home>/cache`.
+            if let Err(e) = hmodel::htaddr::check_name(&spec.addr.name) {
+                return Err(e.context(InProvider {
+                    provider: provider.name.clone(),
+                    what: format!("resolving target `{addr}`"),
+                }));
+            }
 
             return anyhow::Ok(Arc::new(EngineTargetSpec {
                 spec: Arc::new(spec),

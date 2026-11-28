@@ -631,9 +631,9 @@ fn validate_state_decl(provider: &str) -> anyhow::Result<()> {
 /// BUILD file wrote `target()` or a plugin function declared it — a declared
 /// target must not be able to carry what a hand-written one cannot.
 fn validate_target_decl(name: &str, labels: &[String]) -> anyhow::Result<()> {
-    if name.is_empty() {
-        anyhow::bail!("target name cannot be empty");
-    }
+    // Here, where the BUILD file is still in the error; the engine checks
+    // every provider's spec again (a cdylib provider does not come here).
+    hmodel::htaddr::check_name(name)?;
     // Reject a label outside the grammar here, where the BUILD file and
     // target name are still in the error, rather than letting it become a
     // tag no `label(...)` query can ever name.
@@ -1419,9 +1419,15 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
         for (key, value) in m.iter() {
             match key.as_str() {
                 "name" => {
-                    if let Some(s) = value.unpack_str() {
-                        name = s.to_string();
-                    }
+                    // A non-string name was dropped, and reported as an empty
+                    // one (EVAL-23).
+                    let Some(s) = value.unpack_str() else {
+                        return Err(starlark::Error::new_other(anyhow::anyhow!(
+                            "target() `name` must be a string, not {} `{value}`",
+                            value.get_type()
+                        )));
+                    };
+                    name = s.to_string();
                 }
                 "driver" => {
                     if let Some(s) = value.unpack_str() {

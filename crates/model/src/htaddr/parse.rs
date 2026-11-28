@@ -126,6 +126,33 @@ pub fn parse_addr_with_base(input: &str, base: &PkgBuf) -> anyhow::Result<Addr> 
     ))
 }
 
+/// The characters a target name may not contain: the address parser's
+/// separators (`@`, `:`, `|`, a space), and `/`, since a name is a directory
+/// component of the target's cache entry (`<home>/cache/<pkg>/__target_<name>`)
+/// and a `/` would nest it inside another target's, or `..` segments climb out.
+const NAME_FORBIDDEN: &str = "a name may not contain `@`, `:`, `|`, `/` or a space";
+
+/// Refuse a target name outside the grammar: empty, or holding one of
+/// [`NAME_FORBIDDEN`]'s characters. The message names the character and the
+/// rule. Every other name, unicode included, is valid.
+pub fn check_name(name: &str) -> anyhow::Result<()> {
+    if name.is_empty() {
+        anyhow::bail!("target name cannot be empty");
+    }
+    if let Some(c) = name
+        .chars()
+        .find(|c| matches!(c, '@' | ':' | '|' | '/' | ' '))
+    {
+        let what = if c == ' ' {
+            "a space".to_owned()
+        } else {
+            format!("`{c}`")
+        };
+        anyhow::bail!("target name `{name}` contains {what}; {NAME_FORBIDDEN}");
+    }
+    Ok(())
+}
+
 pub fn parse_addr(input: &str) -> anyhow::Result<Addr> {
     let (_, (p, n, kvs)) = all_consuming(addr_parser)
         .parse(input)
