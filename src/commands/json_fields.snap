@@ -20,11 +20,37 @@ auth status	state	string	free	default
 inspect deps	ref	string	free	default
 inspect failure	addr	string?	free	default
 inspect failure	failed_at	number?	free	default
+inspect failure	file	string?	free	default
 inspect failure	fixes	string?	free	default
 inspect failure	hashin	string?	free	default
+inspect failure	hints	[object]	free	default
+inspect failure	hints[].kind	"declare_tool"	free	default
+inspect failure	hints[].kind	"did_you_mean"	free	default
+inspect failure	hints[].kind	"other"	free	default
+inspect failure	hints[].kind	"see_log"	free	default
+inspect failure	hints[].kind	"valid_values"	free	default
+inspect failure	hints[].kind	string	free	default
+inspect failure	hints[].text	string	free	default
+inspect failure	location	object?	free	default
+inspect failure	location.col	number	free	default
+inspect failure	location.file	string	free	default
+inspect failure	location.line	number	free	default
 inspect failure	log	string?	free	default
+inspect failure	log_lines	number?	free	default
+inspect failure	log_replaced	bool	free	default
+inspect failure	message	string	free	default
 inspect failure	out	string?	free	default
 inspect failure	slot	string	free	default
+inspect failure	stage	"cache"	free	default
+inspect failure	stage	"cli"	free	default
+inspect failure	stage	"config"	free	default
+inspect failure	stage	"eval"	free	default
+inspect failure	stage	"link"	free	default
+inspect failure	stage	"parse"	free	default
+inspect failure	stage	"run"	free	default
+inspect failure	stage	"spec"	free	default
+inspect failure	stage	string	free	default
+inspect failure	truncated	bool	free	default
 inspect functions	name	string	free	default
 inspect functions	plugin	string	free	default
 inspect functions	signature	string	free	default
@@ -53,6 +79,7 @@ query	package	string	free	default
 run	addr	string?	free	default
 run	cache	"local"	free	default
 run	cache	"miss"	free	default
+run	cache	"none"	free	default
 run	cache	"remote"	free	default
 run	cache	string?	free	default
 run	duration_ms	number	free	default
@@ -64,6 +91,19 @@ run	failure.log	string?	free	default
 run	failure.out	string?	free	default
 run	file	string?	free	default
 run	hashin	string?	built	opt-in
+run	hints	[object]	free	default
+run	hints[].kind	"declare_tool"	free	default
+run	hints[].kind	"did_you_mean"	free	default
+run	hints[].kind	"other"	free	default
+run	hints[].kind	"see_log"	free	default
+run	hints[].kind	"valid_values"	free	default
+run	hints[].kind	string	free	default
+run	hints[].text	string	free	default
+run	location	object?	free	default
+run	location.col	number	free	default
+run	location.file	string	free	default
+run	location.line	number	free	default
+run	log_replaced	bool	free	default
 run	more	number?	free	default
 run	outcome	"cached"	free	default
 run	outcome	"cancelled"	free	default
@@ -73,11 +113,23 @@ run	outcome	"skipped"	free	default
 run	outcome	string	free	default
 run	outputs	[string]?	free	opt-in
 run	path	[string]?	free	default
+run	path_elided	number?	free	default
 run	remote	string?	free	default
 run	root	string?	free	default
 run	root_file	string?	free	default
 run	selected	bool	free	default
+run	stage	"cache"	free	default
+run	stage	"cli"	free	default
+run	stage	"config"	free	default
+run	stage	"eval"	free	default
+run	stage	"link"	free	default
+run	stage	"parse"	free	default
+run	stage	"run"	free	default
+run	stage	"spec"	free	default
+run	stage	string?	free	default
+run	streamed	bool	free	default
 run	timed_out	bool	free	default
+run	truncated	bool	free	default
 session inflight	id	string	free	default
 session inflight	report	string	free	default
 session list	argv	[string]	free	default

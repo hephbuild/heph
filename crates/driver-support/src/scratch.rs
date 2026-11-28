@@ -66,8 +66,8 @@ pub fn input(r#ref: hplugin::driver::TargetAddr, i: usize) -> hplugin::driver::t
 /// `package`, each built by [`input`].
 ///
 /// Order is the declared order. A repeated reference is refused: it would mount
-/// one directory twice and set one env var twice, which is a BUILD-file mistake
-/// worth naming rather than quietly collapsing.
+/// one directory twice and set one env var twice, which is a mistake in the
+/// target's definition worth naming rather than quietly collapsing.
 pub fn inputs(
     refs: &[String],
     package: &hmodel::htpkg::PkgBuf,

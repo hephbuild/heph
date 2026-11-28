@@ -8,6 +8,8 @@
     reason = "shared test harness; each test binary uses a different subset"
 )]
 
+pub mod failure_load;
+
 use anyhow::{Context as _, Result};
 use heph::engine::{Config, Engine};
 use heph::pluginbuildfile;
@@ -56,6 +58,28 @@ pub fn build_engine_with_remote(root: &std::path::Path, remote_uri: Option<&str>
     e.register_managed_driver(|_| Box::new(pluginexec::Driver::new_bash().with_host_path()))
         .expect("register bash driver");
     Arc::new(e)
+}
+
+/// A recorded failure as its record says it: the diagnostic's message, then
+/// each cause on its own line. A recorded `TargetFailure` holds no error
+/// chain (D7b), so this is what a test reads in place of `{:#}`.
+pub fn failure_text(f: &hplugin::error::TargetFailure) -> String {
+    let mut text = f.record.diagnostic.message.clone();
+    for cause in &f.record.causes {
+        text.push('\n');
+        text.push_str(cause);
+    }
+    text
+}
+
+/// A recorded failure's log tail as a renderer reads it: through its
+/// record's log reference.
+pub fn failure_tail(f: &hplugin::error::TargetFailure) -> Option<hcore::failure_log::LogTail> {
+    hcore::failure_log::read_tail(
+        f.record.log.as_ref()?,
+        hcore::failure_log::TAIL_LINES_CAP,
+        hcore::failure_log::TAIL_MAX_BYTES,
+    )
 }
 
 /// Whether a test that needs user xattrs must fail, not skip, on a

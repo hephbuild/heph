@@ -1398,8 +1398,14 @@ impl FailureWriteBackRan {
         }
     }
 
-    /// `root` is the workspace root the fixes were written under.
-    fn report(&self, addr: &Addr, root: &std::path::Path) -> WriteBackOnFailure {
+    /// `root` is the workspace root the fixes were written under; `scrub`
+    /// is what the `warn` of a failed write is scrubbed of (P21).
+    fn report(
+        &self,
+        addr: &Addr,
+        root: &std::path::Path,
+        scrub: &crate::engine::failure_record::Scrub,
+    ) -> WriteBackOnFailure {
         use hplugin::error::{FailureFixes, FixesNotWritten};
         match self {
             Self::Written(written) => {
@@ -1422,7 +1428,7 @@ impl FailureWriteBackRan {
                 error: Some(format!("{e:#}")),
             },
             Self::Failed(e) => {
-                tracing::warn!(addr = %addr, error = %format!("{e:#}"), "in_place write-back on failure");
+                log_write_back_failed(addr, e, scrub);
                 WriteBackOnFailure {
                     fixes: None,
                     error: Some(format!("in_place fixes not written: {e:#}")),
@@ -1430,6 +1436,21 @@ impl FailureWriteBackRan {
             }
         }
     }
+}
+
+/// A failed run's write-back failed: the scrubbed line at `warn`, the raw
+/// chain at `debug` only (P21).
+fn log_write_back_failed(
+    addr: &Addr,
+    e: &anyhow::Error,
+    scrub: &crate::engine::failure_record::Scrub,
+) {
+    tracing::warn!(
+        addr = %addr,
+        error = %crate::engine::failure_record::log_line(e, scrub),
+        "in_place write-back on failure"
+    );
+    tracing::debug!(addr = %addr, error = %format!("{e:#}"), "in_place write-back on failure (raw)");
 }
 
 /// An `@heph/fs` input's per-path hashouts in the form a dependent's `hashin`
@@ -1617,9 +1638,23 @@ pub type InteractiveInner = Box<
             // Live window sizes, for a build target's `--shell` (see
             // `RunRequest::winsize`). In-process only.
             Option<crate::engine::driver::WinSizeReceiver>,
-        ) -> futures::future::BoxFuture<'io, anyhow::Result<()>>
+        ) -> futures::future::BoxFuture<'io, anyhow::Result<RunEnd>>
         + Send,
 >;
+
+/// What an [`InteractiveInner`] tells the wrapper that ran it, once the run
+/// returned and before the wrapper hands the terminal back.
+///
+/// `exec_failure` is set when the run's process failed (an exit, a signal, a
+/// timeout; never a stop): the addr, the exit and the timeout as the
+/// failure's record will hold them, and nothing else. A wrapper whose run
+/// streamed prints its one line from it while it still holds the terminal
+/// (`✗ //t · exit status 1 · heph log //t`, D6.1c), and every renderer
+/// leaves that failure's box out ([`hcore::failure::FailureRecord::told_streamed`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunEnd {
+    pub exec_failure: Option<Box<hcore::failure::FailureRecord>>,
+}
 
 /// What an [`InteractiveWrapper`] reports about the run it wrapped.
 ///
@@ -2299,19 +2334,25 @@ fn record_culprit(
     entry: Addr,
 ) -> (anyhow::Error, bool) {
     // A culprit's failure — this target's own, an input whose def failed, a
-    // declarer naming a missing dep, a BUILD file that did not evaluate:
+    // declarer naming a missing dep, a source file that did not evaluate:
     // record the rich diagnostic once against the culprit (first-writer-wins)
     // and propagate a cheap marker naming it. This target, when it is not the
     // culprit, is skipped.
     // The log and its tail are always kept (D6.1): whether the output already
     // streamed to the user's terminal is recorded beside them, from what the
     // wrapper wrote, and each renderer decides what to show.
-    let log = failure_slot_log(&e);
-    let log_tail = log.as_ref().and_then(|l| l.tail().ok());
+    // The path alone: an in-memory tail (credential material) reaches
+    // renderers scrubbed, through the record's `LogRef` (E2).
+    let log = failure_slot_log(&e).map(|l| l.without_memory());
     let outputs = failure_slot_out(&e);
     let slot = downcast_chain_ref::<crate::engine::failure_slot::FailureSlot>(&e);
     let fixes = slot.and_then(|s| s.fixes.clone());
     let sandbox = slot.and_then(|s| s.sandbox.clone());
+    // The run's slot the claim's diagnostic joins, and whether it is
+    // credential material's, which gets none (a lead decision: see
+    // `write_claim_for`).
+    let slot_fill = slot.and_then(|s| s.fill_id.clone());
+    let material = slot.is_some_and(|s| s.material);
     let streamed = crate::engine::failure_slot::RunStreamed::on(&e);
     // Walked before the claim, never under the failures lock (`dep_dag`
     // stays a leaf). Skipped when another caller already holds the claim:
@@ -2324,20 +2365,49 @@ fn record_culprit(
     };
     // A culprit that is not this target has no scope of its own to announce
     // it (an input whose def failed, a declarer reached through a group or a
-    // transitive dep, a BUILD file): the claim's winner announces it, so
+    // transitive dep, a source file): the claim's winner announces it, so
     // every live view sees the failure once. This target's own failure is
     // announced by its caller (its scope's end, or `fail_unscoped`).
     let announce = (unclaimed && !matches!(&culprit, Culprit::Target(c) if c == addr)).then(|| {
         (
-            crate::engine::event::ErrorDetail::from_error(&e),
+            crate::engine::event::ErrorDetail::for_event(&e, &rs.data),
             path.clone(),
             entry.clone(),
         )
     });
+    // Compacted once, here, for the claim's winner only: the one choke point
+    // where a failure is scrubbed and bounded (D7b, I7).
+    let record = unclaimed.then(|| {
+        let scrub = match culprit.target() {
+            Some(c) => rs.scrub_for(&[addr, &entry, c]),
+            None => rs.scrub_for(&[addr, &entry]),
+        };
+        let mut record = crate::engine::failure_record::compact(&e, &culprit, &entry, &scrub);
+        record.path = path.iter().map(Addr::format).collect();
+        Arc::new(record)
+    });
+    let claim = record
+        .as_ref()
+        .filter(|r| !r.surface_top && !material)
+        .map(|r| crate::engine::failure_slot::ClaimWrite {
+            culprit: culprit.clone(),
+            record: Arc::clone(r),
+            fill_id: slot_fill,
+            // The package of the target that led into the file (the path
+            // ends there too, so it names no other).
+            packages: match &culprit {
+                Culprit::File(_) => vec![entry.package.as_str().to_owned()],
+                Culprit::Target(_) => Vec::new(),
+            },
+        });
+    let mut failure = TargetFailure::new(entry);
+    if let Some(record) = record {
+        failure = failure.with_record(record);
+    }
     let fresh = rs.record_failure(
         culprit.clone(),
         Arc::new(
-            TargetFailure::new(entry, log_tail, e)
+            failure
                 .with_path(path)
                 .with_file(match &culprit {
                     Culprit::File(file) => Some(Arc::clone(file)),
@@ -2347,13 +2417,45 @@ fn record_culprit(
                 .with_outputs(outputs)
                 .with_fixes(fixes)
                 .with_sandbox(sandbox)
-                .with_streamed(streamed),
+                .with_streamed(streamed)
+                .with_revision_changed(revision_changed(&e)),
         ),
     );
+    if fresh && let Some(claim) = claim {
+        write_claim_for(rs, claim);
+    }
     if fresh && let Some((detail, path, entry)) = announce {
         announce_culprit(rs, &culprit, &entry, detail, &path);
     }
     (UpstreamFailed { root: culprit }.into(), fresh)
+}
+
+/// The revision that changed under the request, when `e` is that failure:
+/// on its chain, or on a failure another request recorded and surfaced.
+fn revision_changed(e: &anyhow::Error) -> Option<RevisionChangedError> {
+    downcast_chain_ref::<RevisionChangedError>(e)
+        .cloned()
+        .or_else(|| {
+            downcast_chain_ref::<TargetFailure>(e).and_then(|tf| tf.revision_changed.clone())
+        })
+}
+
+/// A fresh claim's record into its culprit's failure slot, in the
+/// background, counted on `bg_pending` ([`failure_slot::write_claim`]).
+///
+/// Not for credential material: a run whose outputs are material keeps no
+/// log on disk, and its record keeps none either (a lead decision). A
+/// material target that fails before it runs has no slot on the chain to
+/// say so and still gets a slot holding only `diagnostic.json`, already
+/// scrubbed. Not for a record another request surfaced (`surface_top`):
+/// that request wrote it.
+///
+/// [`failure_slot::write_claim`]: crate::engine::failure_slot::write_claim
+fn write_claim_for(rs: &RequestState, claim: crate::engine::failure_slot::ClaimWrite) {
+    let Some(engine) = rs.data.engine.upgrade() else {
+        return;
+    };
+    crate::engine::failure_slot::write_claim(engine, rs.bg_pending(), claim);
 }
 
 /// [`FailureFate::Each`]: each culprit's members recorded against it, and a
@@ -2405,7 +2507,7 @@ fn classify_each(
 }
 
 /// The event that announces a culprit with no scope of its own, sent once by
-/// the claim's winner: a `FileFailed` for a BUILD file that did not evaluate
+/// the claim's winner: a `FileFailed` for a source file that did not evaluate
 /// (a path never goes in an address field), else a synthetic
 /// `ResultStart`/`ResultEnd` pair for the culprit target, or only the
 /// `ResultEnd` when the target's own scope already opened.
@@ -2418,12 +2520,20 @@ fn announce_culprit(
 ) {
     use crate::engine::event::BuildEventKind;
     let path = path.iter().map(Addr::format).collect();
+    // Announced by the claim's winner, after the claim: the record is there.
+    let record = rs
+        .get_culprit_failure(culprit)
+        .map(|f| Arc::clone(&f.record));
     match culprit {
         Culprit::File(file) => rs.emit(BuildEventKind::FileFailed {
             file: file.to_string(),
             entry: entry.format(),
-            error: detail.message,
+            error: record
+                .as_deref()
+                .and_then(record_message)
+                .unwrap_or(detail.message),
             path,
+            failure: record.map(|r| Box::new((*r).clone())),
         }),
         Culprit::Target(addr) => {
             // A culprit whose own scope already opened (its locked
@@ -2445,14 +2555,14 @@ fn announce_culprit(
                 rs,
                 addr,
                 Some(detail),
-                EndBlame::Culprit { path },
+                EndBlame::Culprit { path, record },
                 None,
             ));
         }
     }
 }
 
-/// A selection's walk failing on a BUILD file that did not evaluate (a
+/// A selection's walk failing on a source file that did not evaluate (a
 /// requested target's package probed during matcher resolution): recorded
 /// against the file (U2), through the same registry as every other culprit,
 /// so it is one failure however many requested targets the file holds, and
@@ -2467,8 +2577,9 @@ fn blame_walk_failure(rs: &RequestState, matcher: &Matcher, e: anyhow::Error) ->
     if is_stop(&e) {
         return e;
     }
-    // The package the walk was scanning: the broken file may be a `.bzl`
-    // it loads, or a parent package's BUILD, anywhere in the tree. The
+    // The package the walk was scanning: the broken file may be any file
+    // the provider read for it (e.g. one a BUILD file loads), anywhere in
+    // the tree. The
     // file's own directory only when the walk did not say (a confirm's
     // resolution, which names its target's package anyway).
     // A scanned package no named address is in was walked for a package
@@ -2526,6 +2637,13 @@ fn upstream_addr(rs: &RequestState, root: &Culprit) -> Option<String> {
     }
 }
 
+/// The `error` an event carries for a culprit whose record rides it: the
+/// record's message, compacted and scrubbed (I7). `None` when it is empty.
+fn record_message(r: &hcore::failure::FailureRecord) -> Option<String> {
+    let m = &r.diagnostic.message;
+    (!m.trim().is_empty()).then(|| m.clone())
+}
+
 /// `addr`'s `ResultEnd`, for its result scope and for a failure
 /// [`Engine::fail_unscoped`] reports outside one: one builder, so the two
 /// cannot disagree on what a consumer learns. `upstream_of` is
@@ -2544,16 +2662,34 @@ fn result_end_event(
         Some(mut d) => {
             d.upstream_of = None;
             let duplicate = matches!(blame, EndBlame::Duplicate { .. });
-            let (upstream_file, path) = match blame {
-                EndBlame::Unknown => (None, Vec::new()),
-                EndBlame::Duplicate { file } => (file, Vec::new()),
+            let (upstream_file, path, record) = match blame {
+                EndBlame::Unknown => (None, Vec::new(), None),
+                EndBlame::Duplicate { file } => (file, Vec::new(), None),
                 EndBlame::Skipped { of, file } => {
                     d.upstream_of = Some(of);
-                    (file, Vec::new())
+                    (file, Vec::new(), None)
                 }
-                EndBlame::Culprit { path } => (None, path),
+                EndBlame::Culprit { path, record } => (None, path, record),
             };
             let cancelled = rs.end_is_cancelled(&addr, &d);
+            // The record is the culprit's box: a stop is no failure to box.
+            // It answers whether the log is readable as the end does, as
+            // `take_failures_with_logs_where` makes the exit's record answer:
+            // the box reads only the record (`log: none kept`).
+            let failure = record.filter(|_| !cancelled).map(|r| {
+                let mut r = (*r).clone();
+                if log_readable.is_some() {
+                    r.left_behind.get_or_insert_default().log_readable = log_readable;
+                }
+                Box::new(r)
+            });
+            // A culprit's `error` is its record's message, the one its box
+            // leads with, compacted and scrubbed once (I7); any other end's
+            // was scrubbed when its detail was built (`for_event`).
+            let message = match failure.as_deref().map(record_message) {
+                Some(Some(m)) => m,
+                _ => d.message,
+            };
             // The final report's `took down:` row reads the same
             // `upstream_of` the event carries.
             if let Some(root) = &d.upstream_of
@@ -2563,21 +2699,21 @@ fn result_end_event(
             }
             crate::engine::event::BuildEventKind::ResultEnd {
                 addr,
-                error: Some(d.message),
+                error: Some(message),
                 upstream_of: d.upstream_of,
                 upstream_file,
                 path,
                 exit_status: d.exit_status,
                 exit_code: d.exit_code,
-                log_tail: crate::engine::event::ErrorDetail::result_log_tail(
-                    d.log_tail,
-                    d.log.as_ref(),
-                    d.streamed,
-                ),
+                // Never the text (P13): the record names the log
+                // (`failure.log`), and a reader streams it from the slot.
+                // Kept on the wire, `None`, for an older reader.
+                log_tail: None,
                 timed_out: d.timed_out,
                 cancelled,
                 duplicate: duplicate && !cancelled,
                 left_behind: left_behind(d.left_behind, log_readable),
+                failure,
             }
         }
         None => crate::engine::event::BuildEventKind::ResultEnd {
@@ -2593,6 +2729,7 @@ fn result_end_event(
             log_tail: None,
             timed_out: None,
             left_behind: None,
+            failure: None,
         },
     }
 }
@@ -2606,21 +2743,39 @@ enum EndBlame {
     #[default]
     Unknown,
     /// Skipped because `of` failed: the culprit target, or the address that
-    /// led into `file`, a BUILD file that did not evaluate.
+    /// led into `file`, a source file that did not evaluate.
     Skipped { of: String, file: Option<String> },
     /// This end is the culprit's: the shortest path from a requested target,
-    /// inclusive.
-    Culprit { path: Vec<String> },
+    /// inclusive, and its record once the claim is decided
+    /// ([`with_record`](Self::with_record)): what the end carries as
+    /// `failure`.
+    Culprit {
+        path: Vec<String>,
+        record: Option<Arc<hplugin::error::FailureRecord>>,
+    },
     /// A culprit's own end that lost the claim (another end, a synthetic
     /// pair or a `FileFailed` announced the culprit first): it closes the
     /// row, flagged so no consumer boxes or counts it (D1.d). `file` is set
-    /// when the culprit is a BUILD file `addr` itself lives in: the end
+    /// when the culprit is a source file `addr` itself lives in: the end
     /// names it in `upstream_file`, so a consumer can tell the target was
     /// skipped because of its own file.
     Duplicate { file: Option<String> },
 }
 
 impl EndBlame {
+    /// A culprit end with `addr`'s recorded failure attached, read once the
+    /// claim is decided (after `classify_failure_fresh`): the record the
+    /// end's `failure` carries. Every other end is returned unchanged.
+    fn with_record(self, rs: &RequestState, addr: &Addr) -> Self {
+        match self {
+            Self::Culprit { path, record: None } => Self::Culprit {
+                path,
+                record: rs.get_failure(addr).map(|f| Arc::clone(&f.record)),
+            },
+            other => other,
+        }
+    }
+
     /// The end `fate` gives `addr`. Walks the request's `DepDag` for a
     /// culprit's path: never call it holding the failures lock.
     fn of(rs: &RequestState, addr: &Addr, fate: &FailureFate<'_>) -> Self {
@@ -2654,6 +2809,7 @@ impl EndBlame {
             },
             FailureFate::Blame { .. } | FailureFate::Each { .. } => Self::Culprit {
                 path: rs.culprit_path_strings(addr),
+                record: None,
             },
             FailureFate::Propagate | FailureFate::Cancelled | FailureFate::Shell(_) => {
                 Self::Unknown
@@ -2732,7 +2888,7 @@ fn is_stop(e: &anyhow::Error) -> bool {
 ///   raised the error — or, when a [`FileEvalFailed`] is on the chain, that
 ///   file, entered through it;
 /// - else the error is `addr`'s own (or its file's, for a requested target
-///   in a BUILD file that did not evaluate).
+///   in a source file that did not evaluate).
 ///
 /// Only the spec and def boundaries name whose error it is: `link`, `meta`,
 /// `execute` and `run` frames are added by the target doing the work, over
@@ -2777,6 +2933,7 @@ fn failure_fate<'a>(addr: &Addr, e: &'a anyhow::Error) -> FailureFate<'a> {
     // of the cycle, not a single target's own work failing. Propagate unchanged
     // so the cycle surfaces directly to the caller (and never gets masked behind
     // an `UpstreamFailed` marker or duplicated into the failure registry).
+    // The requested target it reaches records it once ([`top_cycle`]).
     // Looked for through the walker, so a cycle that rides one member of an
     // aggregate (keep-going, beside another failing input) is found too:
     // regrouping that aggregate into culprits would record the cycle as a
@@ -2915,6 +3072,23 @@ fn failure_slot_out(e: &anyhow::Error) -> Option<std::path::PathBuf> {
 /// root cause rather than "dependency failed". The CLI renders from the registry
 /// instead, so this is purely about the value returned to direct callers. No-op
 /// for inner frames and for non-marker errors (cancellation, cycles, …).
+/// A dependency cycle reaching a requested target's own frame (D8,
+/// GRAPH-07). [`failure_fate`] propagates a cycle through every frame of it
+/// unrecorded, so it is reported once: here, at the top, where the request
+/// meets it. A stop is a stop, whatever else the chain holds.
+fn top_cycle(is_top: bool, e: &anyhow::Error) -> bool {
+    is_top
+        && downcast_chain_ref::<CycleError>(e).is_some()
+        && downcast_chain_ref::<CancelledError>(e).is_none()
+}
+
+/// Record a [`top_cycle`] as the requested target's own failure: the one
+/// root of the cycle the request reports, counted and boxed like any other.
+/// The caller announces it (the scope's end, or `fail_unscoped`'s pair).
+fn record_cycle(rs: &RequestState, addr: &Addr, e: anyhow::Error) -> (anyhow::Error, bool) {
+    record_culprit(rs, addr, e, Culprit::Target(addr.clone()), addr.clone())
+}
+
 fn surface_top(is_top: bool, rs: &RequestState, e: anyhow::Error) -> anyhow::Error {
     // A cycle in an aggregate is propagated as itself (see `failure_fate`),
     // so it is not a marker to swap for a recorded failure either.
@@ -2970,7 +3144,7 @@ impl Engine {
     /// a failure another caller recorded first was announced by that caller.
     ///
     /// A requested target (`is_top`) skipped because of another culprit (a
-    /// dependency's broken BUILD file, a group member's failure) gets the
+    /// dependency's broken source file, a group member's failure) gets the
     /// pair too, with the skipped end its scope would have had: every
     /// requested target ends (D5). Only the top frame announces it, so a
     /// dependency reached by many callers is not announced once per caller.
@@ -2982,17 +3156,22 @@ impl Engine {
         is_top: bool,
     ) -> anyhow::Error {
         // Announced here when it is this target's own failure. Any other
-        // culprit (an input whose def failed, a BUILD file that did not
+        // culprit (an input whose def failed, a source file that did not
         // evaluate) is announced by `classify_failure_fresh`'s winner.
         let fate = failure_fate(addr, &e);
-        let own = fate.is_own(addr);
+        let cycle = top_cycle(is_top, &e);
+        let own = fate.is_own(addr) || cycle;
         let skipped = match (is_top && !own).then(|| EndBlame::of(rs, addr, &fate)) {
             Some(end @ EndBlame::Skipped { .. }) => Some(end),
             _ => None,
         };
-        let detail =
-            (own || skipped.is_some()).then(|| crate::engine::event::ErrorDetail::from_error(&e));
-        let (e, fresh) = classify_failure_fresh(rs, addr, e);
+        let detail = (own || skipped.is_some())
+            .then(|| crate::engine::event::ErrorDetail::for_event(&e, &rs.data));
+        let (e, fresh) = if cycle {
+            record_cycle(rs, addr, e)
+        } else {
+            classify_failure_fresh(rs, addr, e)
+        };
         if let Some(end) = skipped
             && let Some(detail) = detail
         {
@@ -3015,7 +3194,7 @@ impl Engine {
                 rs,
                 addr_str,
                 Some(detail),
-                EndBlame::Culprit { path },
+                EndBlame::Culprit { path, record: None }.with_record(rs, addr),
                 Some(readable),
             ));
         }
@@ -3268,6 +3447,11 @@ impl Engine {
                     surface_top(is_top, &rs, classify_failure(&rs, addr, e))
                 })
             }
+            // The scope's end already announced it (an own failure's end:
+            // no root named, not a stop); the record makes it the run's.
+            Err(e) if top_cycle(is_top, &e) => {
+                Err(surface_top(is_top, &rs, record_cycle(&rs, addr, e).0))
+            }
             Err(e) => Err(surface_top(is_top, &rs, e)),
         }
     }
@@ -3351,7 +3535,7 @@ impl Engine {
                     // Fail-fast: tell everything to stop, then wait for it.
                     // Failures landing after we signalled don't override it.
                     *fatal = Some(e);
-                    rs.ctoken().cancel();
+                    rs.stop_for_fail_fast();
                 }
             }
         }
@@ -3582,7 +3766,7 @@ impl Engine {
                 Ok(addr) => addr,
                 // The matcher walk itself failed. Stop enqueuing, signal the
                 // already-spawned targets, and fall through to the drain. A
-                // broken BUILD file is the file's failure, recorded as one.
+                // broken source file is the file's failure, recorded as one.
                 Err(e) => {
                     fatal = Some(blame_walk_failure(&rs, matcher, e));
                     rs.ctoken().cancel();
@@ -3709,7 +3893,7 @@ impl Engine {
         }
 
         // Keep-going's counterpart of the failed walk's blame: a named package
-        // whose BUILD file did not evaluate is the file's failure, not a gap.
+        // whose source file did not evaluate is the file's failure, not a gap.
         if walk_finished
             && fatal.is_none()
             && let Some(gaps) = opts.discovery.gaps()
@@ -3759,7 +3943,7 @@ impl Engine {
     /// Keep-going's counterpart of [`blame_walk_failure`] (U2, D5).
     ///
     /// A selection that names its targets by address only (`//d:t1
-    /// //d:t2`), whose walk could not probe a named package because a BUILD
+    /// //d:t2`), whose walk could not probe a named package because a source
     /// file did not evaluate, recorded that package as a gap, and nothing in
     /// it ran. Every named address there is the file's. The file is recorded
     /// once, entered through the first of them, and announced as
@@ -3817,9 +4001,10 @@ impl Engine {
             rs.emit(BuildEventKind::ResultStart {
                 addr: addr_str.clone(),
             });
-            let detail = ErrorDetail::from_error(&e);
+            let detail = ErrorDetail::for_event(&e, &rs.data);
             let end = EndBlame::of(rs, &addr, &failure_fate(&addr, &e));
             let (marker, _) = classify_failure_fresh(rs, &addr, e);
+            let end = end.with_record(rs, &addr);
             rs.emit(result_end_event(rs, addr_str, Some(detail), end, None));
             gaps.withdraw(
                 crate::engine::discovery::Stage::Probe,
@@ -3911,7 +4096,7 @@ impl Engine {
                 *blame.lock() = if own && !fresh {
                     EndBlame::Duplicate { file: None }
                 } else {
-                    end
+                    end.with_record(&fate_rs, addr)
                 };
                 let more = (own && fresh).then_some(async move {
                     // Set once: this scope ends once.
@@ -5600,7 +5785,7 @@ impl Engine {
             .await;
         if let Err(e) = entered {
             let e = unwrap_arc_err(e);
-            tracing::warn!(addr = %def.target.addr, error = %format!("{e:#}"), "in_place write-back on failure");
+            log_write_back_failed(&def.target.addr, &e, &rs.scrub_for(&[&def.target.addr]));
             return WriteBackOnFailure {
                 fixes: None,
                 error: Some(format!("in_place fixes not written: {e:#}")),
@@ -5609,7 +5794,11 @@ impl Engine {
         match ran.get() {
             // A passing frame of this addr already wrote the tree this request.
             None => WriteBackOnFailure::default(),
-            Some(ran) => ran.report(&def.target.addr, self.root()),
+            Some(ran) => ran.report(
+                &def.target.addr,
+                self.root(),
+                &rs.scrub_for(&[&def.target.addr]),
+            ),
         }
     }
 
@@ -6066,7 +6255,8 @@ impl Engine {
                                 .is_some_and(|d| d.managed);
                             let slot = crate::engine::failure_slot::FailureSlot::default()
                                 .with_sandbox(managed.then_some(fate))
-                                .with_streamed(streamed);
+                                .with_streamed(streamed)
+                                .after_run();
                             return Err(err.context(slot));
                         }
                     };
@@ -7085,6 +7275,22 @@ impl Engine {
         }
 
         Ok(sb)
+    }
+
+    /// For `heph query <addr>` (D5): resolve `addr`'s spec and, when it fails
+    /// because a source file the provider read for it did not evaluate, record
+    /// that file as the request's culprit, as `run` does (its box, exit 1),
+    /// and return true. Any other outcome records nothing and returns false:
+    /// the walk reports it as it always did.
+    pub async fn record_file_culprit(self: Arc<Self>, rs: Arc<RequestState>, addr: &Addr) -> bool {
+        let Err(e) = Arc::clone(&self).get_spec(rs.clone(), addr).await else {
+            return false;
+        };
+        if !matches!(blame(addr, &e).0, Culprit::File(_)) {
+            return false;
+        }
+        drop(surface_top(true, &rs, classify_failure(&rs, addr, e)));
+        true
     }
 
     /// Public, tracked. Records `parent → addr` in `dep_dag` and updates `parent`
@@ -12000,9 +12206,10 @@ mod tests {
             downcast_chain_ref::<UpstreamFailed>(&err).is_none(),
             "top-level error must be surfaced as the rich cause, not the marker: {err:#}"
         );
-        downcast_chain_ref::<TargetFailure>(&err)
+        let surfaced = downcast_chain_ref::<TargetFailure>(&err)
             .expect("expected a surfaced TargetFailure at the boundary");
-        let rendered = format!("{err:#}");
+        // The aggregate's members are the record's causes (D7b).
+        let rendered = format!("{err:#}\n{}", surfaced.record.causes.join("\n"));
         assert!(
             rendered.contains("missing:a") && rendered.contains("missing:b"),
             "the surfaced failure must list every broken input, got: {rendered}"
@@ -12026,7 +12233,7 @@ mod tests {
         // (The lib harness can't spawn subprocesses, so base fails at exec spawn;
         // the dedup contract is what this exercises — see the e2e suite for real
         // process failures.)
-        use crate::engine::error::{TargetFailure, UpstreamFailed};
+        use crate::engine::error::TargetFailure;
 
         let engine = engine_with(vec![
             run_target("//d:base", &[], "exit 1"),
@@ -12056,9 +12263,10 @@ mod tests {
         );
         assert_eq!(failures[0].addr.format(), "//d:base");
         // base is recorded as its OWN failure (a genuine cause, not a marker).
+        let message = &failures[0].record.diagnostic.message;
         assert!(
-            downcast_chain_ref::<UpstreamFailed>(&failures[0].source).is_none(),
-            "root cause must be a genuine failure, not an UpstreamFailed marker"
+            !message.contains("dependency failed"),
+            "root cause must be a genuine failure, not an UpstreamFailed marker: {message}"
         );
         // The boundary surfaces a rich diagnostic to the direct caller.
         assert!(downcast_chain_ref::<TargetFailure>(&err).is_some());
@@ -12285,7 +12493,7 @@ mod tests {
         // …and the rich record carries the last 1000 lines read from the log
         // file, tagged with the real starting line number.
         let recorded = rs.get_failure(&addr).expect("failure must be recorded");
-        let tail = recorded.log_tail.as_ref().expect("log tail");
+        let tail = recorded_tail(&recorded).expect("log tail");
         let want: Vec<String> = (13..=1012).map(|i| format!("line{i}")).collect();
         assert_eq!(tail.text, want.join("\n"));
         assert_eq!(tail.start_line, 13);
@@ -12320,6 +12528,7 @@ mod tests {
                 material: false,
                 fixes: None,
                 keep_log: true,
+                scrub: Default::default(),
             })
             .await
             .with_streamed(true);
@@ -12341,9 +12550,7 @@ mod tests {
         else {
             panic!("not a ResultEnd: {end:?}");
         };
-        let log_tail = log_tail.expect("ResultEnd keeps the tail");
-        assert_eq!(log_tail.text, "line9\nline10");
-        assert!(log_tail.streamed, "ResultEnd says it streamed");
+        assert!(log_tail.is_none(), "ResultEnd never carries the text (P13)");
         assert!(
             left_behind.and_then(|l| l.log_path).is_some(),
             "and keeps the log's path"
@@ -12351,7 +12558,7 @@ mod tests {
 
         let _ = classify_failure(&rs, &addr, e);
         let recorded = rs.get_failure(&addr).expect("failure must be recorded");
-        let tail = recorded.log_tail.as_ref().expect("the tail is kept");
+        let tail = recorded_tail(&recorded).expect("the tail is kept");
         assert_eq!(tail.text, "line9\nline10");
         assert_eq!(tail.start_line, 1);
         assert!(recorded.streamed, "the recorded failure says it streamed");
@@ -12360,6 +12567,16 @@ mod tests {
             "the path is kept"
         );
         Ok(())
+    }
+
+    /// A recorded failure's log tail as a renderer reads it: through its
+    /// record's reference (the in-memory tail, else the slot's file).
+    fn recorded_tail(f: &TargetFailure) -> Option<hcore::failure_log::LogTail> {
+        hcore::failure_log::read_tail(
+            f.record.log.as_ref()?,
+            hcore::failure_log::TAIL_LINES_CAP,
+            hcore::failure_log::TAIL_MAX_BYTES,
+        )
     }
 
     /// A `ProcessFailed` with the run log at `path` attached, as a driver
@@ -12391,6 +12608,7 @@ mod tests {
                 material: false,
                 fixes: None,
                 keep_log: true,
+                scrub: Default::default(),
             })
             .await;
         e.context(slot)
@@ -12421,8 +12639,8 @@ mod tests {
         let _ = classify_failure(&rs, &addr, e);
         let recorded = rs.get_failure(&addr).expect("recorded");
         assert_eq!(
-            recorded.log_tail.as_ref().map(|t| t.text.as_str()),
-            Some("what the run wrote")
+            recorded_tail(&recorded).map(|t| t.text),
+            Some("what the run wrote".to_owned())
         );
         let path = recorded
             .log
@@ -12434,7 +12652,117 @@ mod tests {
         let rs = engine.new_state();
         let _ = classify_failure(&rs, &addr, process_failed_with_log(&log_path));
         let recorded = rs.get_failure(&addr).expect("recorded");
-        assert!(recorded.log_tail.is_none() && recorded.log.is_none());
+        assert!(recorded_tail(&recorded).is_none() && recorded.log.is_none());
+        Ok(())
+    }
+
+    /// A fresh claim's `diagnostic.json` lands in the background, counted on
+    /// the request's `bg_pending` from the moment the claim is won: the
+    /// process, which waits for that count, never exits before it lands.
+    /// It joins the slot the run filled, under that fill's id, and the
+    /// record names the log by the same id.
+    #[tokio::test]
+    async fn process_waits_for_the_write() -> anyhow::Result<()> {
+        let engine = engine_with(vec![static_target("//pkg:a", &[], &[])])?;
+        let rs = engine.new_state();
+        let addr = hmodel::htaddr::parse_addr("//pkg:a")?;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log_path = dir.path().join("log.txt");
+        std::fs::write(&log_path, "one\ntwo\n")?;
+        let e = slotted(
+            &engine,
+            &rs,
+            &addr,
+            dir.path(),
+            process_failed_with_log(&log_path),
+        )
+        .await;
+        let slot = engine.failure_slots.slot_dir(&addr);
+        let _ = classify_failure(&rs, &addr, e);
+        // Nothing has yielded since the claim: the write is registered, not
+        // done.
+        assert!(rs.bg_pending().load(Ordering::Acquire) > 0);
+        assert!(!slot.join(hcore::failure_log::DIAGNOSTIC).exists());
+
+        rs.bg_pending().wait_drained().await;
+        let diag = hcore::failure_log::read_diagnostic(&slot).expect("diagnostic.json");
+        assert_eq!(diag.diagnostic.addr.as_deref(), Some("//pkg:a"));
+        assert!(diag.log.is_none(), "the log is the slot's own file");
+        let recorded = rs.get_failure(&addr).expect("recorded");
+        let log = recorded.record.log.as_ref().expect("log ref");
+        let manifest = engine.failure_slots.read(&addr).expect("slot");
+        assert_eq!(log.fill_id, manifest.fill_id);
+        assert_eq!(log.lines, 2);
+        assert_eq!(engine.failure_slots.fills(), 1, "a diagnostic is no fill");
+        Ok(())
+    }
+
+    /// A failure before the run (no slot on the chain) gets a slot of its
+    /// own, and a clear of it that comes right after the claim waits for the
+    /// write and then removes it: the write never lands after the clear.
+    #[tokio::test]
+    async fn clear_waits_for_a_pending_write() -> anyhow::Result<()> {
+        let engine = engine_with(vec![static_target("//pkg:a", &[], &[])])?;
+        let addr = hmodel::htaddr::parse_addr("//pkg:a")?;
+        let slot = engine.failure_slots.slot_dir(&addr);
+
+        // The control: left alone, the write builds the slot.
+        let rs = engine.new_state();
+        let _ = classify_failure(&rs, &addr, anyhow::anyhow!("def failed"));
+        engine.failure_slots.writes_drained().await;
+        let manifest = engine.failure_slots.read(&addr).expect("a pre-run slot");
+        assert_eq!(manifest.hashin, None);
+        assert!(!slot.join(hcore::failure_log::LOG).exists());
+        let diag = hcore::failure_log::read_diagnostic(&slot).expect("diagnostic.json");
+        assert!(diag.diagnostic.message.contains("def failed"), "{diag:?}");
+        engine.failure_slots.clear(&addr).await;
+        assert!(!slot.exists());
+
+        // An engine that has listed `failures/` (empty) and has not seen the
+        // write land: the clear must still wait for it.
+        let rs = engine.new_state();
+        let _ = classify_failure(&rs, &addr, anyhow::anyhow!("def failed again"));
+        engine.failure_slots.clear(&addr).await;
+        engine.failure_slots.writes_drained().await;
+        assert!(!slot.exists(), "the write landed after the clear");
+        Ok(())
+    }
+
+    /// A fill of the slot that comes right after a claim's write waits for
+    /// it: the slot left is the fill's, never the write's over it.
+    #[tokio::test]
+    async fn fill_waits_for_a_pending_write() -> anyhow::Result<()> {
+        let engine = engine_with(vec![static_target("//pkg:a", &[], &[])])?;
+        let addr = hmodel::htaddr::parse_addr("//pkg:a")?;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log_path = dir.path().join("log.txt");
+        std::fs::write(&log_path, "the run\n")?;
+
+        let rs = engine.new_state();
+        let _ = classify_failure(&rs, &addr, anyhow::anyhow!("def failed"));
+        let e = slotted(
+            &engine,
+            &engine.new_state(),
+            &addr,
+            dir.path(),
+            process_failed_with_log(&log_path),
+        )
+        .await;
+        engine.failure_slots.writes_drained().await;
+        let fill = downcast_chain_ref::<crate::engine::failure_slot::FailureSlot>(&e)
+            .and_then(|s| s.fill_id.clone())
+            .expect("the fill's id");
+        let slot = engine.failure_slots.slot_dir(&addr);
+        let manifest = engine.failure_slots.read(&addr).expect("slot");
+        assert_eq!(manifest.fill_id.as_deref(), Some(fill.as_str()));
+        assert_eq!(
+            std::fs::read_to_string(slot.join(hcore::failure_log::LOG))?,
+            "the run\n"
+        );
+        assert!(
+            hcore::failure_log::read_diagnostic(&slot).is_none(),
+            "the write's diagnostic is not the fill's"
+        );
         Ok(())
     }
 
@@ -12509,7 +12837,7 @@ mod tests {
 
         let _ = classify_failure(&rs, &addr, e);
         let recorded = rs.get_failure(&addr).expect("failure must be recorded");
-        let tail = recorded.log_tail.as_ref().expect("the remote log's tail");
+        let tail = recorded_tail(&recorded).expect("the remote log's tail");
         assert_eq!(
             tail.text, "#1 building\n\u{fffd}\nERROR: failed to solve",
             "the stray byte is replaced, the tail kept"
@@ -12575,10 +12903,7 @@ mod tests {
 
         let _ = classify_failure(&rs, &addr, e);
         let recorded = rs.get_failure(&addr).expect("failure must be recorded");
-        let tail = recorded
-            .log_tail
-            .as_ref()
-            .expect("the tail, through the wrappers");
+        let tail = recorded_tail(&recorded).expect("the tail, through the wrappers");
         assert_eq!(tail.text, "the tool said why");
         Ok(())
     }
@@ -12809,6 +13134,51 @@ mod tests {
             "expected exactly one RequestConfig event, got {events:?}"
         );
         assert!(max_workers[0] >= 1, "worker count must be positive");
+        Ok(())
+    }
+
+    /// STAGE-18: `announce_request`, called as a request starts, sends its
+    /// `RequestConfig` before anything resolves: the entrypoint lookup `run`
+    /// makes first (a spec and a def, as slow as the provider) sends no
+    /// event of its own, so this is what a client's clock counts from. The
+    /// `result` call's own announcement is then a no-op.
+    #[tokio::test]
+    async fn announce_request_comes_before_resolution() -> anyhow::Result<()> {
+        let (engine, _home) = engine_with_home(vec![static_target_run("//pkg:a", "true")])?;
+        let addr = hmodel::htaddr::parse_addr("//pkg:a")?;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let rs = engine.new_state_with_events(true, Some(tx));
+
+        engine.announce_request(&rs, false);
+        let first = rx.try_recv().expect("an event before any lookup");
+        assert!(
+            matches!(first.kind, BuildEventKind::RequestConfig { .. }),
+            "{first:?}"
+        );
+        assert!(!engine.is_entrypoint(&rs, &addr).await?);
+        Arc::clone(&engine)
+            .result_addr(
+                rs.clone(),
+                &addr,
+                OutputMatcher::All,
+                &ResultOptions::default(),
+            )
+            .await?;
+        drop(rs);
+        let mut rest = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            rest.push(ev);
+        }
+        assert!(
+            !rest
+                .iter()
+                .any(|e| matches!(e.kind, BuildEventKind::RequestConfig { .. })),
+            "announced once: {rest:?}"
+        );
+        assert!(
+            rest.iter().all(|e| e.at_unix_ms >= first.at_unix_ms),
+            "{rest:?}"
+        );
         Ok(())
     }
 
@@ -14364,6 +14734,14 @@ mod tests {
     /// returned string. A `#[tokio::test]` runtime is current-thread, so every
     /// engine task is polled, and logs, on this thread.
     async fn capture_info_logs<F: std::future::Future>(fut: F) -> (F::Output, String) {
+        capture_logs(tracing_subscriber::filter::LevelFilter::INFO, fut).await
+    }
+
+    /// [`capture_info_logs`], at `level`.
+    async fn capture_logs<F: std::future::Future>(
+        level: tracing_subscriber::filter::LevelFilter,
+        fut: F,
+    ) -> (F::Output, String) {
         use tracing_subscriber::util::SubscriberInitExt as _;
 
         #[derive(Clone, Default)]
@@ -14391,7 +14769,7 @@ mod tests {
             let _guard = tracing_subscriber::fmt()
                 .with_writer(move || writer.clone())
                 .with_ansi(false)
-                .with_max_level(tracing_subscriber::filter::LevelFilter::INFO)
+                .with_max_level(level)
                 .set_default();
             fut.await
         };
@@ -17119,15 +17497,15 @@ mod tests {
             .err()
             .expect("frozen check on a dirty tree must error");
         drop(rs);
-        // The top-level frame surfaces the recorded `TargetFailure` whose `source`
-        // anyhow chain carries the original `FrozenCheckError`.
+        // The top-level frame surfaces the recorded `TargetFailure` whose
+        // record carries the original `FrozenCheckError`'s diff.
         let tf = err
             .downcast_ref::<TargetFailure>()
             .expect("top-level error must be a recorded TargetFailure");
         assert!(
-            downcast_chain_ref::<crate::engine::error::FrozenCheckError>(tf.source.as_ref())
-                .is_some(),
-            "frozen failure must carry a FrozenCheckError, got: {err:#}"
+            tf.record.frozen_diff.is_some(),
+            "frozen failure must carry a FrozenCheckError, got: {:?}",
+            tf.record
         );
         assert_eq!(
             std::fs::read(&tree_file)?,
@@ -17184,9 +17562,9 @@ mod tests {
             .downcast_ref::<TargetFailure>()
             .expect("top-level error must be a recorded TargetFailure");
         assert!(
-            downcast_chain_ref::<crate::engine::error::FrozenCheckError>(tf.source.as_ref())
-                .is_some(),
-            "frozen failure must carry a FrozenCheckError, got: {err:#}"
+            tf.record.frozen_diff.is_some(),
+            "frozen failure must carry a FrozenCheckError, got: {:?}",
+            tf.record
         );
         // Frozen never writes: the tree file stays non-executable.
         let mode = std::fs::metadata(&script)?.permissions().mode();
@@ -17347,7 +17725,7 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 let res = inner(None, None, None, None).await;
                 probe.live.fetch_sub(1, Ordering::SeqCst);
-                res.map(|()| TerminalUse::default())
+                res.map(|_| TerminalUse::default())
             })
         })
     }
@@ -17361,7 +17739,22 @@ mod tests {
         runs: SArc<AtomicUsize>,
         shell_runs: SArc<AtomicUsize>,
         log_path: std::path::PathBuf,
+        /// Set once a `wait` leaf's run has started: what a `fail_late`
+        /// leaf waits for, so the stop lands on a run in progress.
+        waiting: SArc<std::sync::atomic::AtomicBool>,
+        /// Set when a `wait` leaf's run gave up on its stop (see
+        /// [`TerminalDriver::wait_for_stop`]).
+        never_stopped: SArc<std::sync::atomic::AtomicBool>,
     }
+
+    /// Label on a leaf whose `run` holds its thread until it is told to stop,
+    /// then reports the stop as a failure of its own (as exec reports the
+    /// signal it was killed by, and as its `block_in_place` output park on
+    /// macOS holds the thread): a run fail-fast stops.
+    const WAIT_LABEL: &str = "terminal-test:wait";
+    /// Label on a leaf that fails as `fail` does, once a `wait` leaf's run
+    /// has started.
+    const FAIL_LATE_LABEL: &str = "terminal-test:fail_late";
 
     /// Label the driver stamps on a leaf whose `run` must fail; `TargetSpec`
     /// config is not visible from `run`, so the marker rides on the `TargetDef`.
@@ -17427,6 +17820,8 @@ mod tests {
                 (flag("fail"), FAIL_LABEL),
                 (flag("dup"), DUP_LABEL),
                 (flag("badout"), BADOUT_LABEL),
+                (flag("wait"), WAIT_LABEL),
+                (flag("fail_late"), FAIL_LATE_LABEL),
             ]
             .into_iter()
             .filter(|&(on, _)| on)
@@ -17480,10 +17875,19 @@ mod tests {
         async fn run<'a, 'io>(
             &self,
             req: RunRequest<'a, 'io>,
-            _ctoken: &(dyn Cancellable + Send + Sync),
+            ctoken: &(dyn Cancellable + Send + Sync),
         ) -> anyhow::Result<RunResponse> {
             self.runs.fetch_add(1, Ordering::SeqCst);
-            if req.target.labels.iter().any(|l| l == FAIL_LABEL) {
+            let labelled = |label: &str| req.target.labels.iter().any(|l| l == label);
+            if labelled(WAIT_LABEL) {
+                return Err(self.wait_for_stop(ctoken));
+            }
+            if labelled(FAIL_LATE_LABEL) {
+                while !self.waiting.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }
+            if labelled(FAIL_LABEL) || labelled(FAIL_LATE_LABEL) {
                 // In the sandbox, where the engine reads a log from.
                 std::fs::create_dir_all(&req.sandbox_dir)?;
                 let log = req.sandbox_dir.join("log.txt");
@@ -17530,11 +17934,43 @@ mod tests {
         }
         async fn run_shell<'a, 'io>(
             &self,
-            _req: RunRequest<'a, 'io>,
-            _ctoken: &(dyn Cancellable + Send + Sync),
+            req: RunRequest<'a, 'io>,
+            ctoken: &(dyn Cancellable + Send + Sync),
         ) -> anyhow::Result<RunResponse> {
             self.shell_runs.fetch_add(1, Ordering::SeqCst);
+            if req.target.labels.iter().any(|l| l == WAIT_LABEL) {
+                return Err(self.wait_for_stop(ctoken));
+            }
             Ok(RunResponse::default())
+        }
+    }
+
+    impl TerminalDriver {
+        /// A `wait` leaf's run: holds its thread until `ctoken` says stop, so
+        /// an abort of its task cannot land before it returns, then reports
+        /// the stop as the signal it died of.
+        ///
+        /// Gives up after 20s and says so in `never_stopped`: a run that is
+        /// never told to stop (one that held its caller's stack, so the
+        /// caller never heard the sibling fail) fails the test rather than
+        /// hanging it.
+        fn wait_for_stop(&self, ctoken: &(dyn Cancellable + Send + Sync)) -> anyhow::Error {
+            self.waiting.store(true, Ordering::SeqCst);
+            let started = std::time::Instant::now();
+            let stopped = tokio::task::block_in_place(|| {
+                while !ctoken.is_cancelled() {
+                    if started.elapsed() > Duration::from_secs(20) {
+                        return false;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                true
+            });
+            if !stopped {
+                self.never_stopped.store(true, Ordering::SeqCst);
+                return anyhow::anyhow!("never told to stop");
+            }
+            crate::engine::error::ProcessFailed::new("signal: interrupt", None).into()
         }
     }
 
@@ -17667,6 +18103,8 @@ mod tests {
         probe: SArc<TerminalProbe>,
         runs: SArc<AtomicUsize>,
         shell_runs: SArc<AtomicUsize>,
+        /// Set when a `wait` leaf's run gave up waiting for its stop.
+        never_stopped: SArc<std::sync::atomic::AtomicBool>,
         _root: tempfile::TempDir,
         _logs: tempfile::TempDir,
     }
@@ -17691,19 +18129,26 @@ mod tests {
             parallelism: Some(4),
             ..Config::for_tests(root.path())
         })?;
-        engine.register_driver(enclose!((runs, shell_runs, log_path) move |_| {
-            Box::new(TerminalDriver {
-                runs,
-                shell_runs,
-                log_path,
-            })
-        }))?;
+        let waiting: SArc<std::sync::atomic::AtomicBool> = SArc::default();
+        let never_stopped: SArc<std::sync::atomic::AtomicBool> = SArc::default();
+        engine.register_driver(
+            enclose!((runs, shell_runs, log_path, never_stopped) move |_| {
+                Box::new(TerminalDriver {
+                    runs,
+                    shell_runs,
+                    log_path,
+                    waiting,
+                    never_stopped,
+                })
+            }),
+        )?;
         engine.register_provider(move |_| Box::new(SpecsProvider { targets }))?;
         Ok(TerminalHarness {
             engine: Arc::new(engine),
             probe: SArc::new(TerminalProbe::default()),
             runs,
             shell_runs,
+            never_stopped,
             _root: root,
             _logs: logs,
         })
@@ -17913,10 +18358,8 @@ mod tests {
             .expect("a failing member must fail the group");
 
         let recorded = rs.get_failure(&failing).expect("failure must be recorded");
-        let tail = recorded
-            .log_tail
-            .as_ref()
-            .expect("a non-interactive member keeps its process log tail");
+        let tail =
+            recorded_tail(&recorded).expect("a non-interactive member keeps its process log tail");
         assert!(tail.text.contains("line12"), "tail: {}", tail.text);
         Ok(())
     }
@@ -18431,7 +18874,7 @@ mod tests {
             anyhow::Error::new(MovedSourceError("it changed while it ran".to_string()))
                 .context("guarding"),
         )
-        .report(&def.target.addr, root.path());
+        .report(&def.target.addr, root.path(), &Default::default());
         assert_eq!(
             moved.fixes,
             Some(hplugin::error::FailureFixes::NotWritten(
@@ -18443,6 +18886,61 @@ mod tests {
                 .error
                 .is_some_and(|e| e.contains("changed while it ran")),
             "the guard's own sentence"
+        );
+        Ok(())
+    }
+
+    /// I7 / P21: a failed write-back's `warn` line is the scrubbed one-line
+    /// message; the raw chain, secret included, is logged at `debug` only.
+    /// The secret is handed to the request as the target's scrub, as a
+    /// credential's value is, and planted in the write's error.
+    #[tokio::test]
+    async fn warn_log_of_failure_is_scrubbed() -> anyhow::Result<()> {
+        const SECRET: &str = "plantedS3cr3tT0kenValue";
+        let (root, engine, def, _err) = failed_in_place_run()?;
+        let rs = engine.new_state();
+        rs.add_scrub(&def.target.addr, [SECRET.to_string()]);
+        let failed = FailureWriteBackRan::Failed(
+            anyhow::anyhow!("the server answered: Authorization: Bearer {SECRET}")
+                .context("listing the inputs of //pkg:fix"),
+        );
+        let (got, log) = capture_logs(tracing_subscriber::filter::LevelFilter::DEBUG, async {
+            failed.report(
+                &def.target.addr,
+                root.path(),
+                &rs.scrub_for(&[&def.target.addr]),
+            )
+        })
+        .await;
+        assert!(got.error.is_some(), "the write-back failed: {got:?}");
+
+        let lines = |level: &str| -> Vec<&str> {
+            log.lines()
+                .filter(|l| l.contains(level) && l.contains("in_place write-back on failure"))
+                .collect()
+        };
+        let warns = lines(" WARN ");
+        let [warn] = warns.as_slice() else {
+            panic!("one warn line:\n{log}");
+        };
+        assert!(!warn.contains(SECRET), "the warn line is scrubbed: {warn}");
+        assert!(
+            warn.contains("[redacted]"),
+            "the warn line says what it scrubbed: {warn}"
+        );
+        assert!(
+            warn.contains("listing the inputs of"),
+            "the warn line keeps the message: {warn}"
+        );
+        assert!(
+            log.lines()
+                .filter(|l| l.contains(SECRET))
+                .all(|l| l.contains("DEBUG")),
+            "the secret appears at debug only:\n{log}"
+        );
+        assert!(
+            lines("DEBUG").iter().any(|l| l.contains(SECRET)),
+            "the raw chain is logged at debug:\n{log}"
         );
         Ok(())
     }
@@ -18823,9 +19321,7 @@ mod tests {
             .expect("the failing root must fail the run");
 
         let recorded = rs.get_failure(&failing).expect("failure must be recorded");
-        let tail = recorded
-            .log_tail
-            .as_ref()
+        let tail = recorded_tail(&recorded)
             .expect("a target that never streamed keeps its process log tail");
         assert!(tail.text.contains("line12"), "tail: {}", tail.text);
         Ok(())
@@ -18864,8 +19360,65 @@ mod tests {
 
             let recorded = rs.get_failure(&addr).expect("failure must be recorded");
             assert_eq!(recorded.streamed, streamed);
-            let tail = recorded.log_tail.as_ref().expect("the tail is always kept");
+            let tail = recorded_tail(&recorded).expect("the tail is always kept");
             assert!(tail.text.contains("line12"), "tail: {}", tail.text);
+        }
+        Ok(())
+    }
+
+    /// D6.1c: the wrapper hears of a failed process while it still holds the
+    /// terminal, with the status the record then holds, and that record is
+    /// one every renderer leaves out once the run streamed
+    /// (`told_streamed`). A run that went fine, then failed past the run,
+    /// tells the wrapper nothing, and its record keeps its box.
+    #[tokio::test]
+    async fn wrapper_hears_of_a_failed_process_before_it_lets_go() -> anyhow::Result<()> {
+        for fail_in_run in [true, false] {
+            let mut spec = leaf_spec("//pkg:t", fail_in_run)?;
+            if !fail_in_run {
+                spec.config
+                    .insert("badout".to_string(), hcore::htvalue::Value::Bool(true));
+            }
+            let h = terminal_harness(vec![spec])?;
+            let rs = h.engine.new_state();
+            let addr = hmodel::htaddr::parse_addr("//pkg:t")?;
+            let heard: SArc<parking_lot::Mutex<Option<crate::engine::RunEnd>>> = SArc::default();
+            let wrapper: InteractiveWrapper = SArc::new({
+                let heard = SArc::clone(&heard);
+                move |inner: InteractiveInner| {
+                    let heard = SArc::clone(&heard);
+                    Box::pin(async move {
+                        let end = inner(None, None, None, None).await?;
+                        *heard.lock() = Some(end);
+                        Ok(TerminalUse { streamed: true })
+                    })
+                }
+            });
+            let opts = ResultOptions {
+                interactive: Some(wrapper),
+                ..Default::default()
+            };
+            Arc::clone(&h.engine)
+                .result_addr(rs.clone(), &addr, OutputMatcher::All, &opts)
+                .await
+                .err()
+                .expect("the target fails");
+
+            let end = heard.lock().take().expect("the wrapper ran the target");
+            let recorded = rs.get_failure(&addr).expect("failure must be recorded");
+            if fail_in_run {
+                let told = end.exec_failure.expect("a failed process is told");
+                assert_eq!(told.addr.as_deref(), Some("//pkg:t"));
+                assert_eq!(
+                    told.exit, recorded.record.exit,
+                    "the status the record holds"
+                );
+                assert!(recorded.record.told_streamed(), "{:?}", recorded.record);
+            } else {
+                assert_eq!(end.exec_failure, None, "the process went fine");
+                assert!(recorded.record.streamed, "the run streamed");
+                assert!(!recorded.record.told_streamed(), "its box is printed");
+            }
         }
         Ok(())
     }
@@ -18895,7 +19448,7 @@ mod tests {
 
             assert_eq!(h.runs.load(Ordering::SeqCst), 1, "the run itself went fine");
             let recorded = rs.get_failure(&addr).expect("failure must be recorded");
-            let msg = format!("{:#}", recorded.source);
+            let msg = &recorded.record.diagnostic.message;
             assert!(
                 msg.contains("declares host path") && !msg.contains("cache_locally"),
                 "a failure past the run: {msg} ({err:#})",
@@ -18932,15 +19485,183 @@ mod tests {
 
             assert_eq!(h.runs.load(Ordering::SeqCst), 1, "the run itself went fine");
             let recorded = rs.get_failure(&addr).expect("failure must be recorded");
-            let msg = format!("{:#}", recorded.source);
+            let msg = &recorded.record.diagnostic.message;
             assert!(
                 msg.contains("cache_locally") && msg.contains("duplicate cache entry name"),
                 "a cache-store failure: {msg} ({err:#})",
             );
             assert_eq!(recorded.streamed, streamed, "{msg}");
-            let detail = crate::engine::event::ErrorDetail::from_error(&recorded.source);
+            let detail = crate::engine::event::ErrorDetail::from_error(&err);
             assert_eq!(detail.streamed, streamed, "{msg}");
             assert!(!detail.kept, "no slot on a store failure: {msg}");
+        }
+        Ok(())
+    }
+
+    /// U6, D6.1c "execution went fine, then a later step failed": a run that
+    /// streamed, then a cache store that refused its artifacts (`dup`), or a
+    /// declared host path that does not exist (`badout`, the missing-output
+    /// case). The wrapper is told of no failed process, so it prints no
+    /// one-liner; the record is a streamed one past the run, which every
+    /// renderer boxes (`told_streamed` false) with the pointer in place of
+    /// the log (`log_rows_follow_the_slot`, `ci_view_told_streamed_no_box_but_counted`,
+    /// `gather_drops_told_streamed_keeps_after_run`).
+    #[tokio::test]
+    async fn streamed_then_cache_store_fails_box_without_log() -> anyhow::Result<()> {
+        for flag in ["dup", "badout"] {
+            let mut spec = leaf_spec("//pkg:t", false)?;
+            spec.config
+                .insert(flag.to_string(), hcore::htvalue::Value::Bool(true));
+            let h = terminal_harness(vec![spec])?;
+            let rs = h.engine.new_state();
+            let addr = hmodel::htaddr::parse_addr("//pkg:t")?;
+            let heard: SArc<parking_lot::Mutex<Option<crate::engine::RunEnd>>> = SArc::default();
+            let wrapper: InteractiveWrapper = SArc::new({
+                let heard = SArc::clone(&heard);
+                move |inner: InteractiveInner| {
+                    let heard = SArc::clone(&heard);
+                    Box::pin(async move {
+                        let end = inner(None, None, None, None).await?;
+                        *heard.lock() = Some(end);
+                        Ok(TerminalUse { streamed: true })
+                    })
+                }
+            });
+            let opts = ResultOptions {
+                interactive: Some(wrapper),
+                ..Default::default()
+            };
+            Arc::clone(&h.engine)
+                .result_addr(rs.clone(), &addr, OutputMatcher::All, &opts)
+                .await
+                .err()
+                .expect("a later step fails");
+
+            let end = heard.lock().take().expect("the wrapper ran the target");
+            assert_eq!(end.exec_failure, None, "{flag}: the process went fine");
+            let rec = &rs.get_failure(&addr).expect("failure recorded").record;
+            assert!(rec.streamed, "{flag}: the run streamed");
+            assert_eq!(rec.failed_in, hcore::failure::FailedIn::AfterRun, "{flag}");
+            assert!(!rec.told_streamed(), "{flag}: its box is printed");
+            assert!(!rec.cancelled, "{flag}");
+        }
+        Ok(())
+    }
+
+    /// CQ-3: under fail-fast, a sibling fails while a run is in progress. The
+    /// stopped run reports its stop as a failure of its own (a signal), and
+    /// it is a stop all the same: its wrapper hears of no failed process (no
+    /// `✗ … exit status` line while it holds the terminal), and nothing is
+    /// kept for it. The run holds the terminal as `--shell=//pkg:wait` gives
+    /// it, the one way a target that is not the sole selection gets one.
+    /// Both shapes of the stop:
+    ///
+    /// - siblings of one selection (`root`): the request's token is
+    ///   cancelled, and the run is reported as stopped while running;
+    /// - two deps of one target (`dep`): the failing dep's error drops the
+    ///   other's caller, and its execute is abandoned with the request's
+    ///   token untouched. The line used to read the request's token alone, so
+    ///   this run was told as a failure while the keep judged it a stop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fail_fast_stopped_run_tells_no_line_and_is_a_stop() -> anyhow::Result<()> {
+        for shape in ["root", "dep"] {
+            let mut bad = leaf_spec("//pkg:bad", false)?;
+            bad.config
+                .insert("fail_late".to_string(), hcore::htvalue::Value::Bool(true));
+            let mut wait = leaf_spec("//pkg:wait", false)?;
+            wait.config
+                .insert("wait".to_string(), hcore::htvalue::Value::Bool(true));
+            let mut targets = vec![bad, wait];
+            if shape == "dep" {
+                targets.push(leaf_with_deps_spec(
+                    "//top:t",
+                    &["//pkg:bad", "//pkg:wait"],
+                )?);
+            }
+            let h = terminal_harness(targets)?;
+            let heard: SArc<parking_lot::Mutex<Vec<crate::engine::RunEnd>>> = SArc::default();
+            let wrapper: InteractiveWrapper = SArc::new({
+                let heard = SArc::clone(&heard);
+                move |inner: InteractiveInner| {
+                    let heard = SArc::clone(&heard);
+                    Box::pin(async move {
+                        let end = inner(None, None, None, None).await?;
+                        heard.lock().push(end);
+                        Ok(TerminalUse { streamed: true })
+                    })
+                }
+            });
+            let wait_addr = hmodel::htaddr::parse_addr("//pkg:wait")?;
+            let rs = h.state_with(
+                ShellTarget {
+                    addr: wait_addr.clone(),
+                    terminal: Some(wrapper),
+                },
+                true,
+            );
+            let opts = ResultOptions::default();
+            let res = if shape == "root" {
+                Arc::clone(&h.engine)
+                    .result(
+                        rs.clone(),
+                        &Matcher::Package(PkgBuf::from("pkg")),
+                        OutputMatcher::All,
+                        &opts,
+                    )
+                    .await
+                    .map(drop)
+            } else {
+                Arc::clone(&h.engine)
+                    .result_addr(
+                        rs.clone(),
+                        &hmodel::htaddr::parse_addr("//top:t")?,
+                        OutputMatcher::All,
+                        &opts,
+                    )
+                    .await
+                    .map(drop)
+            };
+            assert!(res.is_err(), "{shape}: the build fails");
+            assert!(
+                !h.never_stopped.load(Ordering::SeqCst),
+                "{shape}: the run was never told to stop",
+            );
+
+            // An abandoned run goes on on its own task until it hears the
+            // stop: wait for it to come back to its wrapper.
+            let started = std::time::Instant::now();
+            while heard.lock().is_empty() {
+                assert!(
+                    started.elapsed() < Duration::from_secs(30),
+                    "{shape}: the stopped run never came back to its wrapper"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            // Again now it is back: a run that went on on its own task and
+            // gave up at 20s, never told to stop, came back too.
+            assert!(
+                !h.never_stopped.load(Ordering::SeqCst),
+                "{shape}: the run was never told to stop",
+            );
+            let end = heard.lock().pop().expect("heard");
+            assert_eq!(
+                end.exec_failure, None,
+                "{shape}: a stopped run is not told as a failed process",
+            );
+            assert!(
+                rs.get_failure(&wait_addr).is_none(),
+                "{shape}: nothing is kept for a stop",
+            );
+            assert!(
+                rs.get_failure(&hmodel::htaddr::parse_addr("//pkg:bad")?)
+                    .is_some(),
+                "{shape}: the sibling's failure is what stopped it",
+            );
+            if shape == "root" {
+                assert!(rs.was_cancelled("//pkg:wait"), "reported as stopped");
+                let stopped = rs.fail_fast_stopped().expect("fail-fast stopped a run");
+                assert_eq!(stopped.running, vec!["//pkg:wait".to_string()]);
+            }
         }
         Ok(())
     }

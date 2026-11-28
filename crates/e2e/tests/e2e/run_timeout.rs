@@ -82,7 +82,11 @@ async fn build(engine: &Arc<Engine>, addr: &str) -> anyhow::Result<String> {
         Err(e) => {
             let mut msg = format!("{e:#}");
             for f in rs.take_failures() {
-                msg.push_str(&format!("\nfailure {}: {:#}", f.addr.format(), f.source));
+                msg.push_str(&format!(
+                    "\nfailure {}: {:#}",
+                    f.addr.format(),
+                    crate::common::failure_text(&f)
+                ));
             }
             Err(anyhow::anyhow!(msg))
         }
@@ -129,7 +133,7 @@ async fn a_run_past_its_timeout_fails_as_timed_out() -> anyhow::Result<()> {
         let elapsed = started.elapsed();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("//p:slow timed out after 1s"),
+            msg.contains("//p:slow: timed out after 1s (its timeout)"),
             "{attempt}: {msg}"
         );
         assert!(
@@ -263,7 +267,7 @@ target(
     let engine = engine(ws.path())?;
     let err = build(&engine, "//p:bg").await.expect_err("timed out");
     assert!(
-        format!("{err:#}").contains("//p:bg timed out after 1s"),
+        format!("{err:#}").contains("//p:bg: timed out after 1s (its timeout)"),
         "{err:#}"
     );
 
@@ -329,22 +333,18 @@ async fn a_timed_out_target_keeps_its_log() -> anyhow::Result<()> {
         panic!("one failure recorded, got {}", failures.len());
     };
     assert!(
-        heph::engine::run_timeout::is_timed_out(&failure.source),
-        "a timeout: {:#}",
-        failure.source
+        failure.record.timed_out.is_some(),
+        "a timeout: {:?}",
+        failure.record
     );
-    assert!(
-        !hplugin::error::is_cancelled(&failure.source),
-        "{:#}",
-        failure.source
-    );
+    assert!(!failure.record.cancelled, "{:?}", failure.record);
     let log = slot_log(&engine, "//p:slow").expect("a timed-out run fills its failure slot");
     assert!(log.contains("started"), "the log before the kill: {log:?}");
     assert!(!log.contains("done"), "{log:?}");
     // Its sandbox is removed like any failed run's, and the recorded tail,
     // read from the slot's copy, survives that.
     crate::failure_slot::removed(&crate::failure_slot::sandbox_dir(&engine, "p", "slow")).await;
-    let tail = failure.log_tail.as_ref().expect("the recorded tail");
+    let tail = crate::common::failure_tail(failure).expect("the recorded tail");
     assert!(tail.text.contains("started"), "{tail:?}");
     Ok(())
 }
@@ -429,8 +429,11 @@ async fn a_run_that_ignores_its_cancellation_is_abandoned() -> anyhow::Result<()
             .await
             .expect("an abandoned run does not hang the build")?;
     let msg = format!("{err:#}");
-    assert!(msg.contains("//p:stuck timed out after 1s"), "{msg}");
-    assert!(msg.contains("was abandoned"), "{msg}");
+    assert!(
+        msg.contains("//p:stuck: timed out after 1s (its timeout)"),
+        "{msg}"
+    );
+    assert!(msg.contains(hcore::failure::ABANDONED), "{msg}");
     assert!(
         started.elapsed() < Duration::from_secs(9),
         "abandoned after the shortened grace, not the production one: {:?}",
@@ -439,11 +442,8 @@ async fn a_run_that_ignores_its_cancellation_is_abandoned() -> anyhow::Result<()
     let [failure] = failures.as_slice() else {
         panic!("one failure recorded, got {}", failures.len());
     };
-    assert!(
-        format!("{:#}", failure.source).contains("was abandoned"),
-        "{:#}",
-        failure.source
-    );
+    let text = crate::common::failure_text(failure);
+    assert!(text.contains(hcore::failure::ABANDONED), "{text}");
     Ok(())
 }
 
@@ -541,7 +541,10 @@ target(
         let Err(err) = res else {
             anyhow::bail!("//p:deaf must fail");
         };
-        assert!(format!("{err:#}").contains("was abandoned"), "{err:#}");
+        assert!(
+            format!("{err:#}").contains(hcore::failure::ABANDONED),
+            "{err:#}"
+        );
         let [failure] = <[_; 1]>::try_from(rs.take_failures())
             .map_err(|f| anyhow::anyhow!("one failure recorded, got {}", f.len()))?;
         Ok(Self {
@@ -603,8 +606,8 @@ async fn an_abandoned_runs_sandbox_is_left_and_its_slot_returned() -> anyhow::Re
     assert_eq!(
         run.failure.sandbox,
         Some(hplugin::error::SandboxFate::LeftAbandoned),
-        "{:#}",
-        run.failure.source
+        "{}",
+        crate::common::failure_text(&run.failure)
     );
     Ok(())
 }
@@ -622,8 +625,8 @@ async fn an_abandoned_runs_sandbox_is_kept_under_the_flag() -> anyhow::Result<()
     assert_eq!(
         run.failure.sandbox,
         Some(hplugin::error::SandboxFate::Kept(dir)),
-        "{:#}",
-        run.failure.source
+        "{}",
+        crate::common::failure_text(&run.failure)
     );
     Ok(())
 }
@@ -782,7 +785,7 @@ target(name = "c", driver = "drops", run = "echo $T; sleep 60; echo done > $OUT"
     let started = Instant::now();
     let err = build(&engine, "//p:c").await.expect_err("timed out");
     assert!(
-        format!("{err:#}").contains("//p:c timed out after 1s"),
+        format!("{err:#}").contains("//p:c: timed out after 1s (its timeout)"),
         "{err:#}"
     );
     assert!(started.elapsed() < Duration::from_secs(9));
@@ -911,7 +914,10 @@ async fn a_process_past_its_timeout_times_out_after_a_slow_preparation() -> anyh
         .expect_err("a 60s process under a 1s timeout fails");
     let elapsed = started.elapsed();
     let msg = format!("{err:#}");
-    assert!(msg.contains("//p:padded timed out after 1s"), "{msg}");
+    assert!(
+        msg.contains("//p:padded: timed out after 1s (its timeout)"),
+        "{msg}"
+    );
     assert!(
         msg.contains("failure //p:padded"),
         "recorded as a failure: {msg}"
@@ -932,14 +938,15 @@ async fn a_process_past_its_timeout_times_out_after_a_slow_preparation() -> anyh
 }
 
 /// The `ResultEnd` of `addr`'s timed-out run: its typed timeout and the log
-/// tail it carries. It is a root failure, not a stop: the CI view prints
-/// nothing live for a stop.
+/// tail its record names (the end carries a reference, never the text; P13),
+/// read from the failure slot. It is a root failure, not a stop: the CI view
+/// prints nothing live for a stop.
 fn timed_out_end(
     events: &[BuildEvent],
     addr: &str,
 ) -> (
     Option<hcore::events::TimedOutData>,
-    Option<hcore::events::LogTailData>,
+    Option<hcore::failure_log::LogTail>,
 ) {
     let ends: Vec<_> = events
         .iter()
@@ -947,14 +954,24 @@ fn timed_out_end(
             BuildEventKind::ResultEnd {
                 addr: a,
                 timed_out,
-                log_tail,
+                failure,
                 upstream_of,
                 cancelled,
                 ..
             } if a == addr => {
                 assert_eq!(upstream_of, &None, "{addr} is the root");
                 assert!(!cancelled, "{addr} timed out, it was not stopped");
-                Some((timed_out.clone(), log_tail.clone()))
+                let tail = failure
+                    .as_ref()
+                    .and_then(|f| f.log.as_ref())
+                    .and_then(|log| {
+                        hcore::failure_log::read_tail(
+                            log,
+                            hcore::failure_log::TAIL_LINES_CAP,
+                            hcore::failure_log::TAIL_MAX_BYTES,
+                        )
+                    });
+                Some((timed_out.clone(), tail))
             }
             _ => None,
         })
@@ -969,8 +986,8 @@ fn timed_out_end(
 /// shows under the failure's header.
 const CHATTY: &str = "for i in $(seq 1 30); do echo line $i; done; sleep 60; echo done > $OUT";
 
-/// A timed-out run's `ResultEnd` carries the last lines of what it printed,
-/// as any failure's does: the line backend prints them live under the
+/// A timed-out run's `ResultEnd` names a log holding the last lines of what
+/// it printed, as any failure's does: the line backend prints them live under the
 /// "timed out" header. Stopped within its grace, the run fills its failure
 /// slot, and the tail comes from there.
 #[tokio::test]
@@ -1059,7 +1076,7 @@ async fn timed_out_on_multi_thread(
 ) -> anyhow::Result<(
     Duration,
     Option<hcore::events::TimedOutData>,
-    Option<hcore::events::LogTailData>,
+    Option<hcore::failure_log::LogTail>,
 )> {
     let ws = tempfile::tempdir()?;
     write_build(

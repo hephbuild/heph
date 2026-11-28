@@ -337,6 +337,28 @@ fn run_json_refuses_an_entrypoint() {
     );
 }
 
+/// D5: `heph query <addr> --json` on a target whose BUILD file does not
+/// evaluate prints an empty list, a document a script can parse, and exits 1
+/// with the file's box on stderr.
+#[test]
+fn query_json_on_broken_file_prints_empty_list() {
+    let dist = Dist::locate();
+    let ws = Workspace::new().expect("workspace");
+    ws.write(
+        "d/BUILD",
+        "target(name = \"t\", driver = \"bash\", run = \"true\")\nbroken(\n",
+    )
+    .expect("write BUILD");
+    let out = ws
+        .run(&dist, &["query", "//d:t", "--json"])
+        .expect("query //d:t");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{}", common::describe(&out));
+    let doc: Value = serde_json::from_slice(&out.stdout).expect("stdout is JSON");
+    assert_eq!(doc, serde_json::json!([]), "{}", common::describe(&out));
+    assert_eq!(stderr.matches("✗ d/BUILD").count(), 1, "{stderr}");
+}
+
 /// How a measured run ended: its exit code, the CPU time it used, and stdout.
 struct Measured {
     code: i32,

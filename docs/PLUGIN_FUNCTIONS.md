@@ -82,7 +82,8 @@ A plugin reaches another plugin's function through the engine's registry, by
 Both are per engine — never stash one in a process-global, or a second engine in
 the same process calls into the first one's functions. Both error when called
 before the engine has finished registering plugins (the registry is sealed
-before the first BUILD evaluation), and after the engine is gone.
+before any provider evaluates a source file, the buildfile provider's BUILD
+files for example), and after the engine is gone.
 
 Relay what the inner call declared with `FnOutcome::absorb`:
 

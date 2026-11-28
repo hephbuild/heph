@@ -710,6 +710,17 @@ impl TookDown {
     pub const NAMED: usize = 5;
 }
 
+/// The values a request's targets were handed to scrub
+/// ([`RequestStateData::scrubs`]).
+#[derive(Default)]
+struct Scrubs {
+    by_addr: FxHashMap<Addr, crate::engine::failure_record::Scrub>,
+    /// Every value of `by_addr` together, with its scrubber: built by the
+    /// first failure event after a change, dropped by the next change
+    /// (FQ-15).
+    all: Option<Arc<crate::engine::failure_record::Scrub>>,
+}
+
 /// Shared mutable state for a request — common across all child RequestStates.
 pub struct RequestStateData {
     pub engine: Weak<Engine>,
@@ -848,11 +859,19 @@ pub struct RequestStateData {
     /// shows the slots its runs freed.
     sandbox_removals: crate::engine::sandbox_cleaner::PendingCounter,
     /// Per-request registry of culprits, keyed by what is to blame (a target,
-    /// or a BUILD file that did not evaluate). Populated by the `result_addr`
+    /// or a provider's source file that did not evaluate). Populated by the `result_addr`
     /// classifier (first-writer-wins dedup) and drained once at the end of
     /// execution for rendering. Shared via `Arc<RequestStateData>`, so
     /// `with_parent` / `with_skip_provider` children record into the same map.
     pub failures: Mutex<indexmap::IndexMap<Culprit, Arc<TargetFailure>>>,
+    /// The secret values each target was handed this request (its
+    /// credentials' material when it ran; never a deferred value, U20), which
+    /// its recorded failure is scrubbed of
+    /// ([`compact`](crate::engine::failure_record::compact), I7). Request
+    /// state only: never on a def, never hashed (I1), dropped with the
+    /// request. Written only by a target that has some to scrub, read only on
+    /// a failure.
+    scrubs: Mutex<Scrubs>,
     /// The target behind each `_transitive_<hash>_<i>` origin id a
     /// dependent's merged transitive inputs carry, keyed by `<hash>`
     /// (`Addr::hash_str`): who declared a merged input, for a failure that
@@ -875,6 +894,9 @@ pub struct RequestStateData {
     /// ([`RequestState::end_is_cancelled`]), by formatted addr: roots and
     /// what they took down. The report leaves them out.
     cancelled: Mutex<FxHashSet<String>>,
+    /// What `--fail-fast` stopped, for the report's `stopped by --fail-fast`
+    /// lines. Written only under `--fail-fast`.
+    fail_fast_log: Mutex<FailFastLog>,
     /// Decision maker for `approval`-gated targets. `None` in non-interactive
     /// contexts that never set one (gc, tests) — a target requiring approval then
     /// fails with a clear error. Shared via `Arc<RequestStateData>`, so child
@@ -1313,6 +1335,48 @@ fn once(flag: &std::sync::atomic::AtomicBool) -> bool {
     !flag.load(Relaxed) && !flag.swap(true, Relaxed)
 }
 
+/// What `--fail-fast` stopped, as the request saw it ([`RequestState::fail_fast_stopped`]).
+#[derive(Debug, Default)]
+struct FailFastLog {
+    /// The executes open now, by formatted addr.
+    open: FxHashSet<String>,
+    /// `open` when the first failure stopped the request; `None` until then.
+    running_at_stop: Option<FxHashSet<String>>,
+    /// Every target whose end was a stop of its own (no `upstream_of`), in
+    /// end order.
+    stopped_roots: indexmap::IndexSet<String>,
+}
+
+/// An execute [`RequestState::fail_fast_stopped`] may find running: open
+/// until dropped.
+pub struct OpenExecute {
+    data: Arc<RequestStateData>,
+    addr: String,
+}
+
+impl std::fmt::Debug for OpenExecute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenExecute")
+            .field("addr", &self.addr)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for OpenExecute {
+    fn drop(&mut self) {
+        self.data.fail_fast_log.lock().open.remove(&self.addr);
+    }
+}
+
+/// What `--fail-fast` stopped once a target failed (D5, RUN-24).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FailFastStopped {
+    /// The targets that were running, by formatted addr, sorted.
+    pub running: Vec<String>,
+    /// How many stopped targets had not started.
+    pub queued: usize,
+}
+
 impl RequestState {
     pub fn request_id(&self) -> &String {
         &self.data.request_id
@@ -1443,7 +1507,7 @@ impl RequestState {
 
     /// Records a culprit's rich diagnostic. First-writer-wins: if `culprit`
     /// already has an entry (e.g. shared via the memoizer to multiple
-    /// waiters, or a broken BUILD file reached through several of its
+    /// waiters, or a broken source file reached through several of its
     /// targets), the existing one is kept. Whether this call was the one
     /// that recorded it: the claim to announce the failure.
     pub fn record_failure(&self, culprit: impl Into<Culprit>, failure: Arc<TargetFailure>) -> bool {
@@ -1454,6 +1518,51 @@ impl RequestState {
                 true
             }
         }
+    }
+
+    /// Scrub `values` out of `addr`'s recorded failure, and out of any
+    /// failure reached through it. A value under
+    /// [`REDACT_MIN_LEN`](hplugin::driver::REDACT_MIN_LEN) is never scrubbed
+    /// (it would corrupt ordinary text), so it is not kept; nothing is kept
+    /// for no values.
+    pub(crate) fn add_scrub(&self, addr: &Addr, values: impl IntoIterator<Item = String>) {
+        let mut values = values
+            .into_iter()
+            .filter(|v| v.len() >= hplugin::driver::REDACT_MIN_LEN)
+            .peekable();
+        if values.peek().is_none() {
+            return;
+        }
+        let mut scrubs = self.data.scrubs.lock();
+        scrubs
+            .by_addr
+            .entry(addr.clone())
+            .or_default()
+            .extend(values);
+        scrubs.all = None;
+    }
+
+    /// Every value `addrs` were handed to scrub, together: what a failure
+    /// recorded against one of them and entered through another is
+    /// scrubbed of. Empty when none has any.
+    pub(crate) fn scrub_for(&self, addrs: &[&Addr]) -> crate::engine::failure_record::Scrub {
+        let guard = self.data.scrubs.lock();
+        let scrubs = &guard.by_addr;
+        let mut out = crate::engine::failure_record::Scrub::default();
+        if scrubs.is_empty() {
+            return out;
+        }
+        let mut seen: Vec<&Addr> = Vec::with_capacity(addrs.len());
+        for addr in addrs {
+            if seen.contains(addr) {
+                continue;
+            }
+            seen.push(addr);
+            if let Some(s) = scrubs.get(*addr) {
+                out.extend_from(s);
+            }
+        }
+        out
     }
 
     /// Drains and returns all recorded failures in insertion order, leaving the
@@ -1508,10 +1617,26 @@ impl RequestState {
             .into_iter()
             .zip(paths)
             .map(|(f, path)| {
-                if f.path == path {
+                // What it took down is known only now, as the path is.
+                let took_down = Some(self.took_down(&f.addr.format()))
+                    .filter(|t| t.total > 0)
+                    .map(|t| hcore::events::TookDownData {
+                        named: t.named,
+                        total: u64::try_from(t.total).unwrap_or(u64::MAX),
+                    });
+                if f.path == path && f.record.took_down == took_down {
                     f
                 } else {
-                    Arc::new(f.as_ref().clone().with_path(path))
+                    // The record says the same path as the failure it is of.
+                    let mut record = f.record.as_ref().clone();
+                    record.path = path.iter().map(Addr::format).collect();
+                    record.took_down = took_down;
+                    Arc::new(
+                        f.as_ref()
+                            .clone()
+                            .with_path(path)
+                            .with_record(Arc::new(record)),
+                    )
                 }
             })
             .collect()
@@ -1549,7 +1674,16 @@ impl RequestState {
                         return f;
                     }
                     let readable = engine.log_readable(&f.addr).await;
-                    Arc::new(f.as_ref().clone().with_log_readable(readable))
+                    // The record answers as the failure does: the box reads
+                    // only the record.
+                    let mut record = f.record.as_ref().clone();
+                    record.left_behind.get_or_insert_default().log_readable = Some(readable);
+                    Arc::new(
+                        f.as_ref()
+                            .clone()
+                            .with_log_readable(readable)
+                            .with_record(Arc::new(record)),
+                    )
                 }
             })
             .buffered(crate::engine::fanout::discovery_concurrency())
@@ -1706,12 +1840,65 @@ impl RequestState {
         if cancelled {
             set.insert(addr.to_owned());
         }
+        drop(set);
+        if cancelled && d.upstream_of.is_none() && self.fail_fast() {
+            self.data
+                .fail_fast_log
+                .lock()
+                .stopped_roots
+                .insert(addr.to_owned());
+        }
         cancelled
     }
 
     /// Whether `addr`'s failure was a stop ([`end_is_cancelled`](Self::end_is_cancelled)).
     pub fn was_cancelled(&self, addr: &str) -> bool {
         self.data.cancelled.lock().contains(addr)
+    }
+
+    /// Stop the request because a target failed under `--fail-fast`: note
+    /// which executes were running (the report's `(was running)` lines),
+    /// then cancel the token, which signals them.
+    pub fn stop_for_fail_fast(&self) {
+        {
+            let mut log = self.data.fail_fast_log.lock();
+            if log.running_at_stop.is_none() {
+                log.running_at_stop = Some(log.open.clone());
+            }
+        }
+        self.ctoken().cancel();
+    }
+
+    /// `addr`'s execute, open until the guard drops: what
+    /// [`stop_for_fail_fast`](Self::stop_for_fail_fast) finds running.
+    /// `None`, at no cost, without `--fail-fast`.
+    pub fn open_execute(&self, addr: &str) -> Option<OpenExecute> {
+        if !self.fail_fast() {
+            return None;
+        }
+        self.data.fail_fast_log.lock().open.insert(addr.to_owned());
+        Some(OpenExecute {
+            data: Arc::clone(&self.data),
+            addr: addr.to_owned(),
+        })
+    }
+
+    /// What `--fail-fast` stopped once a target failed (D5, RUN-24): the
+    /// targets that were running, sorted, and how many never started.
+    /// `None` when fail-fast stopped nothing (no failure, or no fail-fast).
+    pub fn fail_fast_stopped(&self) -> Option<FailFastStopped> {
+        let log = self.data.fail_fast_log.lock();
+        let at_stop = log.running_at_stop.as_ref()?;
+        let (mut running, queued): (Vec<&String>, Vec<&String>) =
+            log.stopped_roots.iter().partition(|a| at_stop.contains(*a));
+        if running.is_empty() && queued.is_empty() {
+            return None;
+        }
+        running.sort_unstable();
+        Some(FailFastStopped {
+            running: running.into_iter().cloned().collect(),
+            queued: queued.len(),
+        })
     }
 
     /// heph's home, while the engine is alive: what no screen or report
@@ -1968,6 +2155,27 @@ impl RequestState {
 }
 
 impl RequestStateData {
+    /// `text`, an event's `error`, scrubbed of every value any target of
+    /// this request was handed to scrub, and within the record's message
+    /// cap (I7). Every value, not only the failing target's: the text of a
+    /// skipped or stopped end is another target's chain. Events reach
+    /// `events.ndjson`, the session store and hook plugins, so none carries
+    /// a text this has not seen. Called on the failure path only.
+    pub(crate) fn scrub_event_text(&self, text: &str) -> String {
+        let all = {
+            let scrubs = &mut *self.scrubs.lock();
+            let by_addr = &scrubs.by_addr;
+            Arc::clone(scrubs.all.get_or_insert_with(|| {
+                let mut all = crate::engine::failure_record::Scrub::default();
+                for s in by_addr.values() {
+                    all.extend_from(s);
+                }
+                Arc::new(all)
+            }))
+        };
+        crate::engine::failure_record::scrub_line(text, &all)
+    }
+
     /// Fan a fully-built event out to every registered hook and the event
     /// channel (both best-effort). The single delivery path for a `BuildEvent`,
     /// shared by [`RequestState::emit`] and [`emit_scope`](crate::engine::event::emit_scope)'s
@@ -2079,7 +2287,8 @@ pub type RequestRegistry =
 /// Where the fs plugin's codegen reads report (see
 /// [`hbuiltins::pluginfs::CodegenReport`]): an event goes on the stream of the
 /// request whose id it names, and a key fires once per request. A read with no
-/// request (a BUILD evaluation's `heph.fs.glob`), or one whose request is gone,
+/// request (a source file's `heph.fs.glob`, as the buildfile provider
+/// evaluates it), or one whose request is gone,
 /// emits nothing and dedupes engine-wide.
 ///
 /// Holds the request registry, not the engine: the fs driver that holds this
@@ -2290,7 +2499,7 @@ impl Engine {
     ) -> Arc<RequestState> {
         // A request is past registration by construction (the engine is
         // shared), so every request starts with the function registry sealed —
-        // whichever provider path it takes to a BUILD evaluation.
+        // whichever provider path it takes to a source file's evaluation.
         self.seal_functions();
         // Unique per top-level request. `with_parent`/`with_skip_provider`
         // children share this `RequestStateData` (and thus this id), so a request
@@ -2331,11 +2540,13 @@ impl Engine {
             bg_pending: Arc::clone(&bg_pending),
             sandbox_removals: crate::engine::sandbox_cleaner::PendingCounter::default(),
             failures: Mutex::new(indexmap::IndexMap::new()),
+            scrubs: Mutex::new(Scrubs::default()),
             transitive_declarers: Mutex::new(FxHashMap::default()),
             report_passes: std::sync::atomic::AtomicUsize::new(0),
             path_passes: std::sync::atomic::AtomicUsize::new(0),
             took_down: Mutex::new(FxHashMap::default()),
             cancelled: Mutex::new(FxHashSet::default()),
+            fail_fast_log: Mutex::default(),
             approval,
             hash_only,
             selection: std::sync::OnceLock::new(),
@@ -2394,6 +2605,51 @@ mod tests {
         });
         assert_eq!(claims, 1);
         assert!(!once(&flag), "a set flag is never claimed again");
+    }
+
+    /// A failure is scrubbed of every value each named target was handed,
+    /// a target named twice counted once, and a value too short to scrub is
+    /// not kept.
+    #[test]
+    fn scrub_for_unions_the_named_targets_values() -> anyhow::Result<()> {
+        let (_dir, engine) = test_engine()?;
+        let rs = engine.new_state();
+        let (a, b, c) = (addr("a"), addr("b"), addr("c"));
+        rs.add_scrub(&a, ["secret-of-a".to_owned(), "short".to_owned()]);
+        rs.add_scrub(&b, ["secret-of-b".to_owned()]);
+        rs.add_scrub(&c, ["secret-of-c".to_owned()]);
+        rs.add_scrub(&c, std::iter::empty());
+
+        let scrub = rs.scrub_for(&[&a, &b, &a]);
+        assert_eq!(format!("{scrub:?}"), "Scrub(2 values)");
+        let e = anyhow::anyhow!("secret-of-a secret-of-b secret-of-c short");
+        let culprit = Culprit::Target(a.clone());
+        let rec = crate::engine::failure_record::compact(&e, &culprit, &a, &scrub);
+        assert_eq!(
+            rec.diagnostic.message,
+            "[redacted] [redacted] secret-of-c short"
+        );
+        assert!(rs.scrub_for(&[&addr("d")]).is_empty());
+        Ok(())
+    }
+
+    /// FQ-15: the union every event is scrubbed with is built once, and a
+    /// value added after it was built is scrubbed from the next event on.
+    #[test]
+    fn event_text_is_scrubbed_of_a_value_added_later() -> anyhow::Result<()> {
+        let (_dir, engine) = test_engine()?;
+        let rs = engine.new_state();
+        assert_eq!(rs.data.scrub_event_text("secret-of-a"), "secret-of-a");
+        rs.add_scrub(&addr("a"), ["secret-of-a".to_owned()]);
+        let text = "secret-of-a secret-of-b";
+        assert_eq!(rs.data.scrub_event_text(text), "[redacted] secret-of-b");
+        let built = rs.data.scrubs.lock().all.clone().expect("built");
+        assert_eq!(rs.data.scrub_event_text(text), "[redacted] secret-of-b");
+        let again = rs.data.scrubs.lock().all.clone().expect("kept");
+        assert!(Arc::ptr_eq(&built, &again), "built once");
+        rs.add_scrub(&addr("b"), ["secret-of-b".to_owned()]);
+        assert_eq!(rs.data.scrub_event_text(text), "[redacted] [redacted]");
+        Ok(())
     }
 
     /// A node's index in the DAG's parallel vectors, for white-box assertions.
@@ -3028,7 +3284,7 @@ mod tests {
         );
         rs.record_failure(
             c.clone(),
-            Arc::new(TargetFailure::new(c.clone(), None, anyhow::anyhow!("boom")).with_path(early)),
+            Arc::new(TargetFailure::new(c.clone()).with_path(early)),
         );
         // The shorter edge resolves after the failure was recorded.
         rs.add_dep_for_test(&r, &c)?;
@@ -3067,10 +3323,7 @@ mod tests {
         }
         for c in &culprits {
             rs.add_dep_for_test(&hub, c)?;
-            rs.record_failure(
-                c.clone(),
-                Arc::new(TargetFailure::new(c.clone(), None, anyhow::anyhow!("boom"))),
-            );
+            rs.record_failure(c.clone(), Arc::new(TargetFailure::new(c.clone())));
         }
         assert_eq!(rs.path_passes(), 0, "recording walks nothing");
 
@@ -3331,6 +3584,7 @@ mod tests {
                 addr: "//a:b".into(),
             },
             |error: Option<crate::engine::event::ErrorDetail>| BuildEventKind::ResultEnd {
+                failure: None,
                 duplicate: false,
                 left_behind: None,
                 cancelled: false,

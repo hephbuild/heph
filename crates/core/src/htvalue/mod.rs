@@ -16,19 +16,22 @@ pub enum Value {
     List(Vec<Value>),
 }
 
-/// The most chars [`Value::to_starlark`] writes before it cuts the rest to `…`.
-pub const STARLARK_DISPLAY_CAP: usize = 256;
+/// The most chars [`Value::render`] writes before it cuts the rest to `…`.
+pub const RENDER_CAP: usize = 256;
 
 impl Value {
-    /// The value as a BUILD author would write it — `3`, `["X"]`,
-    /// `{"X": 1}`, `True`, `None` — for an error message, never Rust's
-    /// `Debug` (`Int(3)`). Map keys are sorted, so the text is stable; control
-    /// characters in a string are escaped; a value whose text would pass
-    /// [`STARLARK_DISPLAY_CAP`] chars is cut there with `…`.
-    pub fn to_starlark(&self) -> String {
+    /// The value in JSON notation — `3`, `["X"]`, `{"X": 1}`, `true`, `null`
+    /// — for an error message, never Rust's `Debug` (`Int(3)`). Map keys are
+    /// sorted, so the text is stable; a string is escaped as JSON escapes it,
+    /// plus every other control character, so it never moves a terminal's
+    /// cursor. A float JSON cannot write is `NaN`, `Infinity` or `-Infinity`,
+    /// as JavaScript and JSON5 write it. A value whose text would pass
+    /// [`RENDER_CAP`] chars is cut there with `…`, so the text is JSON only
+    /// when it is short enough.
+    pub fn render(&self) -> String {
         let mut out = String::new();
         // `Err` only means the cap was reached, and `…` already says so.
-        if write_starlark(self, &mut out).is_err() {
+        if write_value(self, &mut out).is_err() {
             debug_assert!(out.ends_with('…'));
         }
         out
@@ -75,7 +78,7 @@ struct Capped;
 /// Push `s` onto `out`, or as much of it as fits under the cap and then `…`.
 fn push_capped(out: &mut String, s: &str) -> Result<(), Capped> {
     let used = out.chars().count();
-    let room = STARLARK_DISPLAY_CAP.saturating_sub(used);
+    let room = RENDER_CAP.saturating_sub(used);
     if s.chars().count() <= room {
         out.push_str(s);
         return Ok(());
@@ -85,22 +88,22 @@ fn push_capped(out: &mut String, s: &str) -> Result<(), Capped> {
     Err(Capped)
 }
 
-fn write_starlark(v: &Value, out: &mut String) -> Result<(), Capped> {
+fn write_value(v: &Value, out: &mut String) -> Result<(), Capped> {
     match v {
-        Value::String(s) => push_capped(out, &starlark_str(s)),
-        Value::Bool(true) => push_capped(out, "True"),
-        Value::Bool(false) => push_capped(out, "False"),
+        Value::String(s) => push_capped(out, &quote_str(s)),
+        Value::Bool(true) => push_capped(out, "true"),
+        Value::Bool(false) => push_capped(out, "false"),
         Value::Int(i) => push_capped(out, &i.to_string()),
         Value::Uint(u) => push_capped(out, &u.to_string()),
-        Value::Float(f) => push_capped(out, &starlark_float(*f)),
-        Value::Null() => push_capped(out, "None"),
+        Value::Float(f) => push_capped(out, &render_float(*f)),
+        Value::Null() => push_capped(out, "null"),
         Value::List(items) => {
             push_capped(out, "[")?;
             for (i, item) in items.iter().enumerate() {
                 if i > 0 {
                     push_capped(out, ", ")?;
                 }
-                write_starlark(item, out)?;
+                write_value(item, out)?;
             }
             push_capped(out, "]")
         }
@@ -112,10 +115,10 @@ fn write_starlark(v: &Value, out: &mut String) -> Result<(), Capped> {
                 if i > 0 {
                     push_capped(out, ", ")?;
                 }
-                push_capped(out, &starlark_str(k))?;
+                push_capped(out, &quote_str(k))?;
                 push_capped(out, ": ")?;
                 if let Some(item) = m.get(k) {
-                    write_starlark(item, out)?;
+                    write_value(item, out)?;
                 }
             }
             push_capped(out, "}")
@@ -123,10 +126,11 @@ fn write_starlark(v: &Value, out: &mut String) -> Result<(), Capped> {
     }
 }
 
-/// `s` as a Starlark string literal: double-quoted, with `"`, `\` and every
-/// control character escaped (`\n`, `\t`, `\x1b`), so it reads as written and
-/// never moves a terminal's cursor.
-pub fn starlark_str(s: &str) -> String {
+/// `s` as a JSON string: double-quoted, with `"`, `\` and every control
+/// character escaped (`\n`, `\t`, `\u001b`), so it reads as written and never
+/// moves a terminal's cursor. JSON requires the escape below U+0020 only;
+/// DEL and the C1 controls get it too, in the same `\uXXXX` form.
+pub fn quote_str(s: &str) -> String {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
@@ -137,11 +141,10 @@ pub fn starlark_str(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\t' => out.push_str("\\t"),
             '\r' => out.push_str("\\r"),
-            c if c.is_control() && c.is_ascii() => {
-                // Writing to a `String` cannot fail.
-                write!(out, "\\x{:02x}", u32::from(c)).unwrap_or_default();
-            }
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
             c if c.is_control() => {
+                // Writing to a `String` cannot fail.
                 write!(out, "\\u{:04x}", u32::from(c)).unwrap_or_default();
             }
             c => out.push(c),
@@ -151,18 +154,15 @@ pub fn starlark_str(s: &str) -> String {
     out
 }
 
-/// A float as Starlark writes one: always with a `.` or an exponent, so it
-/// does not read as an int.
-fn starlark_float(f: f64) -> String {
+/// A float in JSON notation, always with a `.` or an exponent so it does not
+/// read as an int. JSON has no NaN or infinity; they are written as
+/// JavaScript and JSON5 write them, `NaN`, `Infinity` and `-Infinity`, not as
+/// `null`, which would say the value was absent.
+fn render_float(f: f64) -> String {
     if f.is_nan() {
-        "float(\"nan\")".to_owned()
+        "NaN".to_owned()
     } else if f.is_infinite() {
-        if f > 0.0 {
-            "float(\"+inf\")"
-        } else {
-            "float(\"-inf\")"
-        }
-        .to_owned()
+        if f > 0.0 { "Infinity" } else { "-Infinity" }.to_owned()
     } else {
         // `Debug` keeps the `.0` that `Display` drops from a whole float.
         format!("{f:?}")
@@ -175,7 +175,7 @@ pub fn parse_string(v: &Value) -> anyhow::Result<Option<String>> {
         Value::String(s) => Ok(Some(s.clone())),
         v => Err(anyhow::anyhow!(
             "invalid: expected string, got: {}",
-            v.to_starlark()
+            v.render()
         )),
     }
 }
@@ -196,7 +196,7 @@ pub fn parse_strings(v: &Value) -> anyhow::Result<Vec<String>> {
         Value::String(s) => Ok(vec![s.clone()]),
         v => Err(anyhow::anyhow!(
             "invalid: expected string or [string], got: {}",
-            v.to_starlark()
+            v.render()
         )),
     }
 }
@@ -205,7 +205,7 @@ pub fn parse_strings(v: &Value) -> anyhow::Result<Vec<String>> {
 fn map_mismatch(v: &Value) -> anyhow::Error {
     anyhow::anyhow!(
         "invalid: expected string, [string], {{string: string}} or {{string: [string]}} got: {}",
-        v.to_starlark()
+        v.render()
     )
 }
 
@@ -237,13 +237,13 @@ pub fn parse_map_string_map_string_strings(
             .iter()
             .map(|(k, v)| {
                 parse_map_string_strings(v)
-                    .with_context(|| format!("key {}", starlark_str(k)))
+                    .with_context(|| format!("key {}", quote_str(k)))
                     .map(|inner| (k.clone(), inner))
             })
             .collect(),
         v => Err(anyhow::anyhow!(
             "invalid: expected {{string: {{string: [string]}}}} got: {}",
-            v.to_starlark()
+            v.render()
         )),
     }
 }
@@ -270,7 +270,7 @@ pub fn parse_bool(v: &Value) -> anyhow::Result<bool> {
         Value::Bool(b) => Ok(*b),
         _ => Err(anyhow::anyhow!(
             "invalid: expected bool, got: {}",
-            v.to_starlark()
+            v.render()
         )),
     }
 }
@@ -280,7 +280,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn to_starlark_writes_literals() {
+    fn render_writes_json_notation() {
         let v = Value::Map(HashMap::from([
             (
                 "b".to_owned(),
@@ -289,29 +289,75 @@ mod tests {
             ("a".to_owned(), Value::Bool(true)),
             ("c".to_owned(), Value::Null()),
             ("d".to_owned(), Value::Float(1.0)),
+            ("e".to_owned(), Value::Bool(false)),
+            ("f".to_owned(), Value::Map(HashMap::new())),
+            ("g".to_owned(), Value::List(vec![])),
         ]));
+        let text = v.render();
         assert_eq!(
-            v.to_starlark(),
-            r#"{"a": True, "b": ["X", -3, 4], "c": None, "d": 1.0}"#
+            text,
+            r#"{"a": true, "b": ["X", -3, 4], "c": null, "d": 1.0, "e": false, "f": {}, "g": []}"#
         );
-        assert_eq!(s("q\"\\\x1b\n").to_starlark(), r#""q\"\\\x1b\n""#);
-        assert_eq!(
-            Value::Float(f64::INFINITY).to_starlark(),
-            r#"float("+inf")"#
-        );
+        // Under the cap the text is JSON, and reads back as the value.
+        let back: serde_json::Value = serde_json::from_str(&text).expect("JSON");
+        assert_eq!(back["a"], serde_json::Value::Bool(true));
+        assert_eq!(back["c"], serde_json::Value::Null);
+        assert_eq!(back["d"], serde_json::json!(1.0));
     }
 
     #[test]
-    fn to_starlark_cuts_at_the_cap() {
+    fn render_escapes_strings_as_json() {
+        let raw = "q\"\\\x1b\n\t\r\u{8}\u{c}\u{7f}\u{85}é→";
+        let text = s(raw).render();
+        assert_eq!(text, r#""q\"\\\u001b\n\t\r\b\f\u007f\u0085é→""#, "{text}");
+        assert!(!text.chars().any(char::is_control), "{text:?}");
+        let back: String = serde_json::from_str(&text).expect("a JSON string");
+        assert_eq!(back, raw);
+        // A key is quoted as a string is.
+        assert_eq!(
+            Value::Map(HashMap::from([("a\"b".to_owned(), Value::Int(1))])).render(),
+            r#"{"a\"b": 1}"#
+        );
+    }
+
+    /// Finite floats are JSON numbers; NaN and the infinities, which JSON
+    /// cannot write, read as JavaScript writes them rather than as `null`.
+    #[test]
+    fn render_floats() {
+        for (f, want) in [
+            (1.0, "1.0"),
+            (-0.0, "-0.0"),
+            (0.1, "0.1"),
+            (1e300, "1e300"),
+            (1e-7, "1e-7"),
+            (f64::NAN, "NaN"),
+            (f64::INFINITY, "Infinity"),
+            (f64::NEG_INFINITY, "-Infinity"),
+        ] {
+            let text = Value::Float(f).render();
+            assert_eq!(text, want);
+            if f.is_finite() {
+                let back: f64 = serde_json::from_str(&text).expect("a JSON number");
+                assert_eq!(back.to_bits(), f.to_bits(), "{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn render_cuts_at_the_cap() {
         let v = Value::List((0..1000).map(Value::Int).collect());
-        let text = v.to_starlark();
-        assert_eq!(text.chars().count(), STARLARK_DISPLAY_CAP + 1);
+        let text = v.render();
+        assert_eq!(text.chars().count(), RENDER_CAP + 1);
         assert!(text.ends_with('…'));
+        // A string longer than the cap is cut inside it, by chars.
+        let long = s(&"é".repeat(RENDER_CAP * 2)).render();
+        assert_eq!(long.chars().count(), RENDER_CAP + 1);
+        assert!(long.starts_with("\"é") && long.ends_with('…'));
     }
 
     /// F2: no `Int(`/`String(`/`List(` in what a parser says about a value.
     #[test]
-    fn parse_errors_name_values_as_starlark() {
+    fn parse_errors_name_values_in_json_notation() {
         let errs = [
             parse_string(&Value::Int(3)),
             parse_strings(&Value::Map(HashMap::from([(
@@ -334,6 +380,7 @@ mod tests {
         assert!(texts[0].ends_with("got: 3"), "{}", texts[0]);
         assert!(texts[1].ends_with(r#"got: {"X": 1}"#), "{}", texts[1]);
         assert!(texts[2].ends_with(r#"got: ["X"]"#), "{}", texts[2]);
+        assert!(texts[3].ends_with("got: true"), "{}", texts[3]);
     }
 
     fn s(v: &str) -> Value {
@@ -410,7 +457,7 @@ mod tests {
         let outer =
             "invalid: expected string, [string], {string: string} or {string: [string]} got: ";
         let cases: Vec<(Value, String)> = vec![
-            (Value::Bool(true), format!("{outer}True")),
+            (Value::Bool(true), format!("{outer}true")),
             (Value::Int(1), format!("{outer}1")),
             (Value::Uint(1), format!("{outer}1")),
             (Value::Float(1.5), format!("{outer}1.5")),
@@ -421,7 +468,7 @@ mod tests {
             ),
             (
                 map(vec![("k", Value::Bool(false))]),
-                "invalid: expected string or [string], got: False".to_string(),
+                "invalid: expected string or [string], got: false".to_string(),
             ),
             (
                 map(vec![("k", list(vec![Value::Int(3)]))]),
@@ -457,7 +504,7 @@ mod tests {
         let outer =
             "invalid: expected string, [string], {string: string} or {string: [string]} got: ";
         let cases: Vec<(Value, String)> = vec![
-            (Value::Bool(true), format!("{outer}True")),
+            (Value::Bool(true), format!("{outer}true")),
             (Value::Int(1), format!("{outer}1")),
             (list(vec![s("a")]), format!("{outer}[\"a\"]")),
             (

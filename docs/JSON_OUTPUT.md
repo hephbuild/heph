@@ -27,8 +27,9 @@ flags, and any of them exits 2 (see "Commands without JSON").
   one array, a **record-shaped** one (`version`, `inspect failure`,
   `session show`, …) one object. Which of the two a command prints is part of
   its contract: a list with nothing in it is `[]`, and a record with nothing to
-  report is `null` with exit 0 (`inspect failure` of a target that never
-  failed).
+  report is `null` with exit 0 (`inspect failure` of a target with no
+  recorded failure: one that never failed, or one skipped because a
+  dependency failed, since only a culprit keeps a record).
 - **Whitespace.** On a terminal the document is pretty-printed. Piped, a
   record is one compact line, and a list is `[`, then one compact element per
   line, then `]`, so `grep` and `head` work on it line by line. What is printed
@@ -228,7 +229,7 @@ about one command's document: `docs/CODEGEN.md`, `docs/SESSIONS.md`,
 
 `heph run --json` prints one entry per matched target, written as each one
 finishes (completion order, not address order), and one per **culprit**: a
-target or BUILD file whose own failure stopped something the selection asked
+target or source file whose own failure stopped something the selection asked
 for. A culprit the selector did not match is still written, with
 `selected: false`, and always before any record naming it as `root` or
 `root_file`. Any other
@@ -244,28 +245,36 @@ Each record is output contract 2 (`heph version --json` reports
 
 | Field | Default | Meaning |
 |---|---|---|
-| `addr` | yes | the target's address; null for a BUILD file that did not evaluate, whose path is in `file`. Read `.addr // .file` for a name every record has |
-| `file` | yes | the workspace-relative BUILD or `.bzl` file that did not evaluate; null on every other record |
+| `addr` | yes | the target's address; null for a source file that did not evaluate, whose path is in `file`. Read `.addr // .file` for a name every record has |
+| `file` | yes | the workspace-relative source file that did not evaluate, as its provider reported it (the buildfile provider's `d/BUILD`, say); null on every other record |
 | `outcome` | yes | `cached`, `ran`, `failed`, `skipped` or `cancelled` |
-| `cache` | yes | `local`, `remote` or `miss`; null when no cache was consulted (`--force`, caching off, or it failed before the lookup) |
+| `cache` | yes | `local`, `remote` or `miss`; `none` when the target does not cache (`cache = False`) and ran, failed run included; null when no cache was consulted for another reason (`--force`, or it failed before its run) |
 | `remote` | yes | the name of the remote cache a `remote` hit came from; null otherwise |
 | `duration_ms` | yes | from the start of its resolution to its end |
 | `exit_code` | yes | its process's exit code: 0 for `ran`, the code for a `failed` run; null when nothing ran or a signal ended it. Read from the run's structured exit status, never parsed out of the error text |
 | `timed_out` | yes | it failed because its run outlasted its `timeout` |
 | `error` | yes | why it failed, on one line; null on success and on `skipped`. Its wording is not contract |
 | `root` | yes | the culprit, when it is a target: on a failed culprit, the record itself; on `skipped`, the nearest culprit it depends on. Always an address. Null when the culprit is a file (`root_file` names it), and for `ran`, `cached` and `cancelled` |
-| `root_file` | yes | the culprit, when it is a BUILD or `.bzl` file that did not evaluate: on the file's own record, its `file`; on `skipped`, the nearest culprit it depends on. Always a workspace-relative path. Null when the culprit is a target, and for `ran`, `cached` and `cancelled`. Exactly one of `root` and `root_file` is set on a `failed` or `skipped` record that has a culprit, as `addr` and `file` are on every record |
+| `root_file` | yes | the culprit, when it is a source file that did not evaluate: on the file's own record, its `file`; on `skipped`, the nearest culprit it depends on. Always a workspace-relative path. Null when the culprit is a target, and for `ran`, `cached` and `cancelled`. Exactly one of `root` and `root_file` is set on a `failed` or `skipped` record that has a culprit, as `addr` and `file` are on every record |
 | `more` | yes | on `skipped`: how many culprits other than its own it also reaches; null elsewhere |
-| `path` | yes | on a failed culprit: a shortest chain of addresses from a requested target down to it (see below for when it can differ between runs). On `skipped`: from this target down to the address its culprit was recorded at. Inclusive at both ends and never elided; null elsewhere |
+| `path` | yes | on a failed culprit: a shortest chain of addresses from a requested target down to it (see below for when it can differ between runs). On `skipped`: from this target down to the address its culprit was recorded at. Inclusive at both ends; a culprit's is never elided, a skipped record's is elided as the text box elides one (see below); null elsewhere. **Not contiguous when `path_elided` is present**: the gap sits after the second element, so the second and third are not an edge |
+| `path_elided` | yes | on a `skipped` record whose `path` was elided: how many addresses were left out of its middle; absent otherwise |
 | `selected` | yes | the selector matched it. False only on a culprit written because something selected depends on it; a `file` record is never selected |
 | `failure` | yes | `{log, out, fixes}`, as `heph inspect failure`; null unless it failed running |
+| `stage` | yes | on a failed culprit (a target or a file record): the stage of the build that raised it, `eval`, `spec`, `parse`, `link`, `run`, `cache`, `config` or `cli`; null elsewhere |
+| `location` | yes | on a failed culprit: `{file, line, col}`, where in a source file it was raised, `file` workspace-relative; null when it names no place, and elsewhere |
+| `hints` | yes | on a failed culprit: `[{kind, text}]`, what can be done about it; `kind` is `did_you_mean`, `valid_values`, `declare_tool`, `see_log` or `other`, and `text` is not contract. Empty elsewhere |
+| `truncated` | yes | on a failed culprit: a cap cut something from its record (the message, its causes, a source line); false elsewhere |
+| `log_replaced` | yes | on a failed culprit: a newer failed run filled its failure slot again, so the slot's log is no longer this failure's; false elsewhere |
+| `streamed` | yes | on a failed culprit: its run's output reached a terminal as it ran; false elsewhere |
 | `outputs` | no | its output files, the set `--list-out` prints, narrowed by `--output`. Its tier is *free* (no spec, def or hash is added), but selecting it costs what `--list-out` does: a remote hit's outputs are downloaded, which the default fields never do. That is why it is not a default |
 | `hashin` | no (built) | its input hash |
 
 How the outcome is decided:
 
 - `cached`: no process ran; the result came from a cache (`cache` says which).
-- `ran`: it ran and succeeded (`cache: miss`, or null under `--force`). A
+- `ran`: it ran and succeeded (`cache: miss`, `none` for a `cache = False`
+  target, or null under `--force`). A
   cache hit whose blobs turned out to be gone is rebuilt, and reads as a miss.
 - `failed`: its own run failed, or resolving it did (parse, hash, sandbox).
 - `skipped`: it did not run because a culprit it depends on failed (`root`
@@ -277,6 +286,32 @@ To find what broke, read the culprits' own records: they are the
 `outcome: "failed"` ones, and `select(.outcome == "failed") | .addr // .file`
 names each. On a culprit's record `.path` is how the selection reached it.
 `.root // .root_file` is a skipped record's culprit.
+
+**The text lines and their fields.** What a run without `--json` prints on
+stderr (`docs/FAILURE_OUTPUTS.md`) maps onto the records as below. The
+wording of a line is not contract; its field is.
+
+| Text on stderr | In `--json` |
+|---|---|
+| a failure box's header, `✗ //p:t` (or `✗ d/BUILD`) | a record with `outcome: "failed"`, named by `.addr // .file` |
+| the one line of a failure told after its streamed output, `✗ //t · exit status 1 · heph log //t` | the same record, with `streamed: true` |
+| the box's message | `error` |
+| its source excerpt (`d/BUILD:4:5`) | `location` |
+| a hint row | `hints[].text`, with its `kind` |
+| `exit status: 1`, `timed out after 1s (its timeout)` | `exit_code`, `timed_out` |
+| `reached by: //a:root → //p:mid → //p:t` | `path` |
+| `took down: //a:x, //a:y +3 more` | the `skipped` records whose `root` (or `root_file`) is this culprit: those of matched targets only, where the row may also name a dependency between them |
+| `(output not shown here: N lines · heph log //p:t)` | `streamed: true` |
+| `log replaced by a newer failed run` | `log_replaced: true` |
+| `full log:`, `outputs:`, `fixes written:` | `failure.log`, `failure.out`, `failure.fixes` |
+| `log: heph log //p:t` | the command itself; `failure.log` is the path |
+| `– //a:root skipped: //c:y failed` | a record with `outcome: "skipped"`, `root: "//c:y"` |
+| `stopped by --fail-fast: …` | the list is left open, without its `]` |
+| the last line, `2 failed: //c:y, d/BUILD +3 more (…) · 4 skipped` | `[.[] \| select(.outcome == "failed")]` and its `length`; the skipped count is the number of `skipped` records |
+| `! selection incomplete …` | the list is left open |
+
+The totals line names at most five culprits, each cut to 120 columns, then
+`+N more`; `--json` has every one.
 
 **Skipped records are a closing batch.** They come from one pass over the
 dependency graph at the end of the request, so they are all written once the
@@ -305,12 +340,16 @@ the last edge: `//c:y depends on //d:t, which this file defines`. Its wording,
 the elided middle of a long path included (`… 3 more (--json has the full
 path) …`), is not contract: read `path` here, not the box.
 
-Skipped records arrive only at request end, and a skipped record's `path` is
-the full chain, so the output grows with chain depth × skipped count: for one
-deep selected chain, with the square of its depth.
+Skipped records arrive only at request end. A skipped record's `path` is
+elided by the box's rule: a path of more than five addresses keeps this
+target, the first hop and the last two, and `path_elided` says how many it
+left out (`["//a:n000", "//a:n001", "//a:n499", "//a:leaf"]` with
+`path_elided: 497`). So the output grows with the skipped count, not with
+chain depth × skipped count. The culprit's own record carries its path
+whole, which is the one to read for the full chain.
 
-**A broken BUILD file reached by address.** A selection of addresses only
-(`heph run //d:t1 //d:t2`) whose BUILD file does not evaluate gets the file's
+**A broken source file reached by address.** A selection of addresses only
+(`heph run //d:t1 //d:t2`) whose source file (`d/BUILD`) does not evaluate gets the file's
 record, `failed`, then a `skipped` record for each address, and a closed list;
 the run exits 1 through the failure path, with the file's failure box.
 Contract 1 reported that as a gap in the selection (a skipped package, the
@@ -328,18 +367,20 @@ does not evaluate still leaves that package a gap.
 - A culprit the selector did not match is now written, with
   `selected: false`. A consumer that wants only what it asked for filters on
   `.selected`.
-- A BUILD file that did not evaluate is a record with `addr: null` and `file`
+- A source file that did not evaluate is a record with `addr: null` and `file`
   set. Name a record with `.addr // .file`.
 - Skipped records are written at the end of the request, as a closing batch,
   not as each target is given up, and carry `error: null`. A reader that
   stops early (`first(select(.outcome == "failed"))`, `head -1` on `--jq`)
   misses them.
-- An address-only selection that hits a BUILD file that does not evaluate
+- An address-only selection that hits a source file that does not evaluate
   fails through the failure path (exit 1, a closed list), where it reported
   a selection gap.
 - `heph inspect failure --json`'s `addr`, `hashin` and `failed_at` are
-  nullable. Each is always set today; a reader that indexes them must accept
-  `null`.
+  nullable: `addr` is `null` on a source file's record (its path is in
+  `file`), and `hashin` and `failed_at` on every failure before the run. A
+  reader that indexes them must accept `null`. See `heph inspect failure`
+  below.
 - A cancelled command (Ctrl-C, SIGTERM or SIGHUP) exits 130, also when a
   failure had already failed it. It exited 1. A cancel that `--fail-fast` made
   after a failure is not a user's, and exits 1.
@@ -379,6 +420,44 @@ terminal, so with `--json`, `--fields` or `--jq` they exit 2 at parse time.
 it has no entry to report: `heph run <entrypoint> --json` is refused once the
 selector resolves, before anything runs, naming the target. It is a usage
 error, exit 2, like the flags refused at parse time.
+
+### `heph inspect failure`
+
+`heph inspect failure <addr> --json` prints one record: a culprit's last
+recorded failure and where its slot kept each part (`docs/FAILURE_OUTPUTS.md`
+has the example).
+
+| Field | Meaning |
+|---|---|
+| `addr` | the target's address; null on a source file's record |
+| `file` | the workspace-relative file that did not evaluate; null on a target's record |
+| `slot` | the failure slot's directory, absolute |
+| `stage` | `eval`, `spec`, `parse`, `link`, `run`, `cache`, `config` or `cli`; never null. Synthetic on a slot from an older heph, which kept no record: `run` when the target ran, else `eval` |
+| `message` | what went wrong, on one line; never null. Its wording is not contract. Synthetic on a slot from an older heph: `no diagnostic kept (the slot is from an older heph)` |
+| `location` | `{file, line, col}` in a source file; null when it names no place |
+| `hints` | `[{kind, text}]`; a hint's wording is not contract |
+| `truncated` | a cap cut something from the record |
+| `hashin` | the input hash of the run that failed; null for a failure before the run |
+| `failed_at` | when it failed, ms since the Unix epoch; null for a failure before the run |
+| `log` | the run's full process log; null when it kept none, and for a failure before the run |
+| `log_lines` | how many lines `log` holds (0 for a run that printed nothing); null with no log |
+| `log_replaced` | a newer failed run filled the slot again while it was read |
+| `out` | the `failure_out` matches; null when none matched |
+| `fixes` | the list of files an `in_place` write-back changed; null when none |
+
+`heph inspect failure //d:t` for a target whose source file did not evaluate
+answers with the file's record: `addr` null, `file` `d/BUILD`. It answers for
+culprits only: for a target skipped because a dependency failed it prints
+`null` (exit 0), as for one that never failed. The run's own `--json` carries
+the skipped target's `root` and `path`.
+
+### `heph query` on a broken source file
+
+`heph query <addr> --json`, naming one address, on a target whose source
+file does not evaluate prints `[]`, a closed list, and exits 1 with
+the file's failure box on stderr, as `heph run` does. It does not report a
+selection gap: the address named one package, and that package's file is the
+culprit.
 
 ### Commands without JSON
 

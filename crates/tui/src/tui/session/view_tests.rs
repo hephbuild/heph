@@ -56,6 +56,7 @@ fn ev(at: u64, kind: BuildEventKind) -> BuildEvent {
 
 fn result_end(addr: &str, error: Option<&str>) -> BuildEventKind {
     BuildEventKind::ResultEnd {
+        failure: None,
         duplicate: false,
         upstream_file: None,
         path: Vec::new(),

@@ -29,8 +29,8 @@ use heph::htmatcher::Matcher;
 use heph::htpkg::PkgBuf;
 use heph::pluginexec;
 use heph::pluginstatictarget::Target;
-use hplugin::diagnostic::{Boundary, Stage, innermost_stage_frame};
-use hplugin::error::{CancelledError, Culprit, CycleError, MissingDep, TargetFailure};
+use hplugin::diagnostic::{Boundary, Stage};
+use hplugin::error::{CancelledError, Culprit, MissingDep, TargetFailure};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -58,9 +58,20 @@ impl Run {
             .unwrap_or_else(|| panic!("no failure of {c}:\n{}", self.describe()))
     }
 
-    /// `c`'s recorded path, formatted.
+    /// `c`'s recorded path, formatted. Its compacted record names the same
+    /// culprit, entry and path: the record is the failure's, not a
+    /// placeholder, and the request-end path pass moves both.
     fn path(&self, c: &str) -> Vec<String> {
-        self.failure(c).path.iter().map(Addr::format).collect()
+        let f = self.failure(c);
+        let path: Vec<String> = f.path.iter().map(Addr::format).collect();
+        let rec = &f.record;
+        assert_eq!(rec.path, path, "{c}'s record path");
+        assert_eq!(rec.entry, f.addr.format(), "{c}'s record entry");
+        match &f.file {
+            Some(file) => assert_eq!(rec.file.as_deref(), Some(&**file), "{c}'s record file"),
+            None => assert_eq!(rec.addr.as_deref(), Some(c), "{c}'s record culprit"),
+        }
+        path
     }
 
     /// Skipped `a`'s `(root, path, more)` from the request-end pass.
@@ -111,7 +122,14 @@ impl Run {
     fn describe(&self) -> String {
         self.failures
             .iter()
-            .map(|f| format!("{} (addr {}): {:#}", f.culprit(), f.addr.format(), f.source))
+            .map(|f| {
+                format!(
+                    "{} (addr {}): {:#}",
+                    f.culprit(),
+                    f.addr.format(),
+                    crate::common::failure_text(f)
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -182,10 +200,20 @@ async fn run(engine: &Arc<Engine>, a: &str) -> Run {
     r
 }
 
-/// The [`MissingDep`] on a recorded failure, or a panic.
-fn missing_dep(f: &TargetFailure) -> &MissingDep {
-    downcast_chain_ref::<MissingDep>(&f.source)
-        .unwrap_or_else(|| panic!("a MissingDep on {:#}", f.source))
+/// The [`MissingDep`] a recorded failure's record holds (its typed
+/// `missing_dep`), or a panic. The record holds no error chain (D7b), so the
+/// facts are its own fields, not read back from its message.
+fn missing_dep(f: &TargetFailure) -> MissingDep {
+    let m = f
+        .record
+        .missing_dep
+        .as_ref()
+        .unwrap_or_else(|| panic!("a missing_dep on {:?}", f.record));
+    MissingDep {
+        dep: addr(&m.dep),
+        declarer: addr(&m.declarer),
+        origin_id: m.origin_id.clone(),
+    }
 }
 
 /// A BUILD-file workspace: `files` is `(package, content)`.
@@ -585,17 +613,18 @@ async fn deep_missing_dep_blames_declarer() -> anyhow::Result<()> {
 }
 
 /// PR 1's interim text: before targets carry a source location, the
-/// `MissingDep` names the declarer's BUILD file from its package.
+/// `MissingDep` names the declarer's package (U27: the engine names no
+/// provider's file kind).
 #[tokio::test]
-async fn missing_dep_interim_text_names_build_file() -> anyhow::Result<()> {
+async fn missing_dep_interim_text_names_the_package() -> anyhow::Result<()> {
     let ws = chain_to_c(r#"deps = ["//d:missing"]"#, &[("d", D_PRESENT)]);
     let r = run(&ws.engine, "//a:root").await;
-    let text = format!("{:#}", r.assert_blames("//c:y").source);
+    let text = crate::common::failure_text(r.assert_blames("//c:y"));
     assert!(
         text.contains("//c:y depends on //d:missing, which does not exist"),
         "{text}"
     );
-    assert!(text.contains("the BUILD file in c/"), "{text}");
+    assert!(text.contains("(`deps`, declared in package //c)"), "{text}");
     Ok(())
 }
 
@@ -778,11 +807,8 @@ async fn deep_bad_option_blames_the_target() -> anyhow::Result<()> {
     ]);
     let r = run(&ws.engine, "//app:bin").await;
     let f = r.assert_blames("//lib:b");
-    assert!(
-        format!("{:#}", f.source).contains("enviroment"),
-        "{:#}",
-        f.source
-    );
+    let text = crate::common::failure_text(f);
+    assert!(text.contains("enviroment"), "{text}");
     Ok(())
 }
 
@@ -835,11 +861,8 @@ async fn deep_parse_error_blames_the_input() -> anyhow::Result<()> {
     )?;
     let r = run(&ws.engine, "//f:root").await;
     let f = r.assert_blames("//f:l3");
-    assert!(
-        format!("{:#}", f.source).contains("injected error at parse //f:l3"),
-        "{:#}",
-        f.source
-    );
+    let text = crate::common::failure_text(f);
+    assert!(text.contains("injected error at parse //f:l3"), "{text}");
     Ok(())
 }
 
@@ -856,10 +879,10 @@ async fn deep_apply_transitive_error_blames_the_input() -> anyhow::Result<()> {
     )?;
     let r = run(&ws.engine, "//f:root").await;
     let f = r.assert_blames("//f:l3");
+    let text = crate::common::failure_text(f);
     assert!(
-        format!("{:#}", f.source).contains("injected error at apply_transitive //f:l3"),
-        "{:#}",
-        f.source
+        text.contains("injected error at apply_transitive //f:l3"),
+        "{text}"
     );
     Ok(())
 }
@@ -886,7 +909,8 @@ async fn deep_unknown_driver_blames_the_input() -> anyhow::Result<()> {
     })?;
     let r = run(&ws.engine, "//f:root").await;
     let f = r.assert_blames("//f:l3");
-    assert!(format!("{:#}", f.source).contains("nope"), "{:#}", f.source);
+    let text = crate::common::failure_text(f);
+    assert!(text.contains("nope"), "{text}");
     Ok(())
 }
 
@@ -905,11 +929,16 @@ async fn transitive_dep_spec_error_blames_the_dep() -> anyhow::Result<()> {
     )?;
     let r = run(&ws.engine, "//f:l2").await;
     let f = r.assert_blames("//f:l3");
-    let frame = innermost_stage_frame(&f.source)
-        .unwrap_or_else(|| panic!("a StageFrame on {:#}", f.source));
-    assert_eq!(frame.boundary, Boundary::GetSpec);
-    assert_eq!(frame.stage(), Stage::Spec);
-    assert_eq!(frame.addr.format(), "//f:l3");
+    // The innermost stage frame (`get_spec //f:l3`) is the record's
+    // boundary, and its stage.
+    assert_eq!(
+        f.record.boundary.as_deref(),
+        Some(Boundary::GetSpec.as_str()),
+        "{:?}",
+        f.record
+    );
+    assert_eq!(f.record.diagnostic.stage, Stage::Spec, "{:?}", f.record);
+    assert_eq!(f.record.addr.as_deref(), Some("//f:l3"));
     Ok(())
 }
 
@@ -968,7 +997,9 @@ async fn d1b_attribution_output_group() -> anyhow::Result<()> {
 // ---------------------------------------------------------------------------
 
 /// D1.c: a `CycleError` under an `InputDefFailed` is still a cycle,
-/// propagated as itself, never recorded as a target's failure.
+/// propagated through the cycle's frames as itself: no target in it is
+/// blamed for an input's def. It is reported once (D8, GRAPH-07), as the
+/// requested target's own failure.
 #[tokio::test]
 async fn cycle_under_input_def_is_a_cycle_not_a_failure() -> anyhow::Result<()> {
     let ws = build_ws(&[
@@ -977,12 +1008,12 @@ async fn cycle_under_input_def_is_a_cycle_not_a_failure() -> anyhow::Result<()> 
         ("c", &t("y", r#"deps = ["//b:x"]"#)),
     ]);
     let r = run(&ws.engine, "//a:root").await;
-    let err = r.err.as_ref().expect("failed");
-    assert!(
-        downcast_chain_ref::<CycleError>(err).is_some(),
-        "a cycle: {err:#}"
-    );
-    assert!(r.failures.is_empty(), "nothing recorded:\n{}", r.describe());
+    let [f] = r.failures.as_slice() else {
+        panic!("one record:\n{}", r.describe());
+    };
+    assert_eq!(f.culprit().to_string(), "//a:root", "{}", r.describe());
+    let text = crate::common::failure_text(f);
+    assert!(text.contains("cyclic dependency"), "a cycle: {text}");
     Ok(())
 }
 
@@ -1298,11 +1329,10 @@ async fn two_entries_into_one_broken_file_blame_the_file() -> anyhow::Result<()>
 /// first member only, so the box and `--json`'s `error` say the file's
 /// diagnostic once, not once per entry under the consumer's frame.
 fn assert_file_diagnostic_once(f: &TargetFailure) {
-    let text = format!("{:#}", f.source);
+    let text = crate::common::failure_text(f);
     assert_eq!(text.matches("fail: boom").count(), 1, "{text}");
-    assert!(!text.contains("errors:"), "{text}");
-    let frames = hplugin::diagnostic::cause_frames(&f.source).join(": ");
-    assert_eq!(frames.matches("fail: boom").count(), 1, "{frames}");
+    // Not an aggregate: no `N errors` frame, no causes.
+    assert!(f.record.causes.is_empty(), "{text}");
 }
 
 /// D1.f: `//top:t`'s two inputs live in one `d/BUILD` that fails at
@@ -1499,10 +1529,7 @@ async fn failure_report_cost_20k() -> anyhow::Result<()> {
         rs.mark_requested(r);
     }
     for c in &culprits {
-        rs.record_failure(
-            c.clone(),
-            Arc::new(TargetFailure::new(c.clone(), None, anyhow::anyhow!("boom"))),
-        );
+        rs.record_failure(c.clone(), Arc::new(TargetFailure::new(c.clone())));
     }
     let started = std::time::Instant::now();
     let failures = rs.take_failures();
@@ -1549,15 +1576,15 @@ async fn deep_chain_error_size_is_constant() -> anyhow::Result<()> {
         let r = run(&ws.engine, "//a:n000").await;
         let f = r.assert_blames("//a:leaf");
         (
-            format!("{:#}", f.source).len(),
-            f.source.chain().count(),
+            crate::common::failure_text(f).len(),
+            f.record.text_len(),
             r.path("//a:leaf"),
         )
     }
-    let (shallow_len, shallow_chain, shallow_path) = recorded(5).await;
-    let (deep_len, deep_chain, deep_path) = recorded(500).await;
-    assert_eq!(deep_len, shallow_len, "Display size");
-    assert_eq!(deep_chain, shallow_chain, "chain length");
+    let (shallow_len, shallow_record, shallow_path) = recorded(5).await;
+    let (deep_len, deep_record, deep_path) = recorded(500).await;
+    assert_eq!(deep_len, shallow_len, "message size");
+    assert_eq!(deep_record, shallow_record, "record size");
     assert_eq!(shallow_path.len(), 6);
     assert_eq!(deep_path.len(), 501, "the path is the full chain");
     Ok(())

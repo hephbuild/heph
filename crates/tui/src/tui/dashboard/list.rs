@@ -1179,6 +1179,7 @@ mod tests {
         apply(
             &mut m,
             BuildEventKind::ResultEnd {
+                failure: None,
                 duplicate: false,
                 upstream_file: None,
                 path: Vec::new(),

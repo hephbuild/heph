@@ -71,6 +71,7 @@ fn events() -> Vec<BuildEvent> {
         ev(
             5,
             BuildEventKind::ResultEnd {
+                failure: None,
                 duplicate: false,
                 upstream_file: None,
                 path: Vec::new(),
@@ -93,6 +94,7 @@ fn big_event() -> BuildEvent {
     BuildEvent {
         at_unix_ms: 1,
         kind: BuildEventKind::ResultEnd {
+            failure: None,
             duplicate: false,
             upstream_file: None,
             path: Vec::new(),

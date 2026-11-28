@@ -977,22 +977,30 @@ async fn tail_is_last_1000_of_1500_lines() -> anyhow::Result<()> {
                 addr,
                 exit_status,
                 log_tail,
+                failure,
                 ..
             } = ev.kind
                 && addr == "//p:f"
             {
-                ends.push((exit_status, log_tail));
+                assert!(log_tail.is_none(), "the end names the log, never its text");
+                ends.push((exit_status, failure.and_then(|f| f.log)));
             }
         }
     };
     tokio::time::timeout(std::time::Duration::from_secs(60), collect)
         .await
         .map_err(|_elapsed| anyhow::anyhow!("the request's stream never ended"))?;
-    let [(exit_status, log_tail)] = ends.as_slice() else {
+    let [(exit_status, log)] = ends.as_slice() else {
         panic!("one ResultEnd for //p:f, got {}", ends.len());
     };
     assert_eq!(exit_status.as_deref(), Some("exit status: 3"));
-    let tail = log_tail.as_ref().expect("the log's tail");
+    let log = log.as_ref().expect("the record names the log");
+    let tail = hcore::failure_log::read_tail(
+        log,
+        Engine::DEFAULT_LOG_TAIL_LINES,
+        hcore::failure_log::TAIL_MAX_BYTES,
+    )
+    .expect("the log's tail, from the slot");
     let lines: Vec<&str> = tail.text.lines().collect();
     assert_eq!(
         lines.len(),
@@ -1003,7 +1011,6 @@ async fn tail_is_last_1000_of_1500_lines() -> anyhow::Result<()> {
     assert_eq!(lines.last(), Some(&"to-stderr"));
     assert_eq!(lines.first(), Some(&"line 501"));
     assert_eq!(tail.start_line, 501);
-    assert!(!tail.streamed, "nothing reached a terminal");
     Ok(())
 }
 

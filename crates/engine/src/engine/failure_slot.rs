@@ -3,7 +3,8 @@
 //! When a target's run fails, the engine copies the log the driver returned
 //! (its `Log` failure artifact, [`hplugin::error::failure_log`]) into
 //! `<home>/failures/<addr-key>/`: a `log.txt`, and a `manifest.json` written
-//! **last** naming the address, the revision and when it failed. The failure box
+//! **last** naming the address, the revision (none for a failure before the
+//! run), when it failed and the fill's own id (P12). The failure box
 //! renders the tail from the copy and points at it (`full log: <path>`).
 //!
 //! When the run kept `failure_out` matches (the managed layer packed them into
@@ -42,6 +43,14 @@
 //!   lock, and when its next run starts, under its execute lock. To keep a warm
 //!   run free of a syscall per target, an engine lists `failures/` once and
 //!   clears only the slots it saw or filled.
+//! - **A slot for every fresh claim** ([`write_claim`]). The claim's
+//!   compacted record is written as `diagnostic.json`: into the slot the run
+//!   filled, under that fill's id, or into a slot of its own (manifest and
+//!   `diagnostic.json`, no revision) for a failure that kept nothing — one
+//!   before the run, or a source file that did not evaluate (keyed by
+//!   [`file_key`]). In the background, counted on the request's `bg_pending`;
+//!   a fill or a clear of the same slot waits for it. Not for credential
+//!   material, nor for a record another request surfaced.
 //! - **No log for credential material.** A target whose outputs are material
 //!   gets its tail read into memory instead; its `failure_out` matches still
 //!   get an `out/` (what a target lists there is its author's to judge).
@@ -49,21 +58,23 @@
 //!   error surfaces as it would have.
 
 use crate::engine::driver::outputartifact::{Content, OutputArtifact, Type as ArtifactType};
+use crate::engine::sandbox_cleaner::PendingCounter;
 use hmodel::htaddr::Addr;
 use hplugin::error::{FailureLog, LogTail};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// The directory under the home that holds every slot.
 pub(crate) const FAILURES_DIR: &str = "failures";
 /// Name prefix of a slot being built or being discarded. A key never starts
 /// with a dot, so no key is ever taken for one.
 pub(crate) const TEMP_PREFIX: &str = ".tmp-";
-const MANIFEST: &str = "manifest.json";
 /// The kept log, inside a slot.
-pub const LOG: &str = "log.txt";
+pub use hcore::failure_log::LOG;
+use hcore::failure_log::{DIAGNOSTIC, MANIFEST};
 /// The kept `failure_out` matches, inside a slot, by workspace-relative path.
 pub const OUT: &str = "out";
 /// Every path a failed `in_place` run wrote back over the tree, one per line,
@@ -98,15 +109,35 @@ pub fn addr_key(addr: &Addr) -> String {
         field(v);
     }
     let digest = h.digest128();
+    key_name(
+        addr.package
+            .as_str()
+            .chars()
+            .chain(std::iter::once(':'))
+            .chain(addr.name.chars()),
+        digest,
+    )
+}
 
+/// The prefix of a source file's slot address in its manifest: the slot of the
+/// file at workspace-relative `rel` names `file:<rel>`.
+pub const FILE_ADDR_PREFIX: &str = "file:";
+
+/// The directory name of the slot of the source file at workspace-relative
+/// `rel`, which a provider reported as not evaluating: as [`addr_key`], over `file:<rel>`. Its
+/// digest never meets an address's: an address's starts with a length, and
+/// `file:` read as one is far past any name.
+pub fn file_key(rel: &str) -> String {
+    let mut h = xxhash_rust::xxh3::Xxh3::new();
+    h.update(FILE_ADDR_PREFIX.as_bytes());
+    h.update(rel.as_bytes());
+    key_name(FILE_ADDR_PREFIX.chars().chain(rel.chars()), h.digest128())
+}
+
+/// A slot's directory name: the readable part `chars` gives, then `digest`.
+fn key_name(chars: impl Iterator<Item = char>, digest: u128) -> String {
     let mut readable = String::with_capacity(READABLE_MAX);
-    for c in addr
-        .package
-        .as_str()
-        .chars()
-        .chain(std::iter::once(':'))
-        .chain(addr.name.chars())
-    {
+    for c in chars {
         if readable.len() >= READABLE_MAX {
             break;
         }
@@ -127,9 +158,22 @@ pub struct SlotManifest {
     /// The full address, variant included — the only place a reader takes it
     /// from; the directory name is not parsed.
     pub addr: String,
-    pub hashin: String,
+    /// The run's revision; `None` for a failure before the run, which has
+    /// none, and for an invocation, which is never hashed.
+    #[serde(default)]
+    pub hashin: Option<String>,
     /// Milliseconds since the Unix epoch.
     pub failed_at: u64,
+    /// This fill's id, a uuid minted per fill (P12): what a record's log
+    /// reference is compared against to tell the slot was since replaced.
+    /// `None` in a slot from an older heph. Never hashed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fill_id: Option<String>,
+    /// For a source file's slot (`addr` is `file:<path>`): the packages whose
+    /// targets were reached through it, so `inspect failure //d:t` finds the
+    /// file's slot when `//d:t` has none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub packages: Vec<String>,
 }
 
 /// The engine's record of a failure's log on the error chain: what
@@ -142,6 +186,11 @@ pub struct FailureSlot {
     pub log: Option<FailureLog>,
     /// The slot's `out/`, when the run's `failure_out` matches were kept.
     pub out: Option<PathBuf>,
+    /// What `out` holds at the target's package, grouped ([`kept_groups`]):
+    /// counted once here, so no renderer walks the slot.
+    pub kept: Vec<hcore::events::KeptGroup>,
+    /// How many groups past `kept` were left out.
+    pub kept_more: u32,
     /// Why the run's `failure_out` matches were not kept, when keeping them
     /// failed: the target's error carries it as one context line.
     pub out_error: Option<String>,
@@ -160,6 +209,21 @@ pub struct FailureSlot {
     ///
     /// [`TerminalUse`]: crate::engine::TerminalUse
     pub streamed: bool,
+    /// The run itself went fine and a step past it failed (hashing its
+    /// artifacts, checking the host paths it declared): the record is
+    /// [`FailedIn::AfterRun`](hcore::failure::FailedIn::AfterRun), so a run
+    /// that streamed still gets its box (D6.1c). Set by the engine
+    /// ([`after_run`](Self::after_run)), never by the fill.
+    pub after_run: bool,
+    /// The id of the fill that put the slot in place, when one did: what the
+    /// failure's record names its log by ([`hcore::failure::LogRef`]).
+    pub fill_id: Option<String>,
+    /// How many lines the slot's `log.txt` has, counted after the copy; 0
+    /// with no log on disk.
+    pub log_lines: u64,
+    /// The target's outputs are credential material ([`Fill::material`]):
+    /// the claim's `diagnostic.json` is not written for it.
+    pub material: bool,
 }
 
 impl FailureSlot {
@@ -174,6 +238,13 @@ impl FailureSlot {
     #[must_use]
     pub fn with_streamed(mut self, streamed: bool) -> Self {
         self.streamed = streamed;
+        self
+    }
+
+    /// The same slot, saying the failure came past a run that went fine.
+    #[must_use]
+    pub fn after_run(mut self) -> Self {
+        self.after_run = true;
         self
     }
 }
@@ -246,6 +317,11 @@ pub(crate) struct Fill<'a> {
     /// invocation, which is never logged (R22): its slot holds `out/` only,
     /// whatever its driver attached.
     pub keep_log: bool,
+    /// What the run's record is scrubbed of. A material run's memory tail
+    /// is scrubbed of it *before* it is cut to the record's cap (H-M1): a
+    /// cut first could leave a secret's suffix at the tail's head, where no
+    /// later scrub recognises it.
+    pub scrub: crate::engine::failure_record::Scrub,
 }
 
 /// The slots of one home, as one engine sees them.
@@ -254,8 +330,52 @@ pub struct FailureSlots {
     /// Slot names this engine knows exist: what `failures/` held when it was
     /// first listed, plus the slots filled since. Listed on first use.
     known: tokio::sync::OnceCell<std::sync::Mutex<HashSet<String>>>,
+    /// Of the known slots, each source file's (`file:` manifests): the
+    /// packages it lists. Filled with `known`; a target of one of those
+    /// packages resolving means the file evaluated again, and its slot is
+    /// cleared with the target's ([`clear`](Self::clear)).
+    file_packages: std::sync::Mutex<HashMap<String, Vec<String>>>,
+    /// Claim writes ([`write_claim`]) registered and not yet done.
+    writes: PendingCounter,
+    /// One exclusion per slot key, held by a fill, a claim write or a clear
+    /// while it changes that slot: a clear or a fill never lands under a
+    /// claim write registered before it. The entries no one holds are pruned
+    /// when the map outgrows twice what it held after the last prune
+    /// (FQ-1): amortized O(1) per lookup, where pruning on every lookup was
+    /// O(n) each and O(n²) over a burst of failures.
+    slot_locks: std::sync::Mutex<SlotLocks>,
     #[cfg(any(test, feature = "test-support"))]
     fills: std::sync::atomic::AtomicU64,
+}
+
+/// The slot exclusions ([`FailureSlots::slot_lock`]): one per key, the ones
+/// no one holds pruned once the map doubles past its last pruned size.
+#[derive(Default)]
+struct SlotLocks {
+    map: HashMap<String, Arc<tokio::sync::Mutex<()>>>,
+    /// The size past which the next lookup prunes.
+    prune_at: usize,
+    /// How many entries the prunes walked, in all.
+    #[cfg(test)]
+    walked: usize,
+}
+
+impl SlotLocks {
+    /// The fewest entries a prune waits for.
+    const PRUNE_MIN: usize = 64;
+
+    /// The exclusion of `key`, pruning first when the map is due.
+    fn get(&mut self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
+        if self.map.len() >= self.prune_at.max(Self::PRUNE_MIN) {
+            #[cfg(test)]
+            {
+                self.walked += self.map.len();
+            }
+            self.map.retain(|_, l| Arc::strong_count(l) > 1);
+            self.prune_at = self.map.len().saturating_mul(2);
+        }
+        Arc::clone(self.map.entry(key.to_owned()).or_default())
+    }
 }
 
 impl fmt::Debug for FailureSlots {
@@ -271,9 +391,36 @@ impl FailureSlots {
         Self {
             root: home.join(FAILURES_DIR),
             known: tokio::sync::OnceCell::new(),
+            file_packages: std::sync::Mutex::default(),
+            writes: PendingCounter::default(),
+            slot_locks: std::sync::Mutex::default(),
             #[cfg(any(test, feature = "test-support"))]
             fills: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Resolve once every claim write registered so far is done. For tests:
+    /// a claim's `diagnostic.json` lands in the background.
+    pub async fn writes_drained(&self) {
+        self.writes.wait_drained().await;
+    }
+
+    /// The exclusion of the slot `key`.
+    fn slot_lock(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.slot_locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(key)
+    }
+
+    /// Whether someone holds or awaits the exclusion of the slot `key`.
+    fn slot_busy(&self, key: &str) -> bool {
+        self.slot_locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .map
+            .get(key)
+            .is_some_and(|l| Arc::strong_count(l) > 1)
     }
 
     /// `<home>/failures`.
@@ -292,6 +439,38 @@ impl FailureSlots {
         read_manifest(&self.slot_dir(addr), addr)
     }
 
+    /// The directory the slot of the source file at workspace-relative `rel`
+    /// lives in, whether or not it exists ([`file_key`]).
+    pub fn file_slot_dir(&self, rel: &str) -> PathBuf {
+        self.root.join(file_key(rel))
+    }
+
+    /// The manifest of the slot of the source file at `rel`, `None` when there
+    /// is no complete slot for it.
+    pub fn read_file(&self, rel: &str) -> Option<SlotManifest> {
+        read_any_manifest(&self.file_slot_dir(rel))
+            .filter(|m| m.addr.strip_prefix(FILE_ADDR_PREFIX) == Some(rel))
+    }
+
+    /// The newest complete slot of a source file whose manifest lists
+    /// `package`, with its directory: what `inspect failure //d:t` answers
+    /// when `d/BUILD` did not evaluate and `//d:t` has no slot of its own.
+    /// Lists `failures/`; for a command, not a build.
+    pub fn read_file_of_package(&self, package: &str) -> Option<(PathBuf, SlotManifest)> {
+        std::fs::read_dir(&self.root)
+            .ok()?
+            .filter_map(|e| {
+                let name = e.ok()?.file_name().into_string().ok()?;
+                name.starts_with("file_").then(|| self.root.join(name))
+            })
+            .filter_map(|dir| {
+                let m = read_any_manifest(&dir)?;
+                (m.addr.starts_with(FILE_ADDR_PREFIX) && m.packages.iter().any(|p| p == package))
+                    .then_some((dir, m))
+            })
+            .max_by_key(|(_, m)| m.failed_at)
+    }
+
     /// How many slots this engine has filled.
     #[cfg(any(test, feature = "test-support"))]
     pub fn fills(&self) -> u64 {
@@ -303,38 +482,77 @@ impl FailureSlots {
         self.known
             .get_or_init(|| async {
                 let root = self.root.clone();
-                std::sync::Mutex::new(hcore::blocking::run(move || list_slots(&root)).await)
+                let (slots, files) = hcore::blocking::run(move || list_slots(&root)).await;
+                self.lock_file_packages().extend(files);
+                std::sync::Mutex::new(slots)
             })
             .await
+    }
+
+    fn lock_file_packages(&self) -> std::sync::MutexGuard<'_, HashMap<String, Vec<String>>> {
+        self.file_packages
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Take out of `known` (and the file map) every source file slot that
+    /// lists `package`: its targets resolve, so the file evaluated again.
+    fn take_files_of(&self, known: &mut HashSet<String>, package: &str) -> Vec<String> {
+        let mut files = self.lock_file_packages();
+        if files.is_empty() {
+            return Vec::new();
+        }
+        let keys: Vec<String> = files
+            .iter()
+            .filter(|(_, pkgs)| pkgs.iter().any(|p| p == package))
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in &keys {
+            files.remove(k);
+            known.remove(k);
+        }
+        keys
     }
 
     /// Remove `addr`'s slot, if this engine knows of one. The first call lists
     /// `failures/`; afterwards a target with no slot costs a hash and a set
     /// lookup, never a syscall. Best-effort: a failure to remove is logged.
+    ///
+    /// A claim write registered for the slot before this call
+    /// ([`write_claim`]) lands first, and is then removed with it.
+    ///
+    /// The slot of each source file that lists `addr`'s package goes too: the
+    /// target resolved, so its package's files evaluated (D5, "a target
+    /// fixed and rebuilt green clears its slot").
     pub async fn clear(&self, addr: &Addr) {
         let known = self.known().await;
-        let key = {
+        let pending = self.writes.load(std::sync::atomic::Ordering::Acquire) > 0;
+        let keys = {
             let mut set = known
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             // The common case, a home with no failures: not even the key.
-            if set.is_empty() {
+            if set.is_empty() && !pending {
                 return;
             }
+            let mut keys = self.take_files_of(&mut set, addr.package.as_str());
             let key = addr_key(addr);
-            if !set.remove(&key) {
-                return;
+            if set.remove(&key) || (pending && self.slot_busy(&key)) {
+                keys.push(key);
             }
-            key
+            keys
         };
-        let dir = self.root.join(&key);
-        let removed = hcore::blocking::run(move || match std::fs::remove_dir_all(&dir) {
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            res => res.map_err(|e| (dir, e)),
-        })
-        .await;
-        if let Err((dir, e)) = removed {
-            tracing::warn!(addr = %addr, dir = %dir.display(), error = %e, "clearing a failure slot");
+        for key in keys {
+            let _excl = self.slot_lock(&key).lock_owned().await;
+            let dir = self.root.join(&key);
+            let removed = hcore::blocking::run(move || match std::fs::remove_dir_all(&dir) {
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+                res => res.map_err(|e| (dir, e)),
+            })
+            .await;
+            if let Err((dir, e)) = removed {
+                tracing::warn!(addr = %addr, dir = %dir.display(), error = %e, "clearing a failure slot");
+            }
         }
     }
 
@@ -348,7 +566,8 @@ impl FailureSlots {
     /// [`fill`](Self::fill) from the run's live log
     /// ([`crate::engine::run_log`]), read through its open descriptor: when
     /// the run had one, it is the log, and any `Log` the failure carries was
-    /// already imported into it or dropped. An empty live log keeps no log.
+    /// already imported into it or dropped. An empty live log, or none, keeps
+    /// an empty `log.txt` (RUN-19): the slot says the run printed nothing.
     pub(crate) async fn fill_live(
         &self,
         fill: Fill<'_>,
@@ -367,9 +586,12 @@ impl FailureSlots {
         ops: SlotIo,
     ) -> FailureSlot {
         let source = match live {
+            // RUN-19: a run that printed nothing keeps an empty log. Material
+            // keeps only a memory tail, and an empty one is no tail.
             Some(file) => file
                 .filter(|f| f.metadata().is_ok_and(|m| m.len() > 0))
-                .map(LogSource::Fd),
+                .map(LogSource::Fd)
+                .or_else(|| (!fill.material).then(|| LogSource::Bytes(Vec::new()))),
             None if fill.keep_log => select_log(fill.addr, fill.err),
             None => None,
         };
@@ -382,18 +604,27 @@ impl FailureSlots {
         if source.is_none() && out.is_none() && written.is_empty() {
             return FailureSlot {
                 fixes,
+                material: fill.material,
                 ..FailureSlot::default()
             };
         }
         let key = addr_key(fill.addr);
+        let excl = self.slot_lock(&key).lock_owned().await;
         let manifest = SlotManifest {
             version: MANIFEST_VERSION,
             addr: fill.addr.format(),
-            hashin: fill.hashin.to_owned(),
+            hashin: (!fill.hashin.is_empty()).then(|| fill.hashin.to_owned()),
             failed_at: crate::engine::event::now_unix_ms(),
+            fill_id: Some(new_fill_id()),
+            packages: Vec::new(),
         };
-        let (root, lines, material, roots) =
-            (self.root.clone(), fill.lines, fill.material, fill.roots);
+        let (root, lines, material, roots, scrub) = (
+            self.root.clone(),
+            fill.lines,
+            fill.material,
+            fill.roots,
+            fill.scrub,
+        );
         let addr = fill.addr.clone();
         let filled = hcore::blocking::run(move || {
             let source = source.and_then(|source| match source {
@@ -408,7 +639,14 @@ impl FailureSlots {
             });
             let out = out.and_then(|tar| staged_out_tar(&addr, tar, &roots));
             let tail_of = |source: &LogSource| match memory_tail(source, lines) {
-                Ok(t) => Some(FailureLog::in_memory(t)),
+                Ok(mut t) => {
+                    // Scrubbed whole, then cut (H-M1).
+                    if let std::borrow::Cow::Owned(clean) = scrub.apply(&t.text) {
+                        t.text = clean;
+                    }
+                    let (tail, cut) = capped_tail(t);
+                    Some(FailureLog::in_memory(tail, cut))
+                }
                 Err(e) => {
                     tracing::warn!(addr = %addr, error = %e, "reading the failure log's tail");
                     None
@@ -432,6 +670,7 @@ impl FailureSlots {
                 slot_log.as_ref(),
                 out.as_ref(),
                 &written,
+                None,
                 ops,
             );
             // The tar was packed for this fill alone: freed once read, whatever
@@ -446,10 +685,17 @@ impl FailureSlots {
                     }
                     Filled {
                         key: Some(key),
+                        fill_id: manifest.fill_id,
+                        log_lines: built.log.as_ref().map_or(0, |l| l.1),
                         log: built
                             .log
-                            .map(|(path, file)| FailureLog::open(path, file, lines))
+                            .map(|(path, _)| FailureLog::on_disk(path, lines))
                             .or(memory),
+                        kept: built
+                            .out
+                            .as_deref()
+                            .map(|out| kept_groups(out, addr.package.as_ref()))
+                            .unwrap_or_default(),
                         out: built.out,
                         out_error: built.out_error.map(|e| format!("{e:#}")),
                         fixes: built.fixes,
@@ -477,6 +723,7 @@ impl FailureSlots {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .insert(key);
         }
+        drop(excl);
         if let (Some(hplugin::error::FailureFixes::Written { list, .. }), Some(path)) =
             (fixes.as_mut(), filled.fixes)
         {
@@ -485,12 +732,213 @@ impl FailureSlots {
         FailureSlot {
             log: filled.log,
             out: filled.out,
+            kept: filled.kept.0,
+            kept_more: filled.kept.1,
             out_error: filled.out_error,
             fixes,
             sandbox: None,
             streamed: false,
+            after_run: false,
+            fill_id: filled.fill_id,
+            log_lines: filled.log_lines,
+            material: fill.material,
         }
     }
+}
+
+/// What a fresh claim writes into the culprit's slot (P28): the claim's
+/// record as `diagnostic.json`, beside the log the run kept, or in a slot of
+/// its own for a failure that kept nothing (one before the run, a source
+/// file that did not evaluate).
+pub(crate) struct ClaimWrite {
+    pub culprit: hplugin::error::Culprit,
+    /// The claim's record, compacted and scrubbed.
+    pub record: Arc<hcore::failure::FailureRecord>,
+    /// The id of the fill that kept the run's log or `out/`: the slot the
+    /// diagnostic joins. `None` builds a slot of its own.
+    pub fill_id: Option<String>,
+    /// For a file culprit: the packages its targets were reached through.
+    pub packages: Vec<String>,
+}
+
+impl ClaimWrite {
+    fn key(&self) -> String {
+        match &self.culprit {
+            hplugin::error::Culprit::Target(a) => addr_key(a),
+            hplugin::error::Culprit::File(rel) => file_key(rel),
+        }
+    }
+}
+
+/// Counts a claim write on its counters until dropped, however its task
+/// ends.
+struct Registered([PendingCounter; 2]);
+
+impl Registered {
+    fn new(counters: [PendingCounter; 2]) -> Self {
+        for c in &counters {
+            c.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
+        Self(counters)
+    }
+}
+
+impl Drop for Registered {
+    fn drop(&mut self) {
+        for c in &self.0 {
+            c.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+}
+
+/// Write `claim` into the failure slots of `engine`, in the background.
+///
+/// Registered here, synchronously, before the claim's winner returns: on
+/// `bg_pending` (the process does not exit before it lands) and on the
+/// slots' own count, with the slot's exclusion taken now when it is free. A
+/// clear or a fill of the slot that comes later waits for it. With no
+/// runtime it is written inline.
+pub(crate) fn write_claim(
+    engine: Arc<crate::engine::Engine>,
+    bg_pending: PendingCounter,
+    claim: ClaimWrite,
+) {
+    let key = claim.key();
+    let file_packages =
+        matches!(claim.culprit, hplugin::error::Culprit::File(_)).then(|| claim.packages.clone());
+    let slots = &engine.failure_slots;
+    let lock = slots.slot_lock(&key);
+    let held = Arc::clone(&lock).try_lock_owned().ok();
+    let registered = Registered::new([bg_pending, Arc::clone(&slots.writes)]);
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn(async move {
+                let _registered = registered;
+                let _excl = match held {
+                    Some(g) => g,
+                    None => lock.lock_owned().await,
+                };
+                let root = engine.failure_slots.root.clone();
+                let (new_slot, key) =
+                    hcore::blocking::run(move || (write_claim_logged(&root, &key, &claim), key))
+                        .await;
+                if new_slot {
+                    let slots = &engine.failure_slots;
+                    let known = slots.known().await;
+                    if let Some(pkgs) = file_packages {
+                        slots.lock_file_packages().insert(key.clone(), pkgs);
+                    }
+                    known
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(key);
+                }
+            });
+        }
+        Err(_) => {
+            let _registered = registered;
+            let _excl = held.unwrap_or_else(|| lock.blocking_lock_owned());
+            if write_claim_logged(&slots.root, &key, &claim)
+                && let Some(known) = slots.known.get()
+            {
+                if let Some(pkgs) = file_packages {
+                    slots.lock_file_packages().insert(key.clone(), pkgs);
+                }
+                known
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(key);
+            }
+        }
+    }
+}
+
+/// [`write_claim_files`], under the slot's exclusion. Never fails: it logs.
+fn write_claim_logged(root: &Path, key: &str, claim: &ClaimWrite) -> bool {
+    match write_claim_files(root, key, claim) {
+        Ok(new_slot) => new_slot,
+        Err(e) => {
+            tracing::warn!(culprit = %claim.culprit, error = %format!("{e:#}"), "keeping the failure's diagnostic");
+            false
+        }
+    }
+}
+
+/// [`write_claim`]'s files: into the slot the run filled, or a slot of its
+/// own. True when it built a slot of its own.
+fn write_claim_files(root: &Path, key: &str, claim: &ClaimWrite) -> anyhow::Result<bool> {
+    use anyhow::Context as _;
+    match &claim.fill_id {
+        Some(id) => {
+            let dir = root.join(key);
+            // The run's slot, unless it was replaced or cleared since.
+            match hcore::failure_log::peek_fill_id(&dir) {
+                Ok(Some(found)) if found == *id => {}
+                found => {
+                    tracing::debug!(culprit = %claim.culprit, ?found, "the run's slot is gone or replaced; no diagnostic");
+                    return Ok(false);
+                }
+            }
+            let bytes = hcore::failure_log::encode_diagnostic(&claim.record, Some(id))
+                .context("encoding the failure's diagnostic")?;
+            let tmp = dir.join(format!(
+                "{TEMP_PREFIX}diagnostic-{}",
+                uuid::Uuid::new_v4().as_simple()
+            ));
+            let written = std::fs::write(&tmp, bytes)
+                .with_context(|| format!("writing {}", tmp.display()))
+                .and_then(|()| {
+                    let to = dir.join(DIAGNOSTIC);
+                    std::fs::rename(&tmp, &to)
+                        .with_context(|| format!("renaming {} to {}", tmp.display(), to.display()))
+                });
+            match written {
+                Ok(()) => Ok(false),
+                Err(e) => {
+                    drop(std::fs::remove_file(&tmp));
+                    if e.downcast_ref::<io::Error>()
+                        .is_some_and(|e| e.kind() == io::ErrorKind::NotFound)
+                    {
+                        tracing::debug!(culprit = %claim.culprit, "the run's slot went while its diagnostic was written");
+                        return Ok(false);
+                    }
+                    Err(e)
+                }
+            }
+        }
+        None => {
+            let fill_id = new_fill_id();
+            let bytes = hcore::failure_log::encode_diagnostic(&claim.record, Some(&fill_id))
+                .context("encoding the failure's diagnostic")?;
+            let manifest = SlotManifest {
+                version: MANIFEST_VERSION,
+                addr: match &claim.culprit {
+                    hplugin::error::Culprit::Target(a) => a.format(),
+                    hplugin::error::Culprit::File(rel) => format!("{FILE_ADDR_PREFIX}{rel}"),
+                },
+                hashin: None,
+                failed_at: crate::engine::event::now_unix_ms(),
+                fill_id: Some(fill_id),
+                packages: claim.packages.clone(),
+            };
+            fill_slot(
+                root,
+                key,
+                &manifest,
+                None,
+                None,
+                &[],
+                Some(&bytes),
+                SlotIo::REAL,
+            )?;
+            Ok(true)
+        }
+    }
+}
+
+/// A new fill's id (P12).
+fn new_fill_id() -> String {
+    uuid::Uuid::new_v4().as_simple().to_string()
 }
 
 /// What a fill kept.
@@ -498,11 +946,63 @@ impl FailureSlots {
 struct Filled {
     /// The slot's name, when one was renamed into place.
     key: Option<String>,
+    /// The id of the fill that was renamed into place.
+    fill_id: Option<String>,
+    /// The lines of the slot's `log.txt`.
+    log_lines: u64,
     log: Option<FailureLog>,
     out: Option<PathBuf>,
+    kept: (Vec<hcore::events::KeptGroup>, u32),
     out_error: Option<String>,
     /// The slot's `fixes.txt`, when one was written.
     fixes: Option<PathBuf>,
+}
+
+/// The files under `out` (a slot's `out/`) at `package`, grouped by first
+/// path component: a directory (`report/`) with how many files it holds, or
+/// a top-level file alone. Sorted by name; the first
+/// [`KEPT_GROUPS_CAP`](hcore::events::KEPT_GROUPS_CAP), and how many more.
+/// `failure_out` is package-relative and the slot mirrors the workspace, so
+/// `//web:lint`'s groups read `report/`, not `web/`. Symlinks are counted,
+/// never followed; an unreadable directory reads as empty.
+pub(crate) fn kept_groups(out: &Path, package: &str) -> (Vec<hcore::events::KeptGroup>, u32) {
+    use hcore::events::{KEPT_GROUPS_CAP, KeptGroup};
+    let Ok(entries) = std::fs::read_dir(out.join(package)) else {
+        return (Vec::new(), 0);
+    };
+    let count_files = |dir: PathBuf| {
+        let mut n = 0u64;
+        let mut stack = vec![dir];
+        while let Some(d) = stack.pop() {
+            for entry in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+                match entry.file_type() {
+                    Ok(t) if t.is_dir() => stack.push(entry.path()),
+                    Ok(_) => n += 1,
+                    Err(_) => {}
+                }
+            }
+        }
+        n
+    };
+    let mut groups: Vec<KeptGroup> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                let files = count_files(entry.path());
+                (files > 0).then(|| KeptGroup {
+                    name: format!("{name}/"),
+                    files,
+                })
+            } else {
+                Some(KeptGroup { name, files: 1 })
+            }
+        })
+        .collect();
+    groups.sort_by(|a, b| a.name.cmp(&b.name));
+    let more = groups.len().saturating_sub(KEPT_GROUPS_CAP);
+    groups.truncate(KEPT_GROUPS_CAP);
+    (groups, u32::try_from(more).unwrap_or(u32::MAX))
 }
 
 /// The file operations a fill performs, injectable for tests.
@@ -621,6 +1121,47 @@ fn resolve_in_roots(path: &Path, roots: &[PathBuf]) -> io::Result<Option<PathBuf
     Ok(Some(real))
 }
 
+/// `tail` within [`RECORD_CAP`](hcore::failure::RECORD_CAP) (E2): a log
+/// kept only in memory is held on the error chain as long as the failure
+/// is, so it gets the record's cap, not [`TAIL_MAX_BYTES`]. The caller has
+/// already scrubbed it ([`Fill::scrub`]). Whole lines are dropped from the
+/// front, so no line is cut unless the last one alone is over the cap; then
+/// its end is kept, at a char boundary. True when it cut.
+///
+/// [`TAIL_MAX_BYTES`]: hcore::failure_log::TAIL_MAX_BYTES
+fn capped_tail(mut tail: LogTail) -> (LogTail, bool) {
+    let cap = hcore::failure::RECORD_CAP;
+    if tail.text.len() <= cap {
+        return (tail, false);
+    }
+    let len = tail.text.len();
+    let over = len - cap;
+    // The first line that starts at or past `over`, when one starts before
+    // the end; else the cut inside the last line.
+    let from = over.saturating_sub(1);
+    let line_start = tail
+        .text
+        .as_bytes()
+        .get(from..)
+        .and_then(|rest| rest.iter().position(|&b| b == b'\n'))
+        .map(|i| from + i + 1)
+        .filter(|&start| start < len);
+    let start = line_start.unwrap_or_else(|| {
+        let mut start = over;
+        while !tail.text.is_char_boundary(start) {
+            start += 1;
+        }
+        start
+    });
+    let dropped = tail
+        .text
+        .get(..start)
+        .map_or(0, |head| head.matches('\n').count());
+    tail.text.drain(..start);
+    tail.start_line += dropped;
+    (tail, true)
+}
+
 /// The tail of `source`, read into memory.
 fn memory_tail(source: &LogSource, lines: usize) -> io::Result<LogTail> {
     match source {
@@ -679,10 +1220,8 @@ fn temp_name(key: &str) -> String {
 
 /// What [`fill_slot`] put in place.
 struct Built {
-    /// The log's final path and the log opened for reading — opened before
-    /// the rename, so it is this fill's copy whatever replaces the slot
-    /// afterwards.
-    log: Option<(PathBuf, std::fs::File)>,
+    /// The log's final path and its line count.
+    log: Option<(PathBuf, u64)>,
     /// The slot's `out/`, when the `failure_out` tar was unpacked in.
     out: Option<PathBuf>,
     /// Why the `failure_out` tar was not unpacked in, when the slot was kept
@@ -700,6 +1239,13 @@ struct Built {
 /// rest of the slot, unless there is neither a log nor a fixes list to keep.
 /// Anything else that fails before the rename leaves the old slot as it was
 /// and the temporary directory removed.
+///
+/// `diagnostic` is a claim's `diagnostic.json`, for a slot that keeps only
+/// that ([`write_claim`]).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each a part of the slot, passed through from one of two fills"
+)]
 fn fill_slot(
     root: &Path,
     key: &str,
@@ -707,6 +1253,7 @@ fn fill_slot(
     log: Option<&LogSource>,
     out: Option<&OutputArtifact>,
     fixes: &[String],
+    diagnostic: Option<&[u8]>,
     ops: SlotIo,
 ) -> anyhow::Result<Built> {
     use anyhow::Context as _;
@@ -725,10 +1272,12 @@ fn fill_slot(
                 LogSource::Fd(from) => copy_fd(from, &path)
                     .with_context(|| format!("copying the live log to {}", path.display()))?,
             }
-            Some(
-                std::fs::File::open(&path)
-                    .with_context(|| format!("opening {}", path.display()))?,
-            )
+            // Opened only to count; nothing keeps the file (E2).
+            let file = std::fs::File::open(&path)
+                .with_context(|| format!("opening {}", path.display()))?;
+            let lines = hcore::failure_log::count_lines(&file)
+                .with_context(|| format!("counting the lines of {}", path.display()))?;
+            Some(lines)
         }
         None => None,
     };
@@ -765,6 +1314,10 @@ fn fill_slot(
         list.push('\n');
         std::fs::write(&path, list).with_context(|| format!("writing {}", path.display()))?;
     }
+    if let Some(bytes) = diagnostic {
+        let path = temp.path().join(DIAGNOSTIC);
+        std::fs::write(&path, bytes).with_context(|| format!("writing {}", path.display()))?;
+    }
     // Last: a slot is complete exactly when its manifest exists.
     let json = serde_json::to_vec(manifest).context("encoding the failure manifest")?;
     let manifest_path = temp.path().join(MANIFEST);
@@ -787,7 +1340,7 @@ fn fill_slot(
     temp.disarm();
     drop(old);
     Ok(Built {
-        log: log.map(|file| (dest.join(LOG), file)),
+        log: log.map(|lines| (dest.join(LOG), lines)),
         out: moved.then(|| dest.join(OUT)),
         out_error,
         fixes: wrote_fixes.then(|| dest.join(FIXES)),
@@ -817,12 +1370,18 @@ pub fn read_manifest(dir: &Path, addr: &Addr) -> Option<SlotManifest> {
 /// The manifest of the slot at `dir`, if it is complete and of a version this
 /// heph reads, whichever address it names. What `heph tool gc` reads a slot
 /// it found by listing with. A complete slot holds a `log.txt`, an `out/`, a
-/// `fixes.txt`, or any of them together.
+/// `fixes.txt`, a `diagnostic.json` (a failure before the run keeps only
+/// that), or any of them together. A `diagnostic.json` of a version this heph
+/// does not read still makes the slot complete; it reads as no diagnostic
+/// ([`hcore::failure_log::read_diagnostic`]).
 pub(crate) fn read_any_manifest(dir: &Path) -> Option<SlotManifest> {
     let bytes = std::fs::read(dir.join(MANIFEST)).ok()?;
     let m: SlotManifest = serde_json::from_slice(&bytes).ok()?;
     (m.version == MANIFEST_VERSION
-        && (dir.join(LOG).is_file() || dir.join(OUT).is_dir() || dir.join(FIXES).is_file()))
+        && (dir.join(LOG).is_file()
+            || dir.join(OUT).is_dir()
+            || dir.join(FIXES).is_file()
+            || dir.join(DIAGNOSTIC).is_file()))
     .then_some(m)
 }
 
@@ -836,22 +1395,61 @@ pub(crate) fn write_test_slot(root: &Path, addr: &Addr, failed_at: u64, log: &[u
     let m = SlotManifest {
         version: MANIFEST_VERSION,
         addr: addr.format(),
-        hashin: "h".into(),
+        hashin: Some("h".into()),
         failed_at,
+        fill_id: Some(new_fill_id()),
+        packages: Vec::new(),
     };
     std::fs::write(dir.join(MANIFEST), serde_json::to_vec(&m).expect("json")).expect("manifest");
     dir
 }
 
-/// The slot names under `root`; temporaries are not slots.
-fn list_slots(root: &Path) -> HashSet<String> {
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return HashSet::new();
+/// Write a complete slot for the source file at `rel` under `root` by hand,
+/// as a failure before the run leaves it: a manifest and `diagnostic.json`.
+#[cfg(test)]
+pub(crate) fn write_test_file_slot(root: &Path, rel: &str, failed_at: u64) -> PathBuf {
+    let dir = root.join(file_key(rel));
+    std::fs::create_dir_all(&dir).expect("mkdir slot");
+    let fill_id = new_fill_id();
+    let rec = hcore::failure::FailureRecord::new(hcore::diagnostic::Diagnostic::new(
+        hcore::diagnostic::Stage::Eval,
+        "boom",
+    ));
+    let diag = hcore::failure_log::encode_diagnostic(&rec, Some(&fill_id)).expect("encode");
+    std::fs::write(dir.join(DIAGNOSTIC), diag).expect("write diagnostic");
+    let m = SlotManifest {
+        version: MANIFEST_VERSION,
+        addr: format!("{FILE_ADDR_PREFIX}{rel}"),
+        hashin: None,
+        failed_at,
+        fill_id: Some(fill_id),
+        packages: Vec::new(),
     };
-    entries
+    std::fs::write(dir.join(MANIFEST), serde_json::to_vec(&m).expect("json")).expect("manifest");
+    dir
+}
+
+/// The slot names under `root`; temporaries are not slots. With them, each
+/// source file slot's name and the packages its manifest lists: a file key's
+/// readable part starts `file_`, so only those manifests are read.
+fn list_slots(root: &Path) -> (HashSet<String>, HashMap<String, Vec<String>>) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Default::default();
+    };
+    let slots: HashSet<String> = entries
         .filter_map(|e| e.ok()?.file_name().into_string().ok())
         .filter(|n| !n.starts_with('.'))
-        .collect()
+        .collect();
+    let files = slots
+        .iter()
+        .filter(|n| n.starts_with("file_"))
+        .filter_map(|n| {
+            let m = read_any_manifest(&root.join(n))?;
+            (m.addr.starts_with(FILE_ADDR_PREFIX) && !m.packages.is_empty())
+                .then(|| (n.clone(), m.packages))
+        })
+        .collect();
+    (slots, files)
 }
 
 #[cfg(test)]
@@ -863,12 +1461,47 @@ mod tests {
         hmodel::htaddr::parse_addr(s).expect("addr")
     }
 
+    /// The kept files are grouped at the target's package, a directory by
+    /// its file count and a file alone, sorted and capped; an empty
+    /// directory is no group.
+    #[test]
+    fn kept_groups_at_package_sorted_and_capped() {
+        let dir = hcore::fsutil::tempdir().expect("tempdir");
+        let pkg = dir.path().join("web");
+        for f in [
+            "report/a",
+            "report/deep/b",
+            "report/deep/c",
+            "z.txt",
+            "a.txt",
+        ] {
+            let p = pkg.join(f);
+            std::fs::create_dir_all(p.parent().expect("parent")).expect("mkdir");
+            std::fs::write(&p, "x").expect("write");
+        }
+        std::fs::create_dir_all(pkg.join("empty")).expect("mkdir");
+        let (groups, more) = kept_groups(dir.path(), "web");
+        let named: Vec<_> = groups.iter().map(|g| (g.name.as_str(), g.files)).collect();
+        assert_eq!(named, [("a.txt", 1), ("report/", 3), ("z.txt", 1)]);
+        assert_eq!(more, 0);
+
+        for i in 0..7 {
+            std::fs::write(pkg.join(format!("m{i}")), "x").expect("write");
+        }
+        let (groups, more) = kept_groups(dir.path(), "web");
+        assert_eq!(groups.len(), hcore::events::KEPT_GROUPS_CAP);
+        assert_eq!(more, 5);
+        assert_eq!(kept_groups(dir.path(), "gone"), (Vec::new(), 0));
+    }
+
     fn manifest_for(a: &Addr) -> SlotManifest {
         SlotManifest {
             version: MANIFEST_VERSION,
             addr: a.format(),
-            hashin: "h".into(),
+            hashin: Some("h".into()),
             failed_at: 1,
+            fill_id: Some("f".into()),
+            packages: Vec::new(),
         }
     }
 
@@ -929,6 +1562,34 @@ mod tests {
             );
             assert_eq!(k, addr_key(&a), "stable");
         }
+    }
+
+    /// FQ-11: a memory tail whose one line is over the cap keeps its end
+    /// from a char boundary. `€` is 3 bytes and the cut point falls inside
+    /// one: the cut moves to the next char, never splits it.
+    #[test]
+    fn memory_tail_cap_at_char_boundary() {
+        let cap = hcore::failure::RECORD_CAP;
+        let line = "€".repeat(cap / 3 + 100);
+        assert_ne!((line.len() - cap) % 3, 0, "the cut falls inside a char");
+        let (tail, cut) = capped_tail(LogTail {
+            text: line.clone(),
+            start_line: 1,
+        });
+        assert!(cut);
+        assert!(tail.text.len() <= cap && tail.text.len() > cap - 3);
+        assert!(tail.text.chars().all(|c| c == '€'));
+        assert!(line.ends_with(&tail.text));
+        assert_eq!(tail.start_line, 1, "no line was dropped");
+        // Whole lines go from the front first.
+        let lines = format!("{}\n{}", "x".repeat(100), "€".repeat(cap / 3 - 10));
+        let (tail, cut) = capped_tail(LogTail {
+            text: lines,
+            start_line: 1,
+        });
+        assert!(cut);
+        assert!(tail.text.starts_with('€') && tail.text.len() <= cap);
+        assert_eq!(tail.start_line, 2);
     }
 
     #[test]
@@ -1005,6 +1666,97 @@ mod tests {
         assert_eq!(slots.read(&a), Some(manifest_for(&a)));
     }
 
+    /// A file's key is readable, filesystem-safe, its own per path, and never
+    /// an address's, even one spelled like the path.
+    #[test]
+    fn file_key_is_its_own() {
+        let k = file_key("d/BUILD");
+        assert!(k.starts_with("file_d_build-"), "{k}");
+        assert!(
+            k.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-'),
+            "{k}"
+        );
+        assert_ne!(k, file_key("d/build"), "case is not folded away");
+        assert_ne!(k, file_key("d_BUILD"));
+        assert_ne!(k, addr_key(&addr("//d:BUILD")));
+        assert_ne!(k, addr_key(&addr("//file:d")));
+    }
+
+    /// A manifest written before `hashin` was optional, and one written for a
+    /// failure before the run (no `hashin`, no `fill_id`), both read.
+    #[test]
+    fn slot_manifest_without_hashin_reads() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let slots = FailureSlots::new(home.path());
+        let a = addr("//p:a");
+        let dir = slots.slot_dir(&a);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(dir.join(LOG), "x").expect("log");
+        let old = format!(
+            r#"{{"version":1,"addr":"{}","hashin":"h","failed_at":7}}"#,
+            a.format()
+        );
+        std::fs::write(dir.join(MANIFEST), old).expect("m");
+        let m = slots.read(&a).expect("an older heph's slot reads");
+        assert_eq!(
+            (m.hashin.as_deref(), m.fill_id, m.failed_at),
+            (Some("h"), None, 7)
+        );
+        let pre_run = format!(r#"{{"version":1,"addr":"{}","failed_at":8}}"#, a.format());
+        std::fs::write(dir.join(MANIFEST), pre_run).expect("m");
+        let m = slots.read(&a).expect("a slot with no revision reads");
+        assert_eq!((m.hashin, m.failed_at), (None, 8));
+    }
+
+    /// A slot filled before the run holds a manifest and `diagnostic.json`
+    /// only, and is complete: not read as absent.
+    #[test]
+    fn slot_with_diagnostic_and_no_log_is_complete() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let slots = FailureSlots::new(home.path());
+        let a = addr("//p:a");
+        let dir = slots.slot_dir(&a);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let mut m = manifest_for(&a);
+        m.hashin = None;
+        std::fs::write(dir.join(MANIFEST), serde_json::to_vec(&m).expect("json")).expect("m");
+        assert_eq!(slots.read(&a), None, "a manifest alone is no slot");
+        let rec = hcore::failure::FailureRecord::new(hcore::diagnostic::Diagnostic::new(
+            hcore::diagnostic::Stage::Spec,
+            "no such dep",
+        ));
+        let bytes =
+            hcore::failure_log::encode_diagnostic(&rec, m.fill_id.as_deref()).expect("encode");
+        std::fs::write(dir.join(DIAGNOSTIC), bytes).expect("diagnostic");
+        assert_eq!(slots.read(&a), Some(m));
+        let read = hcore::failure_log::read_diagnostic(&dir).expect("the diagnostic reads");
+        assert_eq!(read.diagnostic.message, "no such dep");
+    }
+
+    /// A `diagnostic.json` of a version this heph does not know still makes
+    /// the slot complete, and reads as no diagnostic.
+    #[test]
+    fn diagnostic_json_unknown_version_ignored() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let slots = FailureSlots::new(home.path());
+        let a = addr("//p:a");
+        let dir = slots.slot_dir(&a);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let m = manifest_for(&a);
+        std::fs::write(dir.join(MANIFEST), serde_json::to_vec(&m).expect("json")).expect("m");
+        let future = format!(
+            r#"{{"version":99,"fill_id":"{}","stage":"def","message":"from the future"}}"#,
+            m.fill_id.as_deref().unwrap_or_default()
+        );
+        std::fs::write(dir.join(DIAGNOSTIC), future).expect("diagnostic");
+        assert_eq!(slots.read(&a), Some(m), "the slot is complete");
+        assert!(
+            hcore::failure_log::read_diagnostic(&dir).is_none(),
+            "an unknown version is no diagnostic"
+        );
+    }
+
     #[test]
     fn slot_fill_is_atomic() {
         let home = tempfile::tempdir().expect("tempdir");
@@ -1018,6 +1770,7 @@ mod tests {
             Some(&LogSource::Bytes(b"old\n".to_vec())),
             None,
             &[],
+            None,
             SlotIo::REAL,
         )
         .expect("first fill");
@@ -1030,6 +1783,7 @@ mod tests {
             Some(&LogSource::File(src)),
             None,
             &[],
+            None,
             SlotIo {
                 copy: |from, to| {
                     // Half a copy, then the disk fills.
@@ -1057,13 +1811,14 @@ mod tests {
         let src = home.path().join("log.txt");
         std::fs::write(&src, "kept\n").expect("src");
         let a = addr("//p:a");
-        let (path, _file) = fill_slot(
+        let (path, lines) = fill_slot(
             &home.path().join(FAILURES_DIR),
             &addr_key(&a),
             &manifest_for(&a),
             Some(&LogSource::File(src.clone())),
             None,
             &[],
+            None,
             SlotIo::REAL,
         )
         .expect("fill")
@@ -1071,6 +1826,7 @@ mod tests {
         .expect("a log");
         assert_eq!(std::fs::read(&src).expect("source still there"), b"kept\n");
         assert_eq!(std::fs::read(&path).expect("copy"), b"kept\n");
+        assert_eq!(lines, 1, "the copy's lines are counted");
     }
 
     fn raw_log(data: &[u8]) -> OutputArtifact {
@@ -1104,6 +1860,7 @@ mod tests {
                 material: false,
                 fixes: None,
                 keep_log: true,
+                scrub: Default::default(),
             })
             .await;
         slot.log.map(|l| l.tail().expect("tail").text)
@@ -1161,6 +1918,42 @@ mod tests {
         assert_eq!(std::fs::read(&secret).expect("untouched"), b"outside\n");
     }
 
+    /// Every fill mints its own id, written to the manifest and handed back
+    /// on the slot with the copy's line count; an invocation's fill (no
+    /// revision) writes no `hashin`.
+    #[tokio::test]
+    async fn each_fill_mints_its_fill_id() {
+        let home = tempfile::tempdir().expect("home");
+        let slots = FailureSlots::new(home.path());
+        let a = addr("//p:a");
+        let mut ids = Vec::new();
+        for hashin in ["h", ""] {
+            let err = with_failure_artifacts(anyhow::anyhow!("boom"), vec![raw_log(b"a\nb\nc")]);
+            let slot = slots
+                .fill(Fill {
+                    addr: &a,
+                    hashin,
+                    roots: Vec::new(),
+                    err: &err,
+                    lines: 10,
+                    material: false,
+                    fixes: None,
+                    keep_log: true,
+                    scrub: Default::default(),
+                })
+                .await;
+            let m = slots.read(&a).expect("a slot");
+            assert_eq!(
+                m.fill_id, slot.fill_id,
+                "the slot names the manifest's fill"
+            );
+            assert_eq!(m.hashin.as_deref(), (!hashin.is_empty()).then_some(hashin));
+            assert_eq!(slot.log_lines, 3);
+            ids.push(slot.fill_id.expect("a fill id"));
+        }
+        assert_ne!(ids.first(), ids.get(1), "two fills, two ids");
+    }
+
     /// Credential material never gets a slot: the tail is read into memory.
     #[tokio::test]
     async fn material_target_keeps_tail_in_memory() {
@@ -1184,12 +1977,128 @@ mod tests {
                 material: true,
                 fixes: None,
                 keep_log: true,
+                scrub: Default::default(),
             })
             .await;
         let log = slot.log.expect("a tail");
         assert!(log.path().is_none());
         assert_eq!(log.tail().expect("tail").text, "producer said");
         assert!(!slots.root().exists(), "no slot, not even the directory");
+    }
+
+    /// FQ-1: thousands of claim writes at distinct keys walk at most twice
+    /// as many exclusion-map entries as there were lookups (a walk per
+    /// lookup was N²/2); once they are done, the next lookup due prunes the
+    /// map back down.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slot_locks_prune_amortized_over_many_claims() {
+        const N: usize = 4_000;
+        let (engine, _dir) = crate::engine::cache_test_support::test_engine();
+        let started = std::time::Instant::now();
+        for i in 0..N {
+            let mut rec = hcore::failure::FailureRecord::new(hplugin::diagnostic::Diagnostic::new(
+                hplugin::diagnostic::Stage::Run,
+                "boom",
+            ));
+            rec.addr = Some(format!("//p:t{i}"));
+            write_claim(
+                Arc::clone(&engine),
+                PendingCounter::default(),
+                ClaimWrite {
+                    culprit: hplugin::error::Culprit::Target(addr(&format!("//p:t{i}"))),
+                    record: Arc::new(rec),
+                    fill_id: None,
+                    packages: Vec::new(),
+                },
+            );
+        }
+        engine.failure_slots.writes_drained().await;
+        let elapsed = started.elapsed();
+        let walked = engine
+            .failure_slots
+            .slot_locks
+            .lock()
+            .expect("locks")
+            .walked;
+        assert!(walked <= 2 * N, "{walked} entries walked for {N} lookups");
+        for i in [0, N - 1] {
+            let a = addr(&format!("//p:t{i}"));
+            assert!(engine.failure_slots.read(&a).is_some(), "{a} landed");
+        }
+        // Nothing is held now: lookups at new keys, each released at once,
+        // grow the map to its next prune, which drops it below its
+        // high-water mark (FQ r2).
+        let len = || {
+            engine
+                .failure_slots
+                .slot_locks
+                .lock()
+                .expect("locks")
+                .map
+                .len()
+        };
+        let mut high = len();
+        let shrunk = (0..4 * N + SlotLocks::PRUNE_MIN).any(|i| {
+            drop(engine.failure_slots.slot_lock(&format!("again-{i}")));
+            let now = len();
+            let dropped = now < high;
+            high = high.max(now);
+            dropped
+        });
+        assert!(shrunk, "the map never pruned its released exclusions");
+        assert!(
+            len() <= 1,
+            "only the last lookup's entry is left: {}",
+            len()
+        );
+        // Generous: the quadratic walk took seconds at this size.
+        assert!(elapsed < std::time::Duration::from_secs(60), "{elapsed:?}");
+    }
+
+    /// H-M1: a material run's memory tail is scrubbed before it is cut to
+    /// the record's cap. One line over the cap, cut inside a secret: cut
+    /// first, the secret's suffix would head the tail, where no scrub knows
+    /// it.
+    #[tokio::test]
+    async fn memory_tail_scrubbed_before_the_cut() {
+        let secret = "MEMTAIL-SECRET-0123456789-abcdef";
+        let suffix = secret.get(secret.len() / 2..).expect("suffix");
+        let line = format!(
+            "{}{secret}{}",
+            "a".repeat(100),
+            "b".repeat(hcore::failure::RECORD_CAP - suffix.len())
+        );
+        let home = tempfile::tempdir().expect("home");
+        let sandbox = tempfile::tempdir().expect("sandbox");
+        let slots = FailureSlots::new(home.path());
+        let a = addr("//auth:fetch");
+        let err = with_failure_artifacts(
+            anyhow::anyhow!("boom"),
+            vec![raw_log(format!("{line}\n").as_bytes())],
+        );
+        let fill = |scrub| Fill {
+            addr: &a,
+            hashin: "h",
+            roots: vec![sandbox.path().to_path_buf()],
+            err: &err,
+            lines: 10,
+            material: true,
+            fixes: None,
+            keep_log: true,
+            scrub,
+        };
+        // The fixture has teeth: unscrubbed, the cut leaves the suffix.
+        let raw = slots.fill(fill(Default::default())).await;
+        let raw = raw.log.expect("a tail").tail().expect("tail").text.clone();
+        assert!(raw.starts_with(suffix), "{:?}", raw.get(..40));
+
+        let scrub = crate::engine::failure_record::Scrub::new([secret.to_owned()]);
+        let slot = slots.fill(fill(scrub)).await;
+        let log = slot.log.expect("a tail");
+        assert!(log.memory_cut(), "the tail was cut");
+        let text = &log.tail().expect("tail").text;
+        assert!(text.len() <= hcore::failure::RECORD_CAP);
+        assert!(!text.contains(suffix), "{:?}", text.get(..40));
     }
 
     #[tokio::test]
@@ -1214,6 +2123,7 @@ mod tests {
                 material: false,
                 fixes: None,
                 keep_log: true,
+                scrub: Default::default(),
             })
             .await;
         let log = slot.log.clone().expect("the tail, in memory");
@@ -1282,6 +2192,7 @@ mod tests {
                     material,
                     fixes: None,
                     keep_log: true,
+                    scrub: Default::default(),
                 },
                 None,
                 ops,
@@ -1310,6 +2221,7 @@ mod tests {
                 lines: 10,
                 material: false,
                 keep_log: true,
+                scrub: Default::default(),
                 fixes: Some(FailureFixes::Written {
                     root: root.clone(),
                     paths: paths.clone(),
@@ -1342,6 +2254,7 @@ mod tests {
                 lines: 10,
                 material: false,
                 keep_log: true,
+                scrub: Default::default(),
                 fixes: Some(FailureFixes::NotWritten(FixesNotWritten::Frozen)),
             })
             .await;
@@ -1350,6 +2263,35 @@ mod tests {
             Some(FailureFixes::NotWritten(FixesNotWritten::Frozen))
         );
         assert!(!slots.slot_dir(&b).exists());
+    }
+
+    /// A source file's slot lists the packages reached through it; a target of
+    /// one of them resolving clears it (the file evaluated), a target of
+    /// another package does not, and a slot listing no package stays.
+    #[tokio::test]
+    async fn clear_takes_the_file_slots_of_the_targets_package() {
+        let home = tempfile::tempdir().expect("home");
+        let root = home.path().join(FAILURES_DIR);
+        let with_packages = |rel: &str, pkgs: &[&str]| {
+            let dir = write_test_file_slot(&root, rel, 1);
+            let mut m = read_any_manifest(&dir).expect("manifest");
+            m.packages = pkgs.iter().map(|p| (*p).to_owned()).collect();
+            std::fs::write(dir.join(MANIFEST), serde_json::to_vec(&m).expect("json"))
+                .expect("manifest");
+            dir
+        };
+        let d = with_packages("d/BUILD", &["d"]);
+        let defs = with_packages("lib/defs.bzl", &["e", "d"]);
+        let none = with_packages("x/BUILD", &[]);
+        let slots = FailureSlots::new(home.path());
+
+        slots.clear(&addr("//other:t")).await;
+        assert!(d.exists() && defs.exists());
+        slots.clear(&addr("//d:t")).await;
+        assert!(!d.exists(), "d/BUILD evaluated again");
+        assert!(!defs.exists(), "d loads lib/defs.bzl, which evaluated");
+        assert!(none.exists(), "a slot naming no package is gc's");
+        assert_eq!(slots.read_file("d/BUILD"), None);
     }
 
     /// D10: a slot with an `out/` and no log is a slot; I3: `clear` takes
@@ -1517,6 +2459,7 @@ mod tests {
                     lines: 10,
                     material: true,
                     keep_log: true,
+                    scrub: Default::default(),
                     fixes: Some(FailureFixes::Written {
                         root: sandbox.path().to_path_buf(),
                         paths: paths.clone(),

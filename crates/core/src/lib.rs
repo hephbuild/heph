@@ -22,6 +22,8 @@ pub mod debug_hash;
 pub mod defer;
 pub mod diagnostic;
 pub mod events;
+pub mod failure;
+pub mod failure_log;
 pub mod fsutil;
 pub mod hartifactcontent;
 pub mod hasync;

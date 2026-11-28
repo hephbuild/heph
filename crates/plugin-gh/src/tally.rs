@@ -28,8 +28,11 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
-use hcore::events::{BuildEvent, BuildEventKind, CacheCounts, CacheOutcomeKind, LogTailData};
+use hcore::events::{
+    BuildEvent, BuildEventKind, CacheCounts, CacheOutcomeKind, LogRef, LogTailData,
+};
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::borrow::Cow;
 
 /// How many completed targets to retain for the "slowest" table. The heap is
 /// capped at this, so the memory is constant regardless of graph size.
@@ -131,16 +134,20 @@ impl PartialOrd for Completed {
 pub(crate) struct RootFailure {
     /// The culprit target; for a file culprit, the address that led into it.
     pub addr: String,
-    /// The workspace-relative BUILD/`.bzl` file that did not evaluate, when
-    /// the culprit is that file rather than a target: what a reader is shown.
+    /// The workspace-relative source file a provider reported as not
+    /// evaluating (e.g. `d/BUILD`), when the culprit is that file rather
+    /// than a target: what a reader is shown.
     pub file: Option<String>,
     pub message: String,
     /// The subprocess's exit status, when the failure was a subprocess.
     pub exit_status: Option<String>,
-    /// The last lines of the target's log — the part that actually says what
-    /// went wrong. This is what makes a red build diagnosable from the report
-    /// rather than only from the job log.
+    /// The last lines of the target's log, as an older host's `ResultEnd`
+    /// carried them. A current host sends none (P13): [`log`](Self::log)
+    /// names the log instead.
     pub log_tail: Option<LogTailData>,
+    /// Where the target's log is (the record's reference, never its text):
+    /// read when a report is rendered ([`tail`](Self::tail)), never held.
+    pub log: Option<LogRef>,
     pub driver: Option<String>,
     pub duration_ms: Option<u64>,
     /// Targets that failed solely because this one did.
@@ -155,6 +162,26 @@ impl RootFailure {
     /// target.
     pub(crate) fn culprit(&self) -> &str {
         self.file.as_deref().unwrap_or(&self.addr)
+    }
+
+    /// The last lines of the target's log, at most `max_bytes` of them — the
+    /// part that actually says what went wrong, which makes a red build
+    /// diagnosable from the report rather than only from the job log. Read
+    /// from the failure slot each time a report renders
+    /// ([`hcore::failure_log::read_tail`]), so the tally holds a path per
+    /// root, never the text; an older host's tail as it sent it. `None` when
+    /// there is none, or the slot now holds another run's log.
+    pub(crate) fn tail(&self, max_bytes: usize) -> Option<Cow<'_, str>> {
+        // An event's own tail comes only from a host that predates
+        // `failure.log`: this one sends none, and the tail is read from the
+        // log file below. Kept so a plugin-gh newer than the heph running it
+        // still renders that heph's tails.
+        if let Some(t) = &self.log_tail {
+            return Some(Cow::Borrowed(t.text.as_str()));
+        }
+        let log = self.log.as_ref()?;
+        hcore::failure_log::read_tail(log, hcore::failure_log::TAIL_LINES_CAP, max_bytes)
+            .map(|t| Cow::Owned(t.text))
     }
 }
 
@@ -334,6 +361,8 @@ pub(crate) struct Failure<'a> {
     pub upstream_of: Option<&'a str>,
     pub exit_status: Option<&'a str>,
     pub log_tail: Option<&'a LogTailData>,
+    /// The record's log reference, from a current host.
+    pub log: Option<&'a LogRef>,
 }
 
 /// The package part of `//pkg/sub:name`, or the whole addr if it has no `:`.
@@ -411,6 +440,10 @@ impl Tally {
                 // The job summary names the failure; where its log is
                 // stays in the step's own output.
                 left_behind: _,
+                // The summary names the failure by its message; the record's
+                // box is the job log's. Its log reference is where the
+                // report reads the tail from.
+                failure,
                 duplicate,
             } => {
                 // Another end announced this culprit: close the row, count
@@ -427,6 +460,7 @@ impl Tally {
                         upstream_of: upstream_of.as_deref(),
                         exit_status: exit_status.as_deref(),
                         log_tail: log_tail.as_ref(),
+                        log: failure.as_ref().and_then(|f| f.log.as_ref()),
                     }),
                     ev.at_unix_ms,
                 );
@@ -601,7 +635,7 @@ impl Tally {
             // everything after it.
             BuildEventKind::Unknown => {}
 
-            // A BUILD file that did not evaluate: one root however many
+            // A source file that did not evaluate: one root however many
             // targets reached it, keyed by the address that led into it,
             // which is what the targets it took down name as `upstream_of`.
             BuildEventKind::FileFailed {
@@ -610,6 +644,7 @@ impl Tally {
                 file,
                 // The report names no path: the job log's block has it.
                 path: _,
+                failure: _,
             } => self.record_root(
                 entry,
                 Failure {
@@ -618,6 +653,7 @@ impl Tally {
                     upstream_of: None,
                     exit_status: None,
                     log_tail: None,
+                    log: None,
                 },
                 None,
                 ev.at_unix_ms,
@@ -760,6 +796,7 @@ impl Tally {
             message: failure.message.to_string(),
             exit_status: failure.exit_status.map(str::to_string),
             log_tail: failure.log_tail.cloned(),
+            log: failure.log.cloned(),
             driver: rec.and_then(|r| r.driver.as_deref().map(str::to_string)),
             duration_ms: rec.map(|r| at.saturating_sub(r.started_ms)),
             blocked: 0,
@@ -1057,6 +1094,7 @@ mod tests {
         t.apply(&ev(
             end,
             BuildEventKind::ResultEnd {
+                failure: None,
                 duplicate: false,
                 upstream_file: None,
                 path: Vec::new(),
@@ -1081,6 +1119,7 @@ mod tests {
         t.apply(&ev(
             10,
             BuildEventKind::ResultEnd {
+                failure: None,
                 duplicate: false,
                 upstream_file: None,
                 path: Vec::new(),
@@ -1099,6 +1138,7 @@ mod tests {
             t.apply(&ev(
                 20,
                 BuildEventKind::ResultEnd {
+                    failure: None,
                     duplicate: false,
                     upstream_file: None,
                     path: Vec::new(),
@@ -1129,7 +1169,7 @@ mod tests {
         );
     }
 
-    /// A broken BUILD file is one root however many requested targets live in
+    /// A broken source file is one root however many requested targets live in
     /// it: its `FileFailed` is the root, keyed by the address that led into
     /// it, the targets it took down count against that root, and a
     /// non-announcing end closes its row without a second root. That end
@@ -1149,6 +1189,7 @@ mod tests {
         t.apply(&ev(
             10,
             BuildEventKind::FileFailed {
+                failure: None,
                 file: "d/BUILD".into(),
                 entry: "//d:t1".into(),
                 error: "evaluating d/BUILD: name 'nope' is not defined".into(),
@@ -1157,6 +1198,7 @@ mod tests {
         ));
         let end =
             |addr: &str, upstream_of: Option<&str>, duplicate: bool| BuildEventKind::ResultEnd {
+                failure: None,
                 duplicate,
                 upstream_file: Some("d/BUILD".into()),
                 path: Vec::new(),
@@ -1234,6 +1276,7 @@ mod tests {
             t.apply(&ev(
                 5,
                 BuildEventKind::ResultEnd {
+                    failure: None,
                     duplicate: false,
                     upstream_file: None,
                     path: Vec::new(),
@@ -1904,6 +1947,7 @@ mod tests {
         t.apply(&ev(
             5,
             BuildEventKind::ResultEnd {
+                failure: None,
                 duplicate: false,
                 upstream_file: None,
                 path: Vec::new(),
@@ -1928,6 +1972,7 @@ mod tests {
             t.apply(&ev(
                 0,
                 BuildEventKind::ResultEnd {
+                    failure: None,
                     duplicate: false,
                     upstream_file: None,
                     path: Vec::new(),
@@ -1956,6 +2001,7 @@ mod tests {
             t.apply(&ev(
                 0,
                 BuildEventKind::ResultEnd {
+                    failure: None,
                     duplicate: false,
                     upstream_file: None,
                     path: Vec::new(),
@@ -1983,6 +2029,7 @@ mod tests {
         t.apply(&ev(
             10,
             BuildEventKind::ResultEnd {
+                failure: None,
                 duplicate: false,
                 upstream_file: None,
                 path: Vec::new(),
@@ -2035,6 +2082,7 @@ mod tests {
         t.apply(&ev(
             5_000,
             BuildEventKind::ResultEnd {
+                failure: None,
                 duplicate: false,
                 upstream_file: None,
                 path: Vec::new(),

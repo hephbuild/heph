@@ -90,7 +90,9 @@ impl Fds {
 
     fn raw_wrapper(&self) -> InteractiveWrapper {
         let (stdout, stderr) = (self.stdout.clone(), self.stderr.clone());
-        plain_output_wrapper(move || (appending(&stdout), appending(&stderr)))
+        plain_output_wrapper(heph::tui::failure_report::RenderCtx::default(), move || {
+            (appending(&stdout), appending(&stderr))
+        })
     }
 
     fn stdout(&self) -> String {
@@ -279,7 +281,7 @@ async fn build_target_shell_no_log_no_redaction() -> anyhow::Result<()> {
             let result = inner(Some(&mut typed), Some(&mut out), Some(&mut err), None).await;
             out.flush().await?;
             err.flush().await?;
-            result.map(|()| heph::engine::TerminalUse::default())
+            result.map(|_| heph::engine::TerminalUse::default())
         })
     });
     let opts = ResultOptions {

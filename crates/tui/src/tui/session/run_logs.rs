@@ -650,6 +650,7 @@ mod tests {
         SessionRecord {
             at_unix_ms: at,
             kind: Some(BuildEventKind::ResultEnd {
+                failure: None,
                 duplicate: false,
                 upstream_file: None,
                 path: Vec::new(),

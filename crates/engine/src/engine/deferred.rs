@@ -1,6 +1,7 @@
 //! Deferred values: a driver option whose value is computed by another target.
 //!
-//! A driver option's value has to be a literal in the BUILD file. But the value's
+//! A driver option's value has to be a literal in the target's spec (e.g. in
+//! the buildfile provider's BUILD file). But the value's
 //! owner is usually somewhere else — a role ARN in the Terraform that created the
 //! role, a registry per environment in a platform team's repo, a version in a
 //! release process. Copying it in makes a second source of truth that someone has
@@ -60,7 +61,8 @@
 //!
 //! `${src://…}` — the sandbox *path* of an artifact — is the other cell and is not
 //! implemented here; nor is `${env:NAME}`. Both are reserved by the decoder, so a
-//! BUILD file using one gets a clear refusal rather than a literal.
+//! spec using one (e.g. the buildfile provider's BUILD file) gets a clear
+//! refusal rather than a literal.
 
 use crate::engine::Engine;
 use crate::engine::driver::targetdef::{Input, InputMode, TargetDef};
@@ -95,7 +97,8 @@ pub use hcore::template::RESOURCE_KIND as RESOURCE;
 /// The largest a deferred value may be.
 ///
 /// A value is one line — a role ARN, an image tag, a registry host. The cap is
-/// what stops a one-line BUILD-file typo (a reference pointed at a Go binary)
+/// what stops a one-line typo in a target's spec (e.g. in the buildfile
+/// provider's BUILD file: a reference pointed at a Go binary)
 /// from buffering the whole artifact in memory before failing.
 const MAX_VALUE_BYTES: u64 = 64 * 1024;
 
@@ -570,6 +573,7 @@ impl Engine {
                 by_addr.insert(key, value);
             }
         }
+        // A resolved value is not a secret (I7, U20): nothing scrubs it.
         Ok(by_addr)
     }
 

@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use hcore::hartifactcontent;
 use hcore::hasync::{self, Cancellable};
 use hmodel::htaddr::Addr;
+use hplugin::diagnostic::DriverCall;
 use hplugin::driver::inputartifact;
 use hplugin::driver::outputartifact::Content::TarPath;
 use hplugin::driver::outputartifact::ContentPath;
@@ -296,17 +297,17 @@ pub async fn invoke_inner<'a, 'io>(
             driver
                 .run_shell(mreq, ctoken)
                 .await
-                .with_context(|| "driver run_shell")?
+                .context(DriverCall("driver run_shell"))?
         } else {
             run_shell_fallback(mreq, ctoken, shell_fallback)
                 .await
-                .with_context(|| "shell fallback")?
+                .context(DriverCall("shell fallback"))?
         }
     } else {
         driver
             .run(mreq, ctoken)
             .await
-            .with_context(|| "driver run")?
+            .context(DriverCall("driver run"))?
     };
     Ok(res)
 }
@@ -444,7 +445,8 @@ fn complete_deferred(
                 let origin_id = srcs.get(r.arg).ok_or_else(|| {
                     anyhow::anyhow!(
                         "the host did not resolve `{}` — a deferred value is filled in before the \
-                         command runs, so this is a bug in heph rather than in the BUILD file",
+                         command runs, so this is a bug in heph rather than in the target's \
+                         definition",
                         r.raw
                     )
                 })?;
@@ -534,6 +536,9 @@ pub async fn collect_outputs(
         )
     })
     .await
+    // Called once the process exited zero, so whatever fails here failed
+    // past it.
+    .map_err(hplugin::error::AfterProcess::mark)
 }
 
 /// The synchronous body of [`collect_outputs`], split out so it can be handed to

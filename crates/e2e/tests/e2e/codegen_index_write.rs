@@ -89,7 +89,7 @@ pub(crate) async fn run_with(
             }
             let msg: Vec<String> = failures
                 .iter()
-                .map(|f| format!("{}: {:#}", f.addr.format(), f.source))
+                .map(|f| format!("{}: {:#}", f.addr.format(), crate::common::failure_text(f)))
                 .collect();
             Err(anyhow::anyhow!("{}", msg.join("\n")))
         }
@@ -593,7 +593,7 @@ async fn codegen_write_back_failure_after_a_streamed_run_records_streamed() -> a
         let [failure] = failures.as_slice() else {
             panic!("one failure: {failures:?}");
         };
-        let msg = format!("{:#}", failure.source);
+        let msg = format!("{:#}", crate::common::failure_text(failure));
         assert!(msg.contains("gen.txt"), "the write-back's error: {msg}");
         assert_eq!(failure.streamed, streamed, "{msg}");
     }

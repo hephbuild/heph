@@ -16,3 +16,19 @@ fail-fast = false
 # Print a failing test's output where it fails and again in the final summary,
 # so the cause is at the bottom of a long CI log.
 failure-output = "immediate-final"
+
+# Tests that measure the process or the machine and must not share it.
+# `failure_memory_slope_bounded` reads peak RSS (`ru_maxrss`) at two points
+# and bounds the slope between them. Under the full suite's parallel load on
+# the macOS runner, the points moved by tens of KiB per failure, either way
+# (`55.3 KiB (1 MiB) vs 27.4 KiB (4 MiB)`), while linux and a local run
+# passed: noise from its neighbours, not a leak. So it runs alone: its group
+# admits one test at a time, and it takes every test thread, so nothing else
+# runs beside it. The bound is not widened.
+[test-groups]
+alone = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'package(e2e) & binary(failure_memory) & test(=failure_memory_slope_bounded)'
+test-group = 'alone'
+threads-required = 'num-test-threads'

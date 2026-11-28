@@ -183,6 +183,8 @@ impl Engine {
             *log_not_streamed = !driver.driver.streams_log();
         }
         let mut reservation = Some(reservation);
+        // What a `--fail-fast` stop finds running, until the run ends.
+        let _open = rs.open_execute(&addr_str);
         let res = crate::engine::event::emit_scope(
             &rs,
             start,
@@ -298,6 +300,9 @@ impl Engine {
                 // Whether the run's output reached a terminal: what a failure
                 // box reads to leave out a tail the user already saw (D6.1).
                 let streamed = ran.as_ref().is_ok_and(|(_, t)| t.streamed);
+                // The run itself failed: whether it was a stop was decided
+                // when it returned, and is on its error (CQ-3).
+                let stop_decided = matches!(&ran, Ok((Err(_), _)));
                 let run = ran.and_then(|(ran, _)| ran.stage(Boundary::Run, addr));
                 // End the live log while the sandbox still exists: a log the
                 // driver returned as an artifact is read from it.
@@ -383,8 +388,12 @@ impl Engine {
                         // request's token, or this execute abandoned by
                         // fail-fast — except for a timeout, which is a failure
                         // even when the request was cancelled during its grace.
+                        // A run that returned was decided as it returned
+                        // (the same answer its wrapper's line got); heph's
+                        // own failure around the run is judged here.
                         let cancelled = hplugin::error::is_cancelled(&err)
-                            || (crate::engine::run_timeout::stop_requested(rs.ctoken())
+                            || (!stop_decided
+                                && crate::engine::run_timeout::stop_requested(rs.ctoken())
                                 && !crate::engine::run_timeout::is_timed_out(&err));
                         let kept = if cancelled {
                             None
@@ -405,6 +414,7 @@ impl Engine {
                                 material: outputs_are_material,
                                 fixes: write_back.fixes,
                                 keep_log: true,
+                                scrub: rs.scrub_for(&[addr]),
                             };
                             // A run with a live log keeps it, through the
                             // descriptor; its guard unlinks it once the slot
@@ -759,8 +769,10 @@ impl Engine {
             .present_credentials(rs, addr, &sandbox_dir, &credentials)
             .await
             .stage(Boundary::Credentials, addr)?;
-        // The secrets the log is scrubbed of are known only once presented.
-        // Set before the run, so its first byte is scrubbed.
+        // The log's needles, set before the run so its first byte is
+        // scrubbed. The target's recorded failure is scrubbed of the same
+        // values, registered when they were acquired (I7,
+        // `acquire_credentials`).
         if let Some(log) = &log {
             log.set_needles(hdriver_support::redact::Needles::new(
                 credential_mounts.iter().flat_map(|m| m.redact.iter()),
@@ -877,8 +889,41 @@ impl Engine {
                             w.finish().await;
                         }
                     }
+                    // Whether the run was stopped rather than failed, decided
+                    // once, here, and carried on the error, so the line the
+                    // wrapper tells and the failure the execute keeps cannot
+                    // disagree (CQ-3). A driver may report a stop as an error
+                    // of its own (exec's bare "cancelled"), so the stop
+                    // decides: the request's token, or this execute abandoned
+                    // by fail-fast. A timeout is a failure even when the
+                    // request was cancelled during its grace.
+                    let res = match res {
+                        Err(e)
+                            if !hplugin::error::is_cancelled(&e)
+                                && hcore::hasync::Cancellable::is_cancelled(&stop)
+                                && !crate::engine::run_timeout::is_timed_out(&e) =>
+                        {
+                            Err(e.context(hplugin::error::CancelledError))
+                        }
+                        res => res,
+                    };
+                    // What the wrapper may say of a failed process while it
+                    // still holds the terminal (D6.1c). A stop is not one.
+                    let end = crate::engine::RunEnd {
+                        exec_failure: match &res {
+                            Err(e) if !hplugin::error::is_cancelled(e) => {
+                                crate::engine::failure_record::exec_failure(
+                                    &target.addr,
+                                    e,
+                                    &rs.scrub_for(&[&target.addr]),
+                                )
+                                .map(Box::new)
+                            }
+                            _ => None,
+                        },
+                    };
                     drop(tx.send(res));
-                    Ok(())
+                    Ok(end)
                 })
             }
         ));

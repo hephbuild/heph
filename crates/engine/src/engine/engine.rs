@@ -47,8 +47,8 @@ pub struct PluginInit {
     /// This checkout's codegen file index, the engine's one strong `Arc`.
     /// Built before any plugin (nothing opened, no disk access); the engine
     /// opens its db, if one exists, in the opening step at the start of the
-    /// first request that can reach a reader, before any BUILD evaluation or
-    /// target run, so a lookup finds it open. A lookup that somehow ran first
+    /// first request that can reach a reader, before any provider evaluates a
+    /// source file and before any target runs, so a lookup finds it open. A lookup that somehow ran first
     /// would open it itself (`CodegenIndex::snapshot` opens a db that
     /// appeared), so the order is a cost, never a correctness, matter.
     pub codegen_index: Arc<hwalk::codegen_index::CodegenIndex>,
@@ -59,12 +59,14 @@ pub struct PluginInit {
     pub runtime: tokio::runtime::Handle,
     /// This engine's function registry, for a plugin whose functions call
     /// another plugin's (`heph.<plugin>.<fn>` by `(plugin, fn)`). Unsealed while
-    /// plugins register — reading it then is an error — and sealed before the
-    /// first BUILD evaluation. Per engine: never share it across engines.
+    /// plugins register — reading it then is an error — and sealed before any
+    /// provider evaluates a source file. Per engine: never share it across
+    /// engines.
     pub functions: Arc<FunctionSlot>,
     /// Every registered driver's schema, sealed with [`Self::functions`]: an
-    /// error to read before. The buildfile plugin builds
-    /// `heph.types.<driver>.Kwargs` from it.
+    /// error to read before. A provider may expose it to its source files;
+    /// the buildfile plugin, for example, builds `heph.types.<driver>.Kwargs`
+    /// from it.
     ///
     /// **A plugin must never fold it into a def hash**, nor into anything an
     /// ordinary target's def is built from: every def would then move when any
@@ -102,8 +104,10 @@ pub enum PluginDriver {
 pub struct PluginParts {
     pub provider: Option<Box<dyn SDKProvider>>,
     pub drivers: Vec<PluginDriver>,
-    /// BUILD-file functions, `heph.<plugin>.<fn>`. A plugin may have functions
-    /// and no provider at all.
+    /// The functions providers expose to the source files they evaluate,
+    /// `heph.<plugin>.<fn>` (e.g. in the buildfile provider's BUILD file). A
+    /// plugin may have
+    /// functions and no provider at all.
     pub functions: Vec<PluginFnDef>,
     pub hooks: Vec<Arc<dyn SDKHook>>,
     pub runners: Vec<Arc<dyn hexecrunner::registry::ExecRunner>>,
@@ -145,7 +149,7 @@ pub struct PluginInfo {
     pub source: String,
     pub provider: Option<String>,
     pub drivers: Vec<String>,
-    /// As called from a BUILD file: `heph.<plugin>.<fn>`.
+    /// As a source file calls them: `heph.<plugin>.<fn>`.
     pub functions: Vec<String>,
     pub runners: Vec<String>,
     pub hooks: usize,
@@ -162,8 +166,9 @@ pub fn component_name(plugin: &str, local: &str) -> String {
     }
 }
 
-/// The rule a plugin name follows: it is the `heph.<name>` BUILD namespace, so
-/// it must be a Starlark identifier segment.
+/// The rule a plugin name follows: it is the `heph.<name>` namespace source
+/// files call its functions under, so it must be an identifier segment in
+/// the languages providers evaluate (the buildfile plugin's, for example).
 pub const PLUGIN_NAME_RULE: &str = "[a-z_][a-z0-9_]*";
 
 /// `PluginInit.name` for the test-only bare registrations, whose plugin is
@@ -204,7 +209,7 @@ pub fn validate_plugin_name(name: &str) -> anyhow::Result<()> {
     if !is_valid_name_segment(name) {
         anyhow::bail!(
             "invalid plugin name {name:?}: a plugin name must match `{PLUGIN_NAME_RULE}`, \
-             because it is the `heph.<name>` namespace in BUILD files"
+             because it is the plugin's `heph.<name>` namespace"
         );
     }
     Ok(())
@@ -370,7 +375,7 @@ pub struct Engine {
     /// (a cheap no-op on every path) unless `caches:` is configured.
     pub(crate) remote_caches: Arc<crate::engine::RemoteCacheSet>,
 
-    /// Every plugin's BUILD-file functions, keyed `(plugin, fn)`. Built
+    /// Every plugin's functions, keyed `(plugin, fn)`. Built
     /// incrementally while plugins register (`Arc::get_mut`, so only while the
     /// engine holds the only reference), then sealed into [`Self::function_slot`].
     /// The engine holds the only strong reference: the slot and every plugin's
@@ -768,6 +773,21 @@ impl Engine {
         ann
     }
 
+    /// Announce `rs`'s `RequestConfig` now, at the start of the request,
+    /// rather than when its first `result` call does (STAGE-18). A command
+    /// that resolves a target before building it (`run` of one address asks
+    /// whether it is an entrypoint) would otherwise send no event for as long
+    /// as that resolution takes, and a client's clock, which counts from the
+    /// first event, would read 0 through a slow provider. Once per request:
+    /// the `result` call's own announcement is then a no-op.
+    pub fn announce_request(
+        &self,
+        rs: &crate::engine::request_state::RequestState,
+        no_scratch: bool,
+    ) {
+        rs.announce_request_config(self.max_workers, no_scratch, || self.pool_announcement());
+    }
+
     /// Lower the admission-wait notice threshold, so a test can see
     /// `AdmissionWaitStart/End` without waiting the production five seconds.
     #[cfg(any(test, feature = "test-support"))]
@@ -1104,9 +1124,10 @@ impl Engine {
     }
 
     /// The sealed plugin-function registry (every plugin's `heph.<p>.<fn>`),
-    /// sealing it if nothing has yet. The same registry BUILD evaluation reads
-    /// — the LSP assembles its Starlark globals from it, and `heph inspect
-    /// functions` lists it. Built once, during registration; never rebuilt.
+    /// sealing it if nothing has yet. The same registry a provider's
+    /// evaluation reads — an editor integration (the buildfile LSP, for
+    /// example) assembles its globals from it, and `heph inspect functions`
+    /// lists it. Built once, during registration; never rebuilt.
     pub fn function_registry(&self) -> Arc<FunctionRegistry> {
         self.seal_functions();
         Arc::clone(&self.functions)
@@ -1129,25 +1150,28 @@ impl Engine {
         });
     }
 
-    /// The config schema a registered driver exposes. Used by the BUILD-file LSP
-    /// to complete and document a target's driver-specific config fields. Returns
+    /// The config schema a registered driver exposes. Used by a plugin's
+    /// language server (e.g. the buildfile plugin's BUILD-file LSP) to complete
+    /// and document a target's driver-specific config fields. Returns
     /// `None` only for an unknown driver name; a known config-less driver returns
     /// `Some(DriverSchema::default())` (no fields).
     pub fn driver_schema(&self, name: &str) -> Option<crate::engine::driver::DriverSchema> {
         self.drivers_by_name.get(name).map(|d| d.driver.schema())
     }
 
-    /// Names of all registered drivers, sorted. Used by the BUILD-file LSP to
-    /// complete the `driver =` argument of a `target(...)` call.
+    /// Names of all registered drivers, sorted. Used by a plugin's language
+    /// server to complete a target's driver name (e.g. the `driver =` argument
+    /// of a `target(...)` call in a BUILD file).
     pub fn driver_names(&self) -> Vec<String> {
         let mut names: Vec<String> = self.drivers_by_name.keys().cloned().collect();
         names.sort();
         names
     }
 
-    /// The state schema a registered provider exposes, if any. Used by the
-    /// BUILD-file LSP to complete and document `provider_state(provider="<name>", …)`
-    /// args. Returns `None` for unknown providers or providers without a schema.
+    /// The state schema a registered provider exposes, if any. Used by a
+    /// plugin's language server to complete and document a provider's state
+    /// args (e.g. `provider_state(provider="<name>", …)` in a BUILD file).
+    /// Returns `None` for unknown providers or providers without a schema.
     pub fn provider_state_schema(&self, name: &str) -> Option<provider::StateSchema> {
         self.providers_by_name
             .get(name)
@@ -1212,7 +1236,8 @@ impl Engine {
 
     /// The opening step of the codegen index: once per engine, at the start
     /// of the first request that can reach a reader (a provider call that may
-    /// evaluate BUILD files, a target run, a write-back). Opens this
+    /// evaluate its source files, e.g. BUILD files; a target run; a
+    /// write-back). Opens this
     /// checkout's db if it exists, on the blocking pool, under `rs`'s cancel
     /// token; never creates, imports or walks. A newer, corrupt or unreadable
     /// db fails the request, naming the file. A cancelled or failed step
@@ -1300,7 +1325,7 @@ impl Engine {
         if self.function_slot.is_sealed() {
             anyhow::bail!(
                 "{source} registered after the engine sealed its function registry; every \
-                 plugin must be registered before the first BUILD evaluation"
+                 plugin must be registered before a provider first evaluates its sources"
             );
         }
         let PluginParts {
@@ -2013,7 +2038,7 @@ mod tests {
                     format!(
                         "registering builtin plugin {name:?}: invalid plugin name {name:?}: a \
                          plugin name must match `[a-z_][a-z0-9_]*`, because it is the \
-                         `heph.<name>` namespace in BUILD files"
+                         plugin's `heph.<name>` namespace"
                     )
                 );
             }
@@ -2185,7 +2210,8 @@ mod tests {
 
         /// D6: once the registry is sealed, registering a plugin is an error
         /// naming the plugin — never a function that silently misses the
-        /// namespace every BUILD file already sees.
+        /// namespace every evaluated source file (e.g. a BUILD file) already
+        /// sees.
         #[tokio::test]
         async fn plugin_registered_after_seal_is_refused() {
             let (_root, mut e) = engine();

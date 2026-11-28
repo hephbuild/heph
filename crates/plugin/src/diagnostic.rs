@@ -19,6 +19,15 @@
 //! struct Keyed(plugin::diagnostic::Diagnostic, plugin::diagnostic::SourceLoc);
 //! #[derive(Clone)]
 //! struct Framed(plugin::diagnostic::StageFrame);
+//! #[derive(Clone)]
+//! struct Recorded(plugin::error::FailureRecord);
+//! # fn main() {}
+//! ```
+//!
+//! `failure_record_has_no_hash` (the compacted failure, `hcore::failure`):
+//! ```compile_fail,E0277
+//! #[derive(Hash)]
+//! struct Recorded(plugin::error::FailureRecord);
 //! # fn main() {}
 //! ```
 //!
@@ -83,6 +92,25 @@ pub enum Boundary {
 }
 
 impl Boundary {
+    /// Its name, as a [`FailureRecord::boundary`](hcore::failure::FailureRecord::boundary)
+    /// holds it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::GetSpec => "get_spec",
+            Self::GetDef => "get_def",
+            Self::Link => "link",
+            Self::Meta => "meta",
+            Self::Execute => "execute",
+            Self::Run => "run",
+            Self::ResolveScratch => "resolve_scratch",
+            Self::AcquireScratch => "acquire_scratch",
+            Self::ResolveDeferred => "resolve_deferred",
+            Self::ResolveCredentials => "resolve_credentials",
+            Self::Credentials => "credentials",
+            Self::Admit => "admit",
+        }
+    }
+
     /// The stage a failure under this boundary belongs to.
     pub fn stage(self) -> Stage {
         match self {
@@ -142,6 +170,27 @@ impl fmt::Display for StageFrame {
 
 impl std::error::Error for StageFrame {}
 
+/// The frame a managed driver's call adds over its error (`driver run`,
+/// `driver run_shell`, `shell fallback`): plumbing that says where the
+/// error came back from, never what went wrong. A `{:#}` log line keeps it;
+/// no rendered message does (F2), so it is typed, not matched as text.
+#[derive(Debug, Clone, Copy)]
+pub struct DriverCall(pub &'static str);
+
+impl fmt::Display for DriverCall {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for DriverCall {}
+
+/// Whether `f` is an engine frame a rendered message leaves out: a
+/// [`StageFrame`] or a [`DriverCall`].
+pub fn is_internal_frame(f: &hcore::hmemoizer::ErrorFrame<'_>) -> bool {
+    f.downcast_ref::<StageFrame>().is_some() || f.downcast_ref::<DriverCall>().is_some()
+}
+
 /// `e` under a [`StageFrame`] for `boundary` and `addr`.
 pub fn with_stage(e: anyhow::Error, boundary: Boundary, addr: &Addr) -> anyhow::Error {
     hcore::hmemoizer::nest(e).context(StageFrame {
@@ -178,22 +227,30 @@ pub fn find_diagnostic(e: &anyhow::Error) -> Option<&Diagnostic> {
 }
 
 /// `e`'s cause as text frames, outermost first: every frame but the
-/// [`StageFrame`]s, an empty frame (data riding the chain) dropped, and a frame
+/// internal ones ([`is_internal_frame`]), an empty frame (data riding the chain) dropped, and a frame
 /// that ends with its source's text cut back to its own part (as
 /// `hcore::hmemoizer::chain_frames` does). `e`'s own [`Diagnostic`]
 /// ([`find_diagnostic`]) is printed alone: when there is one, it is the only
 /// frame. A [`MultiError`] is one frame listing each member's cause, so every
-/// member is shown, each as this function shows it.
+/// member is shown, each as this function shows it. A surfaced
+/// [`TargetFailure`](crate::error::TargetFailure) is its record's diagnostic.
 pub fn cause_frames(e: &anyhow::Error) -> Vec<String> {
     if let Some(d) = find_diagnostic(e) {
         return vec![d.to_string()];
     }
     let texts: Vec<String> = hcore::hmemoizer::frames(e)
         .into_iter()
-        .filter(|f| f.downcast_ref::<StageFrame>().is_none())
-        .map(|f| match f.downcast_ref::<MultiError>() {
-            Some(multi) => members_cause(multi),
-            None => f.error().to_string(),
+        .filter(|f| !is_internal_frame(f))
+        .map(|f| {
+            if let Some(multi) = f.downcast_ref::<MultiError>() {
+                members_cause(multi)
+            } else if let Some(t) = f.downcast_ref::<crate::error::TargetFailure>() {
+                // A surfaced failure holds no chain (D7b): its cause is its
+                // record's diagnostic.
+                t.record.diagnostic.to_string()
+            } else {
+                f.error().to_string()
+            }
         })
         .filter(|s| !s.is_empty())
         .collect();
@@ -292,16 +349,14 @@ mod tests {
     #[test]
     fn rendered_messages_have_no_internal_frames() {
         let a = addr("//a:x");
-        let e = anyhow::anyhow!("process exited with status: exit status: 5").context("driver run");
+        let e = anyhow::anyhow!("process exited with status: exit status: 5")
+            .context(DriverCall("driver run"));
         let e = with_stage(e, Boundary::Run, &a);
         let e = with_stage(shared(e), Boundary::Execute, &a);
         let e = with_stage(with_stage(e, Boundary::Meta, &a), Boundary::Link, &a);
         let e = with_stage(e, Boundary::GetDef, &a);
         let frames = cause_frames(&e);
-        assert_eq!(
-            frames,
-            ["driver run", "process exited with status: exit status: 5"]
-        );
+        assert_eq!(frames, ["process exited with status: exit status: 5"]);
         for f in &frames {
             for internal in ["get_def:", "link", "meta", "execute "] {
                 assert!(!f.starts_with(internal), "{f}");

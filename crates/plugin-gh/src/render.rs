@@ -31,7 +31,7 @@
 //! characters, sections are emitted in priority order, and anything dropped says
 //! so.
 
-use crate::tally::{Counters, Tally};
+use crate::tally::{Counters, RootFailure, Tally};
 
 /// GitHub's hard cap on an issue-comment body.
 pub(crate) const COMMENT_LIMIT: usize = 65_536;
@@ -396,7 +396,7 @@ fn push_live_failures(b: &mut Budgeted, t: &Tally, c: &Counters) {
         // Every listed root carries its log tail: the message is an index, the
         // log is what lets a reader start diagnosing from the PR. The first is
         // open; the rest are collapsed so the comment still reads on a phone.
-        if let Some(tail) = r.log_tail.as_ref().and_then(live_log_tail) {
+        if let Some(tail) = live_log_tail(r) {
             let block = code_block(&tail);
             if i == 0 {
                 tail_md = format!("\n{block}");
@@ -433,9 +433,10 @@ fn push_live_failures(b: &mut Budgeted, t: &Tally, c: &Counters) {
 ///
 /// Shorter than the final view's tail because up to [`LIVE_ROOT_ROWS`] of them
 /// share one comment section with every other heph step in the job. Bounded in
-/// bytes only, like [`final_log_tail`]: the engine already applied `--log-lines`.
-fn live_log_tail(tail: &hcore::events::LogTailData) -> Option<String> {
-    bounded_tail(&tail.text, LIVE_LOG_BYTES)
+/// bytes only, like [`final_log_tail`]. Read from the failure slot as the
+/// comment renders ([`RootFailure::tail`]), at most the bytes it keeps.
+fn live_log_tail(r: &RootFailure) -> Option<String> {
+    bounded_tail(&r.tail(LIVE_LOG_BYTES)?, LIVE_LOG_BYTES)
 }
 
 /// `text` in a fenced code block that `text` cannot close.
@@ -451,11 +452,11 @@ fn code_block(text: &str) -> String {
     format!("{fence}\n{text}\n{fence}\n")
 }
 
-/// The full retained tail for the final report, bounded in bytes only — the
-/// engine already applied the user's `--log-lines`, so a line cap here would
-/// silently override their choice.
-fn final_log_tail(tail: &hcore::events::LogTailData) -> Option<String> {
-    bounded_tail(&tail.text, FINAL_LOG_BYTES)
+/// The retained tail for the final report, bounded in bytes only: an older
+/// host's tail had the user's `--log-lines` applied already, so a line cap
+/// here would silently override their choice.
+fn final_log_tail(r: &RootFailure) -> Option<String> {
+    bounded_tail(&r.tail(FINAL_LOG_BYTES)?, FINAL_LOG_BYTES)
 }
 
 /// The last whole lines of `text`, in order, stopping before `max_bytes`.
@@ -794,7 +795,7 @@ fn push_final_failures(b: &mut Budgeted, t: &Tally, c: &Counters) {
         // The log tail is the whole product of a failure report — the message is
         // an index, this is what actually says what went wrong. Bounded in bytes:
         // one line of a minified bundle can be megabytes on its own.
-        if let Some(tail) = r.log_tail.as_ref().and_then(final_log_tail) {
+        if let Some(tail) = final_log_tail(r) {
             s.push_str(&code_block(&tail));
             s.push('\n');
         }
@@ -930,6 +931,7 @@ mod tests {
             t.apply(&ev(
                 1_000,
                 BuildEventKind::ResultEnd {
+                    failure: None,
                     duplicate: false,
                     upstream_file: None,
                     path: Vec::new(),
@@ -949,6 +951,7 @@ mod tests {
             t.apply(&ev(
                 2_000,
                 BuildEventKind::ResultEnd {
+                    failure: None,
                     duplicate: false,
                     upstream_file: None,
                     path: Vec::new(),
@@ -1054,6 +1057,7 @@ mod tests {
             t.apply(&ev(
                 1_000,
                 BuildEventKind::ResultEnd {
+                    failure: None,
                     duplicate: false,
                     upstream_file: None,
                     path: Vec::new(),
@@ -1093,6 +1097,7 @@ mod tests {
         t.apply(&ev(
             1_000,
             BuildEventKind::ResultEnd {
+                failure: None,
                 duplicate: false,
                 upstream_file: None,
                 path: Vec::new(),
@@ -1120,6 +1125,7 @@ mod tests {
         t.apply(&ev(
             1_000,
             BuildEventKind::ResultEnd {
+                failure: None,
                 duplicate: false,
                 upstream_file: None,
                 path: Vec::new(),
@@ -1167,6 +1173,7 @@ mod tests {
             t.apply(&ev(
                 2,
                 BuildEventKind::ResultEnd {
+                    failure: None,
                     duplicate: false,
                     upstream_file: None,
                     path: Vec::new(),
@@ -1229,6 +1236,7 @@ mod tests {
         t.apply(&ev(
             252_000,
             BuildEventKind::ResultEnd {
+                failure: None,
                 duplicate: false,
                 upstream_file: None,
                 path: Vec::new(),
@@ -1293,6 +1301,7 @@ mod tests {
         t.apply(&ev(
             5,
             BuildEventKind::ResultEnd {
+                failure: None,
                 duplicate: false,
                 upstream_file: None,
                 path: Vec::new(),
@@ -1476,6 +1485,7 @@ mod tests {
             t.apply(&ev(
                 1_000,
                 BuildEventKind::ResultEnd {
+                    failure: None,
                     duplicate: false,
                     upstream_file: None,
                     path: Vec::new(),
@@ -1676,6 +1686,7 @@ mod tests {
             t.apply(&ev(
                 2,
                 BuildEventKind::ResultEnd {
+                    failure: None,
                     duplicate: false,
                     upstream_file: None,
                     path: Vec::new(),

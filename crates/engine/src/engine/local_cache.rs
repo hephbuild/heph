@@ -3829,12 +3829,13 @@ mod tests {
             Ok(_) => panic!("the run must fail"),
             Err(e) => e,
         };
-        assert!(format!("{err:#}").contains("exit status: 1"), "{err:#}");
+        assert!(format!("{err:#}").contains("exit status 1"), "{err:#}");
         let hashin = engine
             .failure_slots()
             .read(&addr)
             .expect("the failure filled its slot")
-            .hashin;
+            .hashin
+            .expect("a run's slot names its revision");
         assert!(
             engine.read_manifest(&addr, &hashin)?.is_none(),
             "a failed run filed a manifest"

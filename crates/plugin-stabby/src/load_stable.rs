@@ -265,6 +265,7 @@ pub fn decode_functions(
                 func: Arc::new(StableRemoteFn {
                     handle: Arc::clone(&handle),
                     name: name.clone(),
+                    plugin: plugin.to_owned(),
                 }),
                 name,
             })
@@ -403,7 +404,12 @@ pub fn load(
     let host_drivers = decode_drivers(drivers)
         .with_context(|| format!("loading plugin {name:?}"))?
         .into_iter()
-        .map(|(local, d)| (local, d.with_plugin_abi(reported_abi.as_deref())))
+        .map(|(local, d)| {
+            (
+                local,
+                d.with_plugin_abi(reported_abi.as_deref()).with_plugin(name),
+            )
+        })
         .collect();
 
     let mut host_hooks = Vec::new();
@@ -443,6 +449,9 @@ struct ItemStreamIter<D> {
     stream: DynItemStream,
     decode: D,
     done: bool,
+    /// The plugin the stream comes from: the host, not the plugin, names it
+    /// on a diagnostic the stream ends with.
+    plugin: String,
 }
 
 impl<T, D: FnMut(&[u8]) -> anyhow::Result<T>> Iterator for ItemStreamIter<D> {
@@ -477,13 +486,21 @@ impl<T, D: FnMut(&[u8]) -> anyhow::Result<T>> Iterator for ItemStreamIter<D> {
             // stage is a spec's.
             Some(Body::StreamEnd(se)) => {
                 self.done = true;
-                se.error
-                    .into_option()
-                    .map(|e| Err(convert::error_from_pb(e, Stage::Spec)))
+                se.error.into_option().map(|e| {
+                    Err(convert::error_from_pb_of(
+                        e,
+                        Stage::Spec,
+                        Some(self.plugin.as_str()),
+                    ))
+                })
             }
             Some(Body::Error(e)) => {
                 self.done = true;
-                Some(Err(convert::error_from_pb(*e, Stage::Spec)))
+                Some(Err(convert::error_from_pb_of(
+                    *e,
+                    Stage::Spec,
+                    Some(self.plugin.as_str()),
+                )))
             }
             _ => {
                 self.done = true;
@@ -563,6 +580,7 @@ enum Chunk {
 fn drain_run(
     stream: DynItemStream,
     chunks: &tokio::sync::mpsc::Sender<Chunk>,
+    plugin: Option<&str>,
 ) -> anyhow::Result<ManagedRunResponse> {
     loop {
         let bytes = stream.next();
@@ -598,7 +616,7 @@ fn drain_run(
             // plugin attached. The plugin shares this process, so their paths
             // are ours.
             Some(pb::run_out_frame::Msg::Failure(f)) => {
-                return Err(convert::run_failure_from_pb(*f));
+                return Err(convert::run_failure_from_pb_of(*f, plugin));
             }
             // A dropped receiver means the caller stopped reading; keep draining
             // so the run still reaches its result. A plain thread, never a
@@ -712,6 +730,7 @@ impl Provider for StableRemoteProvider {
                 stream,
                 decode: list_item_decoder(),
                 done: false,
+                plugin: self.name.clone(),
             })
                 as Box<
                     dyn Iterator<Item = anyhow::Result<ListResponse>> + Send,
@@ -743,6 +762,7 @@ impl Provider for StableRemoteProvider {
                 stream,
                 decode: decode_list_package_item,
                 done: false,
+                plugin: self.name.clone(),
             })
                 as Box<
                     dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send,
@@ -788,10 +808,11 @@ impl Provider for StableRemoteProvider {
                     Ok(pb::get_error::Kind::Cancelled) => Err(GetError::Other(anyhow::Error::new(
                         hplugin::error::CancelledError,
                     ))),
-                    Ok(_) => Err(GetError::Other(convert::plugin_error(
+                    Ok(_) => Err(GetError::Other(convert::plugin_error_of(
                         ge.message.unwrap_or_default(),
                         ge.diagnostic,
                         Stage::Spec,
+                        Some(self.name.as_str()),
                     ))),
                     Err(kind) => Err(GetError::Other(
                         kind.context(ge.message.unwrap_or_default()),
@@ -825,7 +846,11 @@ impl Provider for StableRemoteProvider {
                 Body::ProbeResp(pr) => Ok(ProbeResponse {
                     states: convert::states_from_pb(pr.states)?,
                 }),
-                Body::Error(e) => Err(convert::error_from_pb(*e, Stage::Spec)),
+                Body::Error(e) => Err(convert::error_from_pb_of(
+                    *e,
+                    Stage::Spec,
+                    Some(self.name.as_str()),
+                )),
                 other => anyhow::bail!("unexpected probe response: {other:?}"),
             }
         })
@@ -845,6 +870,8 @@ impl Provider for StableRemoteProvider {
 struct StableRemoteFn {
     handle: Arc<DynPluginFunctions>,
     name: String,
+    /// The plugin exporting the function, named on its diagnostics.
+    plugin: String,
 }
 
 #[async_trait]
@@ -871,7 +898,11 @@ impl PluginFn for StableRemoteFn {
             .await;
         match decode_unary(&bytes)? {
             Body::CallFunctionResp(r) => convert::fn_outcome_from_pb(*r),
-            Body::Error(e) => Err(convert::error_from_pb(*e, Stage::Eval)),
+            Body::Error(e) => Err(convert::error_from_pb_of(
+                *e,
+                Stage::Eval,
+                Some(self.plugin.as_str()),
+            )),
             other => anyhow::bail!("unexpected call_function response: {other:?}"),
         }
     }
@@ -883,6 +914,9 @@ impl PluginFn for StableRemoteFn {
 pub struct StableRemoteManagedDriver {
     inner: Arc<DynManagedDriver>,
     name: String,
+    /// The plugin exporting the driver (`name` is the driver's own), named on
+    /// its diagnostics. `None` until [`with_plugin`](Self::with_plugin).
+    plugin: Option<String>,
     /// Decoded once, at load: `schema` has no error channel, and the plugin's
     /// answer never changes.
     schema: Arc<DriverSchema>,
@@ -913,6 +947,7 @@ impl StableRemoteManagedDriver {
         Ok(Self {
             inner: Arc::new(inner),
             name,
+            plugin: None,
             schema: Arc::new(schema),
             cancel_keys: true,
             log_capture: true,
@@ -928,6 +963,14 @@ impl StableRemoteManagedDriver {
     pub fn with_plugin_abi(mut self, reported: Option<&str>) -> Self {
         self.cancel_keys = reported.is_some_and(reads_cancel_key);
         self.log_capture = reported.is_some_and(reads_log_capture);
+        self
+    }
+
+    /// The plugin exporting this driver: the host names it on a diagnostic
+    /// the driver returns, whatever the plugin wrote there.
+    #[must_use]
+    pub fn with_plugin(mut self, plugin: impl Into<String>) -> Self {
+        self.plugin = Some(plugin.into());
         self
     }
 }
@@ -1019,7 +1062,11 @@ impl ManagedDriver for StableRemoteManagedDriver {
                     "ParseResponse.target_def",
                 )?)?,
             }),
-            Body::Error(e) => Err(convert::error_from_pb(*e, Stage::Parse)),
+            Body::Error(e) => Err(convert::error_from_pb_of(
+                *e,
+                Stage::Parse,
+                self.plugin.as_deref(),
+            )),
             other => anyhow::bail!("unexpected parse response: {other:?}"),
         }
     }
@@ -1050,7 +1097,11 @@ impl ManagedDriver for StableRemoteManagedDriver {
                     "ApplyTransitiveResponse.target_def",
                 )?)?,
             }),
-            Body::Error(e) => Err(convert::error_from_pb(*e, Stage::Link)),
+            Body::Error(e) => Err(convert::error_from_pb_of(
+                *e,
+                Stage::Link,
+                self.plugin.as_deref(),
+            )),
             other => anyhow::bail!("unexpected apply_transitive response: {other:?}"),
         }
     }
@@ -1196,9 +1247,10 @@ impl StableRemoteManagedDriver {
         // cancel trips the plugin's run token (which stops the subprocess).
         let (tx, rx) = futures::channel::oneshot::channel();
         let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::channel::<Chunk>(RELAY_QUEUE);
+        let plugin = self.plugin.clone();
         std::thread::spawn(move || {
             // Receiver dropped only if the caller gave up; ignore send failure.
-            drop(tx.send(drain_run(resp_stream, &chunk_tx)));
+            drop(tx.send(drain_run(resp_stream, &chunk_tx, plugin.as_deref())));
             // `chunk_tx` drops here, after the result is sent: that close is
             // what tells the pump every chunk before the terminal frame is in.
         });
@@ -1986,7 +2038,7 @@ mod tests {
                 ..Default::default()
             };
             let (tx, _rx) = tokio::sync::mpsc::channel(RELAY_QUEUE);
-            drain_run(item_stream(std::iter::once(encode_svec(&frame))), &tx)
+            drain_run(item_stream(std::iter::once(encode_svec(&frame))), &tx, None)
         }
 
         let many = |k: usize| (0..k).map(|i| format!("/nix/store/p{i}")).collect();

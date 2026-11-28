@@ -12,6 +12,7 @@
 //! hash and build the dependencies the input hash needs, and never runs or
 //! locks the target itself.
 
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::io::{self, BufRead as _, BufReader, Write};
 use std::sync::Arc;
@@ -180,7 +181,9 @@ where
     let found = match found {
         Ok(Some(found)) => found,
         Ok(None) => {
-            say(&mut err, &no_log(addr, opts.hashin.as_deref()));
+            let line =
+                never_ran(engine, addr).unwrap_or_else(|| no_log(addr, opts.hashin.as_deref()));
+            say(&mut err, &line);
             return Ok(Shown::Nothing);
         }
         Err(e) => {
@@ -199,6 +202,12 @@ where
                 return Ok(Shown::Nothing);
             }
             if let Some(e) = e.downcast_ref::<LogUnavailable>() {
+                if matches!(e.info.source, LogSource::FailureSlot)
+                    && let Some(line) = never_ran(engine, addr)
+                {
+                    say(&mut err, &line);
+                    return Ok(Shown::Nothing);
+                }
                 let status = Status::new(&e.info, req.sessions.as_ref());
                 say(
                     &mut err,
@@ -528,6 +537,46 @@ fn unavailable_next_step(source: &LogSource) -> &'static str {
             "a run that misses the cache records a new one"
         }
     }
+}
+
+/// What `heph log` says for a culprit that failed before its process ran,
+/// read from its failure slot (or the slot of the source file its provider
+/// reported): it never ran, so there is no log to produce by running it
+/// again (D5). `None` for any other target, a skipped one included: it has
+/// no slot.
+fn never_ran(engine: &Engine, addr: &Addr) -> Option<String> {
+    let view = match crate::commands::inspect::failure::inspect_view(engine, addr) {
+        Ok(view) => view?,
+        Err(e) => {
+            tracing::debug!(addr = %addr, error = %format!("{e:#}"), "reading the failure slot for heph log");
+            return None;
+        }
+    };
+    view.before_run().then(|| {
+        format!(
+            "heph: {addr} failed {}; it never ran. See `heph inspect failure {addr}`",
+            failed_while(view.stage, view.file.as_deref())
+        )
+    })
+}
+
+/// When in the build a failure of `stage` before the run happened. An
+/// evaluation names the file that did not evaluate, as its provider reported
+/// it, when the slot holds one.
+fn failed_while(stage: hcore::diagnostic::Stage, file: Option<&str>) -> Cow<'static, str> {
+    use hcore::diagnostic::Stage;
+    let fixed = match (stage, file) {
+        (Stage::Eval, Some(file)) => return Cow::Owned(format!("while {file} was evaluated")),
+        (Stage::Eval, None) => "while its source file was evaluated",
+        (Stage::Spec, _) => "while its spec was resolved",
+        (Stage::Parse, _) => "while its driver parsed its definition",
+        (Stage::Link, _) => "while its inputs were linked",
+        (Stage::Cache, _) => "while its cache was read",
+        (Stage::Config, _) => "while .hephconfig was read",
+        (Stage::Cli, _) => "on the command line",
+        (Stage::Run, _) => "before its process started",
+    };
+    Cow::Borrowed(fixed)
 }
 
 fn no_log(addr: &Addr, hashin: Option<&str>) -> String {

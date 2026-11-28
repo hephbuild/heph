@@ -37,6 +37,10 @@ pub(crate) const EMBED_MAX: usize = 2048;
 /// Longest addr allowed into the embed.
 const EMBED_ADDR_MAX: usize = 128;
 
+/// How much of a log's end an annotation reads for its one line: the
+/// annotation is cut at 400 chars anyway.
+const ANNOTATION_TAIL_BYTES: usize = 4 * 1024;
+
 /// The marker wrapping the embedded document.
 pub(crate) const EMBED_OPEN: &str = "<!-- heph:json ";
 pub(crate) const EMBED_CLOSE: &str = " -->";
@@ -117,7 +121,7 @@ fn root_json(r: &RootFailure) -> serde_json::Value {
         "exit_status": r.exit_status,
         "blocked_count": r.blocked,
         "message": r.message,
-        "log_tail": r.log_tail.as_ref().map(|l| &l.text),
+        "log_tail": r.tail(hcore::failure_log::TAIL_MAX_BYTES),
     })
 }
 
@@ -197,8 +201,9 @@ pub(crate) fn annotations(roots: &[RootFailure], limit: usize) -> Vec<String> {
                 detail.push_str(": ");
             }
             detail.push_str(r.message.lines().next().unwrap_or("failed"));
-            if let Some(tail) = &r.log_tail
-                && let Some(last) = tail.text.lines().rev().find(|l| !l.trim().is_empty())
+            // The annotation shows one line: a small read of the log's end.
+            if let Some(tail) = r.tail(ANNOTATION_TAIL_BYTES)
+                && let Some(last) = tail.lines().rev().find(|l| !l.trim().is_empty())
             {
                 detail.push_str(" — ");
                 detail.push_str(last);
@@ -283,6 +288,7 @@ mod tests {
             t.apply(&ev(
                 1_000,
                 BuildEventKind::ResultEnd {
+                    failure: None,
                     duplicate: false,
                     upstream_file: None,
                     path: Vec::new(),
@@ -306,6 +312,7 @@ mod tests {
             t.apply(&ev(
                 2_000,
                 BuildEventKind::ResultEnd {
+                    failure: None,
                     duplicate: false,
                     upstream_file: None,
                     path: Vec::new(),
@@ -417,6 +424,7 @@ mod tests {
         t.apply(&ev(
             0,
             BuildEventKind::ResultEnd {
+                failure: None,
                 duplicate: false,
                 upstream_file: None,
                 path: Vec::new(),

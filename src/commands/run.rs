@@ -436,25 +436,39 @@ fn build_display(raw: bool, shell: bool) -> BuildDisplay {
 /// and `printf B | …` would share a hashin and B would get A's outputs.
 ///
 /// Whether the output streamed is read off the bytes written to `streams`
-/// that are terminals ([`terminal_tap`]).
+/// that are terminals ([`terminal_tap`]). A failed process's streamed line
+/// words paths with `text` ([`streamed_line_text`]).
 pub fn plain_output_wrapper<O, E>(
+    text: tui::failure_report::RenderCtx,
     streams: impl Fn() -> (O, E) + Send + Sync + 'static,
 ) -> InteractiveWrapper
 where
     O: tokio::io::AsyncWrite + std::os::fd::AsFd + Send + Sync + Unpin + 'static,
     E: tokio::io::AsyncWrite + std::os::fd::AsFd + Send + Sync + Unpin + 'static,
 {
+    let text = Arc::new(text);
     Arc::new(move |inner| {
         let (stdout, stderr) = streams();
+        let text = Arc::clone(&text);
         Box::pin(async move {
             let tap = terminal_tap::TerminalTap::new();
             let mut stdout = terminal_tap::Tapped::new(stdout, &tap);
             let mut stderr = terminal_tap::Tapped::new(stderr, &tap);
             let result = inner(None, Some(&mut stdout), Some(&mut stderr), None).await;
-            let terminal = terminal_tap::finish(&tap, &mut stdout, &mut stderr).await;
-            result.map(|()| terminal)
+            terminal_tap::finish_run(&tap, &mut stdout, &mut stderr, result, &text).await
         })
     })
+}
+
+/// What a streamed run's failure line is worded with: `engine`'s home
+/// redacted and its workspace's paths relative, as the box words them (CQ
+/// r2). Reads the filesystem, so it is built once, before the run.
+pub fn streamed_line_text(engine: &crate::engine::Engine) -> tui::failure_report::RenderCtx {
+    tui::failure_report::RenderCtx {
+        redact: tui::text::Redact::heph_home(&engine.home),
+        rel: tui::text::WorkspaceRel::workspace(engine.root()),
+        ..tui::failure_report::RenderCtx::default()
+    }
 }
 
 /// The caller's window size as it changes, for a build target's `--shell`, whose
@@ -902,7 +916,7 @@ impl RunApp {
                 // there is no tail for a box to leave out.
                 let result = inner(None, None, None, None)
                     .await
-                    .map(|()| crate::engine::TerminalUse::default());
+                    .map(|_| crate::engine::TerminalUse::default());
                 // Before any error renders: this leaves the terminal cooked
                 // again, whatever the run returned.
                 let pump = session.lock().unwrap_or_else(|e| e.into_inner()).take();
@@ -994,16 +1008,19 @@ impl App for RunApp {
         tui::CiProgressView::new(self.progress_label())
             .with_log_lines(self.args.log_lines)
             .with_redact(tui::text::Redact::heph_home(&self.engine.home))
+            .with_workspace(self.engine.root())
     }
 
     async fn run(self, ctx: AppContext) -> anyhow::Result<Option<hcore::process::Exit>> {
         let display = build_display(self.args.raw, self.args.shell.is_some());
+        let text = streamed_line_text(&self.engine);
         let interactive: Option<InteractiveWrapper> = if display == BuildDisplay::Raw {
-            Some(plain_output_wrapper(|| {
+            Some(plain_output_wrapper(text, || {
                 (tokio::io::stdout(), tokio::io::stderr())
             }))
         } else if ctx.interactive() {
             let pauser = ctx.pauser();
+            let text = Arc::new(text);
             // Who owns Ctrl-C while the target holds the terminal. `--shell` puts
             // the user at a live shell inside the sandbox, and its keystrokes —
             // Ctrl-C first among them — are for that session, so the trigger stays
@@ -1017,6 +1034,7 @@ impl App for RunApp {
             };
             Some(Arc::new(move |inner| {
                 let pauser = pauser.clone();
+                let text = Arc::clone(&text);
                 Box::pin(async move {
                     let _guard = pauser.pause_for(pause_for).await;
                     // A `--shell` target parks a person at a prompt: nothing
@@ -1067,8 +1085,9 @@ impl App for RunApp {
                         winsize.as_ref().map(|w| w.sizes.clone()),
                     )
                     .await;
-                    let terminal = terminal_tap::finish(&tap, &mut stdout, &mut stderr).await;
-                    result.map(|()| terminal)
+                    // The failure's one line, if its process failed, lands
+                    // here, before the TUI comes back over it (D6.1c).
+                    terminal_tap::finish_run(&tap, &mut stdout, &mut stderr, result, &text).await
                 })
             }))
         } else {
@@ -1145,6 +1164,10 @@ impl App for RunApp {
                 terminal: shell_terminal,
             }),
         );
+        // The request's first event, before anything resolves: the clock
+        // counts from it, and the lookups below can take as long as a
+        // provider does to evaluate its source (STAGE-18).
+        self.engine.announce_request(&rs, self.scratch_off);
         // Both `--shell=` warnings are this command's: the one before the run
         // here, the one after it below, on the entrypoint path and the build
         // path alike.
@@ -2148,7 +2171,7 @@ mod tests {
         wrapped(Box::new(move |_, _, _, _| {
             Box::pin(async move {
                 target.store(true, Ordering::Relaxed);
-                Ok(())
+                Ok(crate::engine::RunEnd::default())
             })
         }))
         .await?;

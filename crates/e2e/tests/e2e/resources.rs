@@ -132,7 +132,11 @@ async fn build(
         .await;
     let mut msg = String::new();
     for f in rs.take_failures() {
-        msg.push_str(&format!("{}: {:#}\n", f.addr.format(), f.source));
+        msg.push_str(&format!(
+            "{}: {:#}\n",
+            f.addr.format(),
+            crate::common::failure_text(&f)
+        ));
     }
     match batch {
         Err(e) => msg.push_str(&format!("{e:#}\n")),
@@ -1728,10 +1732,10 @@ fn assert_left_as_a_cancellation(c: &CancelledWhileQueued) {
     }
     for f in &c.failures {
         assert!(
-            hplugin::error::is_cancelled(&f.source),
-            "{} recorded a failure, not a cancellation: {:#}",
+            f.record.cancelled,
+            "{} recorded a failure, not a cancellation: {}",
             f.addr.format(),
-            f.source
+            crate::common::failure_text(f)
         );
     }
     assert_eq!(c.after.main.queued, 0, "left the queue: {:?}", c.after);

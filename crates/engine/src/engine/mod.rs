@@ -86,7 +86,7 @@ pub use result::CopyOutputs;
 pub use result::EResult;
 pub use result::OutputMatcher;
 pub use result::ResultOptions;
-pub use result::{InteractiveInner, InteractiveWrapper, TerminalUse};
+pub use result::{InteractiveInner, InteractiveWrapper, RunEnd, TerminalUse};
 pub use spec::EngineTargetSpec;
 // The managed-driver contract lives in fuse-free `heph-driver-support`; the
 // FUSE backend + routing bridge live in `heph-driver-bridge`. Re-export both at
@@ -97,6 +97,7 @@ pub use hdriver_support::driver_managed;
 pub use hdriver_support::driver_managed_os;
 mod execute;
 pub mod failure_gc;
+pub(crate) mod failure_record;
 pub mod failure_slot;
 mod host_paths;
 pub mod invoke;

@@ -9,8 +9,9 @@
 //! and forwards nothing (I4).
 //!
 //! Output contract 2 (D5): every culprit has a record, `selected: false` when
-//! the selection did not name it, and a BUILD file that did not evaluate is
-//! one with `addr: null` and `file` set. A skipped target names its culprit
+//! the selection did not name it, and a source file that did not evaluate
+//! (as its provider reported it, e.g. `d/BUILD`) is one with `addr: null` and
+//! `file` set. A skipped target names its culprit
 //! in `root` (a target) or `root_file` (a file), never both, with the full
 //! `path` to it and the count of `more` culprits it reaches: those come from
 //! the request-end pass over the dependency graph, so skipped records are
@@ -30,7 +31,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context as _;
-use hcore::events::{BuildEvent, BuildEventKind, CacheOutcomeKind, EventReceiver, EventSender};
+use hcore::diagnostic::{Hint, SourceLoc, Stage};
+use hcore::events::{
+    BuildEvent, BuildEventKind, CacheOutcomeKind, EventReceiver, EventSender, FailureRecord,
+};
 use hplugin::error::{Culprit, TargetFailure};
 use serde::Serialize;
 
@@ -73,6 +77,10 @@ pub enum CacheTier {
     Remote,
     /// No cache had it, so it ran.
     Miss,
+    /// The target does not cache (`cache = False`), so no cache was
+    /// looked in and it ran (U22).
+    #[serde(rename = "none")]
+    Uncached,
 }
 
 /// What a failed run left in its failure slot, as `heph inspect failure`
@@ -95,16 +103,17 @@ pub struct RunFailure {
 /// or `root_file`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, output::Record)]
 pub struct RunEntry {
-    /// The target's address; null for a BUILD file that did not evaluate
+    /// The target's address; null for a source file that did not evaluate
     /// (`file` names it). Read `.addr // .file`.
     pub addr: Option<String>,
-    /// The workspace-relative BUILD or `.bzl` file that did not evaluate;
-    /// null on every other record.
+    /// The workspace-relative source file that did not evaluate, as its
+    /// provider reported it (e.g. `d/BUILD`); null on every other record.
     pub file: Option<String>,
     /// How it ended: cached, ran, failed, skipped or cancelled.
     pub outcome: Outcome,
-    /// The cache lookup: local, remote or miss; null when no cache was
-    /// consulted (caching off, `--force`, or it failed before the lookup).
+    /// The cache lookup: local, remote or miss; none when the target does
+    /// not cache (`cache = False`) and ran; null when no cache was consulted
+    /// for another reason (`--force`, or it failed before its run).
     pub cache: Option<CacheTier>,
     /// The name of the remote cache a `remote` hit came from; null otherwise.
     pub remote: Option<String>,
@@ -123,7 +132,7 @@ pub struct RunEntry {
     /// when the culprit is a file (`root_file`), and for ran, cached and
     /// cancelled.
     pub root: Option<String>,
-    /// The culprit when it is a BUILD or `.bzl` file that did not evaluate:
+    /// The culprit when it is a source file that did not evaluate:
     /// the file record's own `file`, or a skipped target's nearest culprit.
     /// Always a workspace-relative path; at most one of `root` and
     /// `root_file` is set, the pair mirroring `addr` and `file`.
@@ -133,16 +142,39 @@ pub struct RunEntry {
     pub more: Option<u64>,
     /// On a failed culprit: a shortest path from a requested target to it,
     /// the one known when it failed (it can differ between runs in rare
-    /// cases). On `skipped`: from this target to where its culprit was
-    /// recorded, over the final graph. Inclusive and never elided; null
-    /// elsewhere.
+    /// cases), inclusive and never elided. On `skipped`: from this target to
+    /// where its culprit was recorded, over the final graph, inclusive and
+    /// elided as text elides a path (this target, the first hop, the last
+    /// two; `path_elided` counts the rest). Null elsewhere.
     pub path: Option<Vec<String>>,
+    /// On a `skipped` record whose `path` was elided: how many addresses
+    /// were dropped from its middle. Absent otherwise (U23).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path_elided: Option<u64>,
     /// The selection named it. A culprit outside the selection is written
     /// too, with false; a file record is never selected.
     pub selected: bool,
     /// What its failed run left behind (as `heph inspect failure`); null
     /// unless it failed running.
     pub failure: Option<RunFailure>,
+    /// On a failed culprit: the stage of the build that raised it (eval,
+    /// spec, parse, link, run, cache, config or cli); null elsewhere.
+    pub stage: Option<Stage>,
+    /// On a failed culprit: where in a source file it was raised,
+    /// the file workspace-relative; null when it names no place, and
+    /// elsewhere.
+    pub location: Option<SourceLoc>,
+    /// On a failed culprit: what the user can do about it, each with its
+    /// kind; empty elsewhere. A hint's wording is not contract.
+    pub hints: Vec<Hint>,
+    /// On a failed culprit: a cap cut something from its record (the
+    /// message, its causes, a source line).
+    pub truncated: bool,
+    /// On a failed culprit: a newer failed run filled its failure slot
+    /// again, so the slot's log is no longer this failure's.
+    pub log_replaced: bool,
+    /// On a failed culprit: its run's output reached a terminal as it ran.
+    pub streamed: bool,
     /// Its output files, the set `--list-out` prints (narrowed by
     /// `--output`). Selecting it costs what `--list-out` does: a remote
     /// hit's outputs are downloaded, which the default fields never do.
@@ -262,8 +294,15 @@ fn blank(addr: Option<String>, outcome: Outcome) -> RunEntry {
         root_file: None,
         more: None,
         path: None,
+        path_elided: None,
         selected: false,
         failure: None,
+        stage: None,
+        location: None,
+        hints: Vec::new(),
+        truncated: false,
+        log_replaced: false,
+        streamed: false,
         outputs: None,
         hashin: None,
     }
@@ -292,14 +331,38 @@ impl Fold {
         crate::tui::text::message(&one_line(text), &self.redact, &self.rel).into_owned()
     }
 
-    /// A culprit's `error`: its recorded cause (the frames the box prints,
-    /// without the engine's boundary frames), else what the event said.
-    fn culprit_line(&self, f: Option<&TargetFailure>, event: Option<&str>) -> Option<String> {
-        let frames = f.map(|f| hplugin::diagnostic::cause_frames(&f.source).join(": "));
-        match frames.as_deref() {
-            Some(text) if !text.is_empty() => Some(self.line(text)),
+    /// A culprit's `error`: its record's message, the one its box leads
+    /// with, else what the event said.
+    fn culprit_line(&self, rec: Option<&FailureRecord>, event: Option<&str>) -> Option<String> {
+        match rec.map(|r| r.diagnostic.message.as_str()) {
+            Some(text) if !text.trim().is_empty() => Some(self.line(text)),
             _ => event.map(|e| self.line(e)),
         }
+    }
+
+    /// A failed culprit's `error` and contract 2 facts, from `rec`: the
+    /// record the event carried, else the request's.
+    fn culprit_facts(
+        &self,
+        entry: &mut RunEntry,
+        rec: Option<&FailureRecord>,
+        event: Option<&str>,
+    ) {
+        entry.error = self.culprit_line(rec, event);
+        let Some(rec) = rec else {
+            return;
+        };
+        let facts = crate::tui::failure_report::json_facts(rec);
+        entry.stage = Some(facts.stage);
+        entry.location = facts.location;
+        entry.hints = facts
+            .hints
+            .into_iter()
+            .map(|h| Hint::new(h.kind, self.line(&h.text)))
+            .collect();
+        entry.truncated = facts.truncated;
+        entry.log_replaced = facts.log_replaced;
+        entry.streamed = facts.streamed;
     }
 
     /// Fold one event; the entries it completes, in order.
@@ -341,8 +404,14 @@ impl Fold {
                 live.start_ms.get_or_insert(ev.at_unix_ms);
                 Vec::new()
             }
-            BuildEventKind::ExecuteStart { addr, .. } => {
-                self.live.entry(addr.clone()).or_default().ran = true;
+            BuildEventKind::ExecuteStart { addr, cache, .. } => {
+                let live = self.live.entry(addr.clone()).or_default();
+                live.ran = true;
+                // A target that does not cache emits no cache outcome: its
+                // record says so rather than reading as unknown (U22).
+                if !*cache {
+                    live.cache.get_or_insert(CacheTier::Uncached);
+                }
                 Vec::new()
             }
             BuildEventKind::CacheOutcome { addr, outcome, .. } => {
@@ -375,6 +444,7 @@ impl Fold {
                 timed_out,
                 cancelled,
                 duplicate,
+                failure: record,
                 ..
             } => {
                 let live = self.live.remove(addr).unwrap_or_default();
@@ -458,7 +528,10 @@ impl Fold {
                                 path.clone()
                             });
                         }
-                        entry.error = self.culprit_line(failure.as_deref(), error.as_deref());
+                        let rec = record
+                            .as_deref()
+                            .or_else(|| failure.as_deref().map(|f| f.record.as_ref()));
+                        self.culprit_facts(&mut entry, rec, error.as_deref());
                         self.place(addr, entry)
                     }
                     _ => {
@@ -467,13 +540,14 @@ impl Fold {
                     }
                 }
             }
-            // A BUILD file that did not evaluate: its own record, once, and
+            // A source file that did not evaluate: its own record, once, and
             // the address that led into it is skipped because of it.
             BuildEventKind::FileFailed {
                 file,
                 entry,
                 error,
                 path,
+                failure: record,
             } => {
                 let mut ready = Vec::new();
                 if self.files.insert(file.clone()) {
@@ -485,7 +559,10 @@ impl Fold {
                         (Some(f), true) => f.path.iter().map(Addr::format).collect(),
                         _ => path.clone(),
                     });
-                    rec.error = self.culprit_line(failure.as_deref(), Some(error));
+                    let record = record
+                        .as_deref()
+                        .or_else(|| failure.as_deref().map(|f| f.record.as_ref()));
+                    self.culprit_facts(&mut rec, record, Some(error));
                     ready.push(rec);
                 }
                 if !self.done.contains(entry) {
@@ -593,8 +670,9 @@ impl Fold {
     /// was written before this, so a culprit precedes its skipped records.
     ///
     /// The skipped records are made one at a time, as the writer asks for
-    /// them: each one's `path` is the full chain to its culprit, so holding
-    /// them all would cost the square of a deep chain's depth.
+    /// them: each one's path is walked as the full chain to its culprit
+    /// (then elided, U23), so holding them all would cost the square of a
+    /// deep chain's depth.
     fn finish(&mut self, rs: &RequestState) -> Finish {
         let early = if self.matched_complete {
             Vec::new()
@@ -662,7 +740,11 @@ impl Iterator for Finish {
                     Culprit::Target(a) => entry.root = Some(a.format()),
                     Culprit::File(f) => entry.root_file = Some(f.to_string()),
                 }
-                entry.path = Some(rec.path.iter().map(Addr::format).collect());
+                // Elided by the text's rule (U23): a skipped record's path
+                // can be as deep as the graph, once per skipped target.
+                let (head, hidden, tail) = crate::tui::failure_rows::path_elision(&rec.path);
+                entry.path = Some(head.iter().chain(tail).map(Addr::format).collect());
+                entry.path_elided = (hidden > 0).then(|| u64::try_from(hidden).unwrap_or(u64::MAX));
                 entry.more = Some(u64::try_from(rec.more).unwrap_or(u64::MAX));
             }
             // Not in the graph the pass walks: what the end named.
@@ -1017,6 +1099,7 @@ mod tests {
 
     fn end(addr: &str, error: Option<&str>, upstream_of: Option<&str>) -> BuildEventKind {
         BuildEventKind::ResultEnd {
+            failure: None,
             duplicate: false,
             upstream_file: None,
             path: Vec::new(),
@@ -1060,14 +1143,24 @@ mod tests {
     struct Known(Vec<Arc<TargetFailure>>);
 
     impl Known {
+        /// `a` failed with `e`, its record compacted as the engine stores it.
         fn target(mut self, a: &str, e: &str) -> Self {
             let addr = crate::htaddr::parse_addr(a).expect("addr");
-            self.0.push(Arc::new(TargetFailure::new(
-                addr,
-                None,
-                anyhow::anyhow!("{e}"),
-            )));
+            self.0.push(Arc::new(
+                TargetFailure::new(addr).with_record(Arc::new(record(a, e))),
+            ));
             self
+        }
+    }
+
+    /// `a`'s record, `message` its diagnostic's.
+    fn record(a: &str, message: &str) -> FailureRecord {
+        FailureRecord {
+            addr: Some(a.to_string()),
+            entry: a.to_string(),
+            ..FailureRecord::new(
+                hcore::diagnostic::Diagnostic::new(Stage::Run, message).with_addr(a),
+            )
         }
     }
 
@@ -1097,6 +1190,7 @@ mod tests {
 
     fn file_failed(file: &str, entry: &str, path: &[&str]) -> BuildEventKind {
         BuildEventKind::FileFailed {
+            failure: None,
             file: file.to_string(),
             entry: entry.to_string(),
             error: "d/BUILD:3:1: fail: boom\nTraceback (most recent call last):".to_string(),
@@ -1127,12 +1221,22 @@ mod tests {
             root_file: Some("p/BUILD".to_string()),
             more: Some(1),
             path: Some(vec!["//p:t".to_string()]),
+            path_elided: Some(2),
             selected: true,
             failure: Some(RunFailure {
                 log: Some(PathBuf::from("/h/log.txt")),
                 out: None,
                 fixes: None,
             }),
+            stage: Some(Stage::Eval),
+            location: SourceLoc::checked("p/BUILD".to_string(), 3, 1).ok(),
+            hints: vec![Hint::new(
+                hcore::diagnostic::HintKind::DidYouMean,
+                "did you mean",
+            )],
+            truncated: true,
+            log_replaced: true,
+            streamed: true,
             outputs: Some(vec![PathBuf::from("o.txt")]),
             hashin: Some("h".to_string()),
         })
@@ -1287,7 +1391,7 @@ mod tests {
         assert!(f.held[0].entry.selected);
     }
 
-    /// A BUILD file that did not evaluate: one record, `addr` and `root`
+    /// A source file that did not evaluate: one record, `addr` and `root`
     /// null, `file` and `root_file` the file, never selected, however many
     /// targets it took down; the requested target that led into it is held
     /// as skipped.
@@ -1346,22 +1450,31 @@ mod tests {
         );
     }
 
-    /// A culprit's `error` is its recorded cause on one line, not the
-    /// event's flattened chain, with control bytes escaped.
+    /// `end` carrying `rec`, as the engine's announcing end does.
+    fn end_with(addr: &str, error: &str, rec: FailureRecord) -> BuildEventKind {
+        let mut e = end(addr, Some(error), None);
+        if let BuildEventKind::ResultEnd { failure, .. } = &mut e {
+            *failure = Some(Box::new(rec));
+        }
+        e
+    }
+
+    /// A culprit's `error` is its record's message on one line, the one its
+    /// box leads with: not the event's flattened chain, not the request's
+    /// copy when the event carries one, with control bytes escaped.
     #[test]
-    fn culprit_error_is_its_cause_on_one_line() {
-        let addr = crate::htaddr::parse_addr("//p:bad").expect("addr");
-        let e = anyhow::anyhow!("line one\n  line two\u{1b}[31m").context("outer");
-        let known = Known(vec![Arc::new(TargetFailure::new(addr, None, e))]);
+    fn culprit_error_is_its_records_message_on_one_line() {
+        let known = Known::default().target("//p:bad", "the request's copy");
+        let rec = record("//p:bad", "outer: line one\n  line two\u{1b}[31m");
         let (entries, _) = fold_with(
             vec![
                 ev(0, matched(&["//p:bad"], true)),
                 ev(
                     1,
-                    end(
+                    end_with(
                         "//p:bad",
-                        Some("get_def: //p:bad: outer: line one\n  line two"),
-                        None,
+                        "get_def: //p:bad: outer: line one\n  line two",
+                        rec,
                     ),
                 ),
             ],
@@ -1374,6 +1487,78 @@ mod tests {
         );
         assert!(error.starts_with("outer: line one line two"), "{error:?}");
         assert!(!error.contains("get_def"), "{error:?}");
+    }
+
+    /// Contract 2's failure facts on a failed culprit and a file record, from
+    /// the record the event carried: stage, location, hints (scrubbed to one
+    /// line), the caps and the log's state. Every other record has
+    /// `stage: null`, `location: null`, `hints: []` and false flags.
+    #[test]
+    fn failed_culprits_carry_the_records_facts() {
+        let mut rec = record("//p:bad", "unknown field");
+        rec.diagnostic.stage = Stage::Eval;
+        rec.diagnostic.location = SourceLoc::checked("p/BUILD".into(), 4, 5).ok();
+        rec.diagnostic.hints = vec![Hint::new(
+            hcore::diagnostic::HintKind::DidYouMean,
+            "did you mean\n`deps`?",
+        )];
+        rec.diagnostic.truncated = true;
+        rec.streamed = true;
+        let mut file_rec = record("//d:t", "evaluating d/BUILD: boom");
+        file_rec.addr = None;
+        file_rec.file = Some("d/BUILD".into());
+        file_rec.diagnostic.stage = Stage::Eval;
+        let mut file_event = file_failed("d/BUILD", "//d:t", &["//d:t"]);
+        if let BuildEventKind::FileFailed { failure, .. } = &mut file_event {
+            *failure = Some(Box::new(file_rec));
+        }
+        let (entries, _) = fold_with(
+            vec![
+                ev(0, matched(&["//p:bad", "//p:ok", "//d:t"], true)),
+                ev(1, end_with("//p:bad", "flat", rec)),
+                ev(2, end("//p:ok", None, None)),
+                ev(3, file_event),
+            ],
+            &Known::default(),
+        );
+        let bad = entries
+            .iter()
+            .find(|e| e.addr.as_deref() == Some("//p:bad"))
+            .expect("the culprit");
+        assert_eq!(bad.stage, Some(Stage::Eval));
+        let loc = bad.location.as_ref().expect("a location");
+        assert_eq!((loc.file.as_str(), loc.line, loc.col), ("p/BUILD", 4, 5));
+        assert_eq!(
+            bad.hints,
+            [Hint::new(
+                hcore::diagnostic::HintKind::DidYouMean,
+                "did you mean `deps`?"
+            )]
+        );
+        assert!(bad.truncated && bad.streamed && !bad.log_replaced);
+        let json = serde_json::to_value(bad).expect("json");
+        assert_eq!(json["stage"], "eval");
+        assert_eq!(json["location"]["line"], 4);
+        assert_eq!(json["hints"][0]["kind"], "did_you_mean");
+
+        let file = entries
+            .iter()
+            .find(|e| e.file.as_deref() == Some("d/BUILD"))
+            .expect("the file record");
+        assert_eq!(file.stage, Some(Stage::Eval));
+        assert_eq!(file.error.as_deref(), Some("evaluating d/BUILD: boom"));
+
+        let ok = entries
+            .iter()
+            .find(|e| e.addr.as_deref() == Some("//p:ok"))
+            .expect("the success");
+        let json = serde_json::to_value(ok).expect("json");
+        assert_eq!(json["stage"], serde_json::Value::Null);
+        assert_eq!(json["location"], serde_json::Value::Null);
+        assert_eq!(json["hints"], serde_json::json!([]));
+        for flag in ["truncated", "log_replaced", "streamed"] {
+            assert_eq!(json[flag], false, "{flag}");
+        }
     }
 
     /// The request-end pass: held records get `root`, `path` and `more`;
@@ -1452,13 +1637,9 @@ mod tests {
         rs.add_dep_for_test(&a("//b:z"), &a("//d:t")).expect("edge");
         rs.record_failure(
             Culprit::Target(a("//c:y")),
-            Arc::new(TargetFailure::new(
-                a("//c:y"),
-                None,
-                anyhow::anyhow!("boom"),
-            )),
+            Arc::new(TargetFailure::new(a("//c:y"))),
         );
-        let mut file = TargetFailure::new(a("//d:t"), None, anyhow::anyhow!("eval"));
+        let mut file = TargetFailure::new(a("//d:t"));
         file.file = Some(Arc::from("d/BUILD"));
         rs.record_failure(Culprit::File(Arc::from("d/BUILD")), Arc::new(file));
         let mut to_file = end("//b:z", Some("dependency failed"), Some("//d:t"));
@@ -1514,11 +1695,7 @@ mod tests {
         rs.add_dep_for_test(&a("//p:b"), &a("//p:c")).expect("edge");
         rs.record_failure(
             Culprit::Target(a("//p:c")),
-            Arc::new(TargetFailure::new(
-                a("//p:c"),
-                None,
-                anyhow::anyhow!("boom"),
-            )),
+            Arc::new(TargetFailure::new(a("//p:c"))),
         );
         let (_, mut f) = fold_with(
             vec![
@@ -1552,10 +1729,7 @@ mod tests {
         }
         rs.add_dep_for_test(&chain[n - 1], &c).expect("edge");
         rs.mark_requested(&chain[0]);
-        rs.record_failure(
-            Culprit::Target(c.clone()),
-            Arc::new(TargetFailure::new(c, None, anyhow::anyhow!("boom"))),
-        );
+        rs.record_failure(Culprit::Target(c.clone()), Arc::new(TargetFailure::new(c)));
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
         let events = std::iter::once(ev(0, matched(&refs, true)))
             .chain(
@@ -1566,11 +1740,11 @@ mod tests {
         fold_with(events, &Known::default()).1
     }
 
-    /// FQ-4: a pure chain of 1000 selected targets, all skipped under the
-    /// one culprit at its foot. Every node is asked for its record, and each
-    /// record carries the whole path down: the output is quadratic in the
-    /// chain's depth, 501,500 path entries for 1000 records, made by one
-    /// pass over the graph.
+    /// FQ-4, U23: a pure chain of 1000 selected targets, all skipped under
+    /// the one culprit at its foot, made by one pass over the graph. Each
+    /// record's path down is elided as text elides it, so the output is
+    /// linear in the chain's depth: at most 4 entries a record, 3,998 for
+    /// 1000 records, `path_elided` counting the 497,502 left out.
     #[tokio::test]
     async fn finish_pure_chain_output_size() {
         const N: usize = 1_000;
@@ -1579,18 +1753,31 @@ mod tests {
             Arc::new(Engine::new(crate::engine::Config::for_tests(dir.path())).expect("engine"));
         let rs = engine.new_state_with_events(false, None);
         let mut f = skipped_chain(&rs, N);
-        let paths: Vec<usize> = f
+        let paths: Vec<(usize, u64)> = f
             .finish(&rs)
-            .map(|e| e.path.as_ref().map_or(0, Vec::len))
+            .map(|e| {
+                (
+                    e.path.as_ref().map_or(0, Vec::len),
+                    e.path_elided.unwrap_or(0),
+                )
+            })
             .collect();
         assert_eq!(rs.report_passes(), 1);
         assert_eq!(paths.len(), N, "one record per skipped target");
-        // `n_i`'s path is `n_i … n_999, c`: N - i + 1 entries.
-        assert_eq!(paths.first(), Some(&(N + 1)));
-        assert_eq!(paths.last(), Some(&2));
-        let total: usize = paths.iter().sum();
-        assert_eq!(total, N * (N + 1) / 2 + N);
-        assert_eq!(total, 501_500);
+        // `n_i`'s path is `n_i … n_999, c`: N - i + 1 entries, 4 of them
+        // kept once it is longer than 5.
+        assert_eq!(paths.first(), Some(&(4, u64::try_from(N - 3).expect("n"))));
+        assert_eq!(paths.get(N - 5), Some(&(4, 2)), "6 entries: 2 left out");
+        assert_eq!(paths.get(N - 4), Some(&(5, 0)), "5 entries: whole");
+        assert_eq!(paths.last(), Some(&(2, 0)));
+        let kept: usize = paths.iter().map(|(k, _)| k).sum();
+        assert_eq!(kept, 3_998);
+        let left_out: u64 = paths.iter().map(|(_, e)| e).sum();
+        assert_eq!(
+            u64::try_from(kept).expect("kept") + left_out,
+            501_500,
+            "the whole chain, counted"
+        );
     }
 
     /// FQ round 2: `finish` streams. Each skipped record's path is built
@@ -1768,6 +1955,38 @@ mod tests {
         );
         assert_eq!(entries[2].outcome, Outcome::Failed);
         assert!(entries[2].timed_out);
+    }
+
+    /// U22: a `cache = False` target that ran, failed or not, reads
+    /// `cache: "none"`; one that never reached its run stays null.
+    #[test]
+    fn uncached_target_reads_cache_none() {
+        let uncached = |addr: &str| {
+            let mut e = execute(addr);
+            if let BuildEventKind::ExecuteStart { cache, .. } = &mut e {
+                *cache = false;
+            }
+            e
+        };
+        let (entries, _) = fold(vec![
+            ev(0, matched(&["//p:ok", "//p:bad", "//p:early"], true)),
+            ev(1, uncached("//p:ok")),
+            ev(2, end("//p:ok", None, None)),
+            ev(3, uncached("//p:bad")),
+            ev(4, end("//p:bad", Some("exit status 3"), None)),
+            ev(5, end("//p:early", Some("parse"), None)),
+        ]);
+        let got: Vec<_> = entries.iter().map(|e| (e.outcome, e.cache)).collect();
+        assert_eq!(
+            got,
+            [
+                (Outcome::Ran, Some(CacheTier::Uncached)),
+                (Outcome::Failed, Some(CacheTier::Uncached)),
+                (Outcome::Failed, None),
+            ]
+        );
+        let json = serde_json::to_value(&entries[1]).expect("json");
+        assert_eq!(json["cache"], "none");
     }
 
     fn collected(whole: bool, cancelled: bool) -> Collected<()> {

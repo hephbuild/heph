@@ -121,6 +121,38 @@ fn succeeding_target_exits_zero() {
     assert!(out.status.success(), "{}", describe(&out));
 }
 
+/// A BUILD file that does not parse.
+const BROKEN_BUILD: &str = "target(name = \"t\", driver = \"bash\", run = \"true\")\nbroken(\n";
+
+/// D5: `heph query <addr>` on a target whose BUILD file does not evaluate
+/// fails as `run` does: one box for the file, and exit 1, never the
+/// "selection incomplete" gap report. The exit code is `main`'s, past the
+/// last function an in-process test can call; the culprit it records is
+/// `crates/e2e`'s `query_records_the_broken_file_as_culprit`.
+#[test]
+fn query_on_broken_file_one_box_exits_1() {
+    let dist = Dist::locate();
+    let ws = Workspace::new().expect("workspace");
+    ws.write("d/BUILD", BROKEN_BUILD).expect("write BUILD");
+
+    let out = ws.run(&dist, &["query", "//d:t"]).expect("query");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{}", describe(&out));
+    assert!(out.stdout.is_empty(), "{}", describe(&out));
+    assert_eq!(
+        stderr.matches("✗ ").count(),
+        1,
+        "one box: {}",
+        describe(&out)
+    );
+    assert!(stderr.contains("✗ d/BUILD"), "{}", describe(&out));
+    assert!(
+        !stderr.contains("selection incomplete"),
+        "{}",
+        describe(&out)
+    );
+}
+
 /// With stderr piped rather than attached to a terminal, the interactive
 /// renderer must stay off. A tool that drives a viewport when its output is
 /// being captured corrupts every CI log and every `heph … | tee` — and the tty
@@ -225,6 +257,68 @@ fn fail_fast_after_failure_exits_1() {
             .expect("run");
         assert_eq!(out.status.code(), Some(1), "run {i}: {}", describe(&out));
     }
+}
+
+/// U6 non-TUI: with no terminal, a failure's box is printed as it happens,
+/// while a sibling is still running, and the end of the run does not print
+/// it again: one header, then only the totals. The sibling runs until the
+/// test opens its gate, after the box is seen.
+#[test]
+fn non_tui_box_before_slow_sibling_not_repeated() {
+    let dist = Dist::locate();
+    let ws = Workspace::new().expect("workspace");
+    let gate = ws.root().join("gate-open");
+    ws.write(
+        "pkg/BUILD",
+        &format!(
+            concat!(
+                "target(name = \"slow\", driver = \"bash\", cache = False,",
+                // Bounded, so a test that fails before opening the gate
+                // leaves no loop behind its killed heph.
+                " run = \"i=0; while [ ! -e {gate} ] && [ $i -lt 1200 ]; do sleep 0.05;",
+                " i=$((i+1)); done\")\n",
+                "target(name = \"bad\", driver = \"bash\", run = [\"echo bad-line\", \"exit 1\"],",
+                " cache = False)\n",
+            ),
+            gate = gate.display(),
+        ),
+    )
+    .expect("write BUILD");
+    let mut run = Bg::spawn(&ws, &dist, &["run", "-e", "//pkg:slow || //pkg:bad"]);
+    let header = "✗ //pkg:bad · exit status 1";
+    common::wait_until("//pkg:bad's box", SHORT, || run.stderr().contains(header));
+    assert!(
+        !recorded(&run.dir, "ResultEnd", "//pkg:slow"),
+        "the box waited for the slow sibling\n{}",
+        run.stderr()
+    );
+    assert!(
+        run.stderr().contains("│ bad-line"),
+        "the box carries the tail\n{}",
+        run.stderr()
+    );
+    std::fs::write(&gate, b"").expect("open the gate");
+    let status = run.wait();
+    let stderr = run.stderr();
+    assert_eq!(status.code(), Some(1), "{stderr}");
+    assert!(
+        recorded(&run.dir, "ResultEnd", "//pkg:slow"),
+        "the sibling ran to its end\n{stderr}"
+    );
+    assert_eq!(
+        stderr.matches(header).count(),
+        1,
+        "the box is printed once\n{stderr}"
+    );
+    assert_eq!(
+        stderr.matches("│ bad-line").count(),
+        1,
+        "the tail is printed once\n{stderr}"
+    );
+    assert!(
+        stderr.lines().any(|l| l == "1 failed: //pkg:bad"),
+        "the end adds the totals\n{stderr}"
+    );
 }
 
 /// SIGTERM is a cancel, as Ctrl-C is: heph stops the build and exits 130,

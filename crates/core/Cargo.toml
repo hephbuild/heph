@@ -26,10 +26,11 @@ tracing = "0.1"
 # `fsutil::TempDir`, a temp dir whose drop removes the read-only trees a
 # stage seals (tempfile's own drop cannot).
 tempfile = "3"
+# A failure slot's `manifest.json` and `diagnostic.json` (`failure_log`), read
+# by the engine and the renderers alike. Also what the event stream's
+# cross-version decode tests read real JSON frames with.
+serde_json = "1"
 
 [dev-dependencies]
 # The paused clock (`start_paused`), for tests only.
 tokio = { version = "1.54.1", features = ["test-util"] }
-# The build-event stream is a live JSON wire format to out-of-process hooks; its
-# cross-version decode behaviour is tested against real JSON frames.
-serde_json = "1"

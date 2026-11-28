@@ -141,6 +141,46 @@ where
     }
 }
 
+/// [`finish`], then, while the wrapper still holds the terminal, the one line
+/// a run that streamed gets when its process failed (D6.1c), on heph's
+/// stderr: `✗ //t · exit status 1 · heph log //t`. Every renderer leaves
+/// that failure's box out (`FailureRecord::told_streamed`), so this line is
+/// all the run says of it, its paths worded with `text`'s home redaction and
+/// workspace as a box words them (CQ r2). What the wrapper hands back to the
+/// engine.
+pub async fn finish_run<O, E>(
+    tap: &TerminalTap,
+    stdout: &mut Tapped<O>,
+    stderr: &mut Tapped<E>,
+    result: anyhow::Result<crate::engine::RunEnd>,
+    text: &crate::tui::failure_report::RenderCtx,
+) -> anyhow::Result<TerminalUse>
+where
+    O: AsyncWrite + Unpin,
+    E: AsyncWrite + Unpin,
+{
+    let used = finish(tap, stdout, stderr).await;
+    let end = result?;
+    if let Some(rec) = end.exec_failure.as_deref().filter(|_| used.streamed) {
+        let ctx = crate::tui::failure_report::RenderCtx {
+            color: stderr.tap.is_some() && crate::tui::color::stderr_color_enabled(),
+            ..text.clone()
+        };
+        let line = format!(
+            "{}\n",
+            crate::tui::failure_report::streamed_exec_line(rec, &ctx)
+        );
+        let told = async {
+            stderr.inner.write_all(line.as_bytes()).await?;
+            stderr.inner.flush().await
+        };
+        if let Err(error) = told.await {
+            tracing::debug!(%error, "telling the streamed run's failure");
+        }
+    }
+    Ok(used)
+}
+
 async fn end_line(w: &mut (impl AsyncWrite + Unpin)) -> io::Result<()> {
     w.write_all(b"\n").await?;
     w.flush().await
@@ -229,6 +269,104 @@ mod tests {
         let used = finish(&tap, &mut out, &mut err).await;
         assert!(!used.streamed, "a terminal that got no byte did not stream");
         assert!(out.inner.is_empty() && err.inner.is_empty());
+        Ok(())
+    }
+
+    /// What the streamed line is worded with, in a run with no home or
+    /// workspace to name.
+    fn text() -> crate::tui::failure_report::RenderCtx {
+        crate::tui::failure_report::RenderCtx::default()
+    }
+
+    /// A failed process's record, as the engine hands it to the wrapper.
+    fn exec_failure(addr: &str) -> crate::engine::RunEnd {
+        // The message a plain exit is recorded with: its status, as the
+        // header says it (`failure_record::compact`).
+        let mut rec = hcore::failure::FailureRecord::new(
+            hcore::diagnostic::Diagnostic::new(hcore::diagnostic::Stage::Run, "exit status 1")
+                .with_addr(addr),
+        );
+        rec.addr = Some(addr.to_owned());
+        rec.entry = addr.to_owned();
+        rec.failed_in = hcore::events::FailedIn::Exec;
+        rec.exit = Some(hcore::events::ExitData {
+            code: Some(1),
+            signal: None,
+            status: "exit status: 1".into(),
+        });
+        crate::engine::RunEnd {
+            exec_failure: Some(Box::new(rec)),
+        }
+    }
+
+    /// D6.1c, U6: a run that streamed and whose process failed gets its one
+    /// line on heph's stderr, after the target's own bytes and after the
+    /// break that ends a line it left open. A run that streamed nothing, or
+    /// whose process did not fail, gets no line; an error from the run is
+    /// handed back after the streams are finished.
+    #[tokio::test]
+    async fn finish_run_tells_a_streamed_exec_failure_once() -> anyhow::Result<()> {
+        // Streamed and failed: the line, after the open line's break.
+        let tap = TerminalTap::new();
+        let (mut out, mut err) = (in_memory(Some(&tap)), in_memory(Some(&tap)));
+        out.write_all(b"half a line").await?;
+        let used = finish_run(&tap, &mut out, &mut err, Ok(exec_failure("//p:t")), &text()).await?;
+        assert!(used.streamed);
+        assert_eq!(out.inner, b"half a line");
+        // Coloured when the test's own stderr is a terminal: compare the text.
+        let mut told = String::new();
+        let mut rest = String::from_utf8(err.inner)?;
+        while let Some(at) = rest.find('\x1b') {
+            told.push_str(rest.get(..at).unwrap_or_default());
+            let end = rest
+                .get(at..)
+                .and_then(|s| s.find('m'))
+                .map_or(rest.len(), |m| at + m + 1);
+            rest = rest.get(end..).unwrap_or_default().to_owned();
+        }
+        told.push_str(&rest);
+        assert_eq!(told, "\n✗ //p:t · exit status 1 · heph log //p:t\n");
+
+        // Failed, but every byte went to files: the box tells it, not a line.
+        let dir = tempfile::tempdir()?;
+        let tap = TerminalTap::new();
+        let mut out = Tapped::new(file_in(dir.path(), "out"), &tap);
+        let mut err = Tapped::new(file_in(dir.path(), "err"), &tap);
+        out.write_all(b"to a file\n").await?;
+        let used = finish_run(&tap, &mut out, &mut err, Ok(exec_failure("//p:t")), &text()).await?;
+        assert!(!used.streamed);
+        assert_eq!(std::fs::read_to_string(dir.path().join("err"))?, "");
+
+        // Streamed, and the process did not fail (a later step may yet):
+        // nothing added.
+        let tap = TerminalTap::new();
+        let (mut out, mut err) = (in_memory(Some(&tap)), in_memory(Some(&tap)));
+        out.write_all(b"ok\n").await?;
+        let used = finish_run(
+            &tap,
+            &mut out,
+            &mut err,
+            Ok(crate::engine::RunEnd::default()),
+            &text(),
+        )
+        .await?;
+        assert!(used.streamed);
+        assert!(err.inner.is_empty());
+
+        // The run's own error comes back, the open line still ended.
+        let tap = TerminalTap::new();
+        let (mut out, mut err) = (in_memory(Some(&tap)), in_memory(Some(&tap)));
+        out.write_all(b"open").await?;
+        let res = finish_run(
+            &tap,
+            &mut out,
+            &mut err,
+            Err(anyhow::anyhow!("spawn")),
+            &text(),
+        )
+        .await;
+        assert!(res.is_err());
+        assert_eq!(err.inner, b"\n");
         Ok(())
     }
 

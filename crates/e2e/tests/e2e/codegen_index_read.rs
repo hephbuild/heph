@@ -63,7 +63,7 @@ async fn resolve(
             } else {
                 let msg: Vec<String> = failures
                     .iter()
-                    .map(|f| format!("{}: {:#}", f.addr.format(), f.source))
+                    .map(|f| format!("{}: {:#}", f.addr.format(), crate::common::failure_text(f)))
                     .collect();
                 Err(anyhow::anyhow!("{}", msg.join("\n")))
             }

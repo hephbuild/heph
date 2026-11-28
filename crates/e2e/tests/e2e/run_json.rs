@@ -28,7 +28,7 @@ target(name = "blk", driver = "bash", run = "echo b > $OUT", out = "blk.txt", de
 "#;
 
 /// The default fields: every `free` one but `outputs`.
-const DEFAULT_KEYS: [&str; 15] = [
+const DEFAULT_KEYS: [&str; 21] = [
     "addr",
     "cache",
     "duration_ms",
@@ -36,6 +36,9 @@ const DEFAULT_KEYS: [&str; 15] = [
     "exit_code",
     "failure",
     "file",
+    "hints",
+    "location",
+    "log_replaced",
     "more",
     "outcome",
     "path",
@@ -43,7 +46,10 @@ const DEFAULT_KEYS: [&str; 15] = [
     "root",
     "root_file",
     "selected",
+    "stage",
+    "streamed",
     "timed_out",
+    "truncated",
 ];
 
 fn write_pkg(root: &Path, pkg: &str, build: &str) {
@@ -61,20 +67,22 @@ pub(crate) struct JsonRun {
     /// The list got its `]`.
     pub(crate) closed: bool,
     /// The run's own result, which `finalize` turns into the exit code.
-    res: anyhow::Result<()>,
+    pub(crate) res: anyhow::Result<()>,
     /// Every event the display saw.
-    events: Vec<heph::engine::event::BuildEvent>,
+    pub(crate) events: Vec<heph::engine::event::BuildEvent>,
     /// What `finalize` makes of the walk's skips: an error when it skipped
     /// part of the selection.
-    complete: anyhow::Result<()>,
+    pub(crate) complete: anyhow::Result<()>,
     /// The failure boxes a text run of the same request prints.
     pub(crate) boxes: String,
+    /// The interactive report the TUI prints at the end of the same request.
+    pub(crate) report: String,
 }
 
 impl JsonRun {
     /// How many failure boxes the text run prints.
     pub(crate) fn box_count(&self) -> usize {
-        self.boxes.matches("× target failed:").count()
+        self.boxes.lines().filter(|l| l.starts_with("✗ ")).count()
     }
 
     pub(crate) fn entry(&self, addr: &str) -> &Value {
@@ -181,8 +189,32 @@ async fn run_json_full(
         }
         (closed, c.res.map(drop), events)
     };
-    // The failure boxes the text run prints, from the same request.
-    let boxes = heph::commands::errors::render_failures_to_string(&rs.failures(), false);
+    // The failure boxes the text run prints, from the same request, and
+    // what `--fail-fast` stopped after them.
+    let mut printed = Vec::new();
+    drop(heph::commands::errors::FailedTargets::reported_in(
+        rs.failures(),
+        None,
+        &std::collections::HashSet::new(),
+        &mut printed,
+        false,
+        heph::commands::errors::BoxRequest {
+            root: None,
+            stopped: rs.fail_fast_stopped(),
+            log_lines: rs.log_tail_lines(),
+        },
+    ));
+    let boxes = String::from_utf8(printed).expect("utf-8 boxes");
+    let failures = rs.take_failures_with_logs().await;
+    let report = heph::commands::errors::ReportContext::gather(
+        &failures,
+        |a| rs.was_cancelled(a),
+        rs.heph_home().as_deref(),
+        rs.log_tail_lines(),
+    )
+    .with_workspace(rs.workspace_root().as_deref())
+    .with_width(200)
+    .render(false);
     drain(rs).await;
     let text = String::from_utf8(buf).expect("utf-8");
     let entries = if closed {
@@ -203,6 +235,7 @@ async fn run_json_full(
         events,
         complete: heph::commands::errors::require_complete_selection(&gaps),
         boxes,
+        report,
     }
 }
 
@@ -424,7 +457,8 @@ async fn fail_fast_run() -> JsonRun {
 
 /// RUN-24: `--fail-fast` stops the running sibling once `bad` fails. The
 /// sibling ends cancelled, in its event and its record, and is neither
-/// blamed nor boxed: the one failure is `bad`'s.
+/// blamed nor boxed: the one failure is `bad`'s. One line after the box
+/// says it was stopped while running.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fail_fast_siblings_are_cancelled_and_listed() {
     let run = fail_fast_run().await;
@@ -453,7 +487,17 @@ async fn fail_fast_siblings_are_cancelled_and_listed() {
     assert_eq!(ends, [(true, None)], "one cancelled end, naming no root");
     assert_eq!(run.box_count(), 1, "{}", run.boxes);
     assert!(run.boxes.contains("//p:bad"), "{}", run.boxes);
-    assert!(!run.boxes.contains("//p:slow"), "{}", run.boxes);
+    let (boxes, stopped) = run
+        .boxes
+        .split_once("\nstopped by --fail-fast")
+        .unwrap_or_else(|| panic!("a fail-fast line:\n{}", run.boxes));
+    assert!(!boxes.contains("//p:slow"), "{}", run.boxes);
+    assert_eq!(
+        format!("stopped by --fail-fast{stopped}"),
+        "stopped by --fail-fast: //p:slow (was running)\n",
+        "{}",
+        run.boxes
+    );
 }
 
 /// RUN-24 / JSON_OUTPUT.md: under `--fail-fast --json` the failure's record
@@ -712,6 +756,9 @@ async fn unselected_culprit_emitted_selected_false() {
     );
     assert_eq!(bad["exit_code"], 3, "{bad}");
     assert!(bad["failure"]["log"].is_string(), "{bad}");
+    // The record's facts: a run failure names no place in a BUILD file.
+    assert_eq!(bad["stage"], "run", "{bad}");
+    assert!(bad["location"].is_null(), "{bad}");
     let blk = run.entry("//p:blk");
     assert_eq!(blk["outcome"], "skipped", "{blk}");
     assert_eq!(blk["selected"], true, "{blk}");
@@ -759,6 +806,10 @@ async fn file_culprit_record_shape() {
     );
     assert_eq!(file["file"], "d/BUILD", "{file}");
     assert_eq!(file["outcome"], "failed", "{file}");
+    // The record's facts: an evaluation error, where its parser stopped.
+    assert_eq!(file["stage"], "eval", "{file}");
+    assert_eq!(file["location"]["file"], "d/BUILD", "{file}");
+    assert!(file["location"]["line"].is_number(), "{file}");
     assert_eq!(
         file["root_file"], "d/BUILD",
         "a culprit is its own root: {file}"
@@ -1028,11 +1079,13 @@ async fn culprit_record_precedes_its_skipped_records() {
     }
 }
 
-/// U3: a 500-deep chain to a culprit. The text box elides the path; the
-/// JSON record carries all of it: 501 entries, from the requested target
-/// to the culprit.
+/// U3, U23: a 500-deep chain to a culprit. The text box elides the path;
+/// the culprit's JSON record carries all of it: 501 entries, from the
+/// requested target to the culprit. A skipped record's path is elided by the
+/// text's rule, `path_elided` counting what it dropped (a short one, whole
+/// and without it, is `finish_pure_chain_output_size`'s).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn long_chain_elided_in_text_full_in_json() {
+async fn long_chain_elided_in_text_and_skipped_json() {
     const DEPTH: usize = 500;
     let root = tempfile::tempdir().expect("root tempdir");
     let mut build = bash("leaf", r#", deps = [":missing"]"#);
@@ -1058,8 +1111,15 @@ async fn long_chain_elided_in_text_full_in_json() {
     assert_eq!(path.len(), DEPTH + 1, "{leaf}");
     assert_eq!(path.first().and_then(Value::as_str), Some("//a:n000"));
     assert_eq!(path.last().and_then(Value::as_str), Some("//a:leaf"));
+    assert!(leaf.get("path_elided").is_none(), "{leaf}");
     let top = run.entry("//a:n000");
-    assert_eq!(top["path"], leaf["path"], "{top}");
+    assert_eq!(top["outcome"], "skipped", "{top}");
+    assert_eq!(
+        top["path"],
+        serde_json::json!(["//a:n000", "//a:n001", "//a:n499", "//a:leaf"]),
+        "{top}"
+    );
+    assert_eq!(top["path_elided"], DEPTH - 3, "{top}");
 
     assert_eq!(run.box_count(), 1, "{}", run.boxes);
     assert!(
@@ -1070,4 +1130,56 @@ async fn long_chain_elided_in_text_full_in_json() {
         run.boxes
     );
     assert!(!run.boxes.contains("//a:n250"), "elided: {}", run.boxes);
+}
+
+/// GRAPH-07: a target that depends on itself is a failure, never a green
+/// run. Its end carries the cycle as its own error (not a stop, not
+/// collateral), the TUI's fold counts it as one root, and the text run
+/// prints one box for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn self_cycle_counts_as_failed() {
+    let root = tempfile::tempdir().expect("root tempdir");
+    write_pkg(root.path(), "c", &bash("me", r#", deps = [":me"]"#));
+    let engine = build_engine_with_remote(root.path(), None);
+
+    let run = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        run_json(&engine, &addr("//c:me"), &["--json"], None),
+    )
+    .await
+    .expect("a self-cycle is detected, not a hang");
+    assert!(run.res.is_err(), "a cycle fails the run");
+    let ends: Vec<_> = run
+        .events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            BuildEventKind::ResultEnd {
+                addr,
+                error,
+                cancelled,
+                upstream_of,
+                duplicate,
+                ..
+            } if addr == "//c:me" => {
+                Some((error.is_some(), *cancelled, upstream_of.clone(), *duplicate))
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        ends.contains(&(true, false, None, false)),
+        "an own failure's end: {ends:?}"
+    );
+    let mut fold = heph::tui::progress::BuildState::new();
+    for ev in &run.events {
+        fold.apply(ev);
+    }
+    assert!(fold.unsuccessful(), "never drawn green");
+    assert_eq!(
+        fold.failure_split(),
+        (1, 0),
+        "one root, nothing it took down"
+    );
+    assert_eq!(run.box_count(), 1, "{}", run.boxes);
+    assert!(run.boxes.contains("//c:me"), "{}", run.boxes);
 }

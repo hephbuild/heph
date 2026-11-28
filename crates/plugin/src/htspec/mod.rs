@@ -1,8 +1,9 @@
 //! Runtime support for the spec derives (`Spec`, `SpecStruct`, `SpecEnum`,
 //! `SpecUnion`).
 //!
-//! A target config spec is a struct whose fields are parsed out of a raw
-//! BUILD-file config map (`HashMap<String, Value>`). [`FromSpecValue`] is the
+//! A target config spec is a struct whose fields are parsed out of the raw
+//! config map a provider reports (`HashMap<String, Value>`; e.g. a `target()`
+//! call in the buildfile provider's BUILD file). [`FromSpecValue`] is the
 //! single source of truth pairing *how a field parses* with *what shape it
 //! accepts* (its [`ParamType`]); the derive reads both off the field type so
 //! the parser and the LSP schema cannot drift.
@@ -22,7 +23,7 @@ use anyhow::Context as _;
 use hcore::htvalue::signature::ParamType;
 use hcore::htvalue::{
     Value, parse_bool, parse_map_string_map_string_strings, parse_map_string_string,
-    parse_map_string_strings, parse_string, parse_strings, starlark_str,
+    parse_map_string_strings, parse_string, parse_strings, quote_str,
 };
 
 pub use htspec_derive::{Spec, SpecEnum, SpecStruct, SpecUnion};
@@ -31,7 +32,7 @@ mod cache;
 pub use cache::TargetSpecCache;
 
 // `Rename`'s type lives in `hcore` (it is applied by `hartifactcontent::view`);
-// only its BUILD-file parsing belongs here.
+// only its parsing out of a spec's config map belongs here.
 mod rename;
 
 // The `Spec` derive macro emits `crate::htspec::DriverField` / `DriverSchema`
@@ -53,7 +54,7 @@ pub trait SpecFields {
     fn schema() -> DriverSchema;
 }
 
-/// A type parsable from a BUILD-file [`Value`] that also describes its own
+/// A type parsable from a spec's config [`Value`] that also describes its own
 /// accepted shape. Implemented for the primitive + container shapes specs use;
 /// implement it by hand (or via `#[derive(SpecUnion)]`) for bespoke union types.
 pub trait FromSpecValue: Sized {
@@ -74,15 +75,17 @@ pub trait FromSpecValue: Sized {
 /// simply the one type that accepts one.
 ///
 /// It closes the reverse direction for free too: if a driver ever changes a field
-/// back from `Deferred<String>` to `String`, a BUILD file containing a reference
-/// fails loudly instead of silently using the literal.
+/// back from `Deferred<String>` to `String`, a spec containing a reference (e.g.
+/// in the buildfile provider's BUILD file) fails loudly instead of silently
+/// using the literal.
 ///
 /// Only the kinds heph actually **resolves** are reserved — today, just `read`.
 /// `${FOO:-default}`, `${OUT}`, `${src:0:3}` (bash substring expansion),
 /// `${env:FOO}` (several tools' own template syntax) and `sed 's/${/X/'` all have
 /// to survive being written in an ordinary field: heph expands none of them, so
 /// none can be *misread* as something it does, and a reservation that swallowed
-/// them would break BUILD files with nothing to do with this feature.
+/// them would break specs (e.g. BUILD files) with nothing to do with this
+/// feature.
 pub fn reject_deferred_reference(s: &str) -> anyhow::Result<()> {
     let Some(r) = hcore::template::first_deferred_ref(s) else {
         return Ok(());
@@ -242,18 +245,19 @@ fn ordered_map<T>(
             .iter()
             .map(|(k, v)| {
                 reject_deferred_reference(k)?;
-                let parsed = value(v).with_context(|| format!("key {}", starlark_str(k)))?;
+                let parsed = value(v).with_context(|| format!("key {}", quote_str(k)))?;
                 Ok((k.clone(), parsed))
             })
             .collect(),
-        other => anyhow::bail!("invalid: expected {expected}, got: {}", other.to_starlark()),
+        other => anyhow::bail!("invalid: expected {expected}, got: {}", other.render()),
     }
 }
 
 /// The one field type that accepts a deferred reference.
 ///
-/// `spec_param_type` stays [`ParamType::String`] deliberately: to a BUILD-file
-/// author and to the LSP this *is* a string field, and it accepts every string it
+/// `spec_param_type` stays [`ParamType::String`] deliberately: to a spec's
+/// author (e.g. a BUILD file's) and to a language server this *is* a string
+/// field, and it accepts every string it
 /// did before. What changed is only that one more kind of string now means
 /// something.
 impl FromSpecValue for crate::driver::Deferred<String> {
@@ -300,9 +304,9 @@ impl FromSpecValue for u32 {
             Value::Uint(u) => {
                 i64::try_from(*u).map_err(|_e| anyhow::anyhow!("integer too large"))?
             }
-            _ => anyhow::bail!("invalid: expected int, got: {}", v.to_starlark()),
+            _ => anyhow::bail!("invalid: expected int, got: {}", v.render()),
         };
-        // Said in a BUILD author's words: `u32` is not a type they wrote.
+        // Said in a spec author's words: `u32` is not a type they wrote.
         u32::try_from(n).map_err(|_e| {
             anyhow::anyhow!(
                 "invalid: expected a non-negative integer of at most {}, got: {n}",
@@ -322,7 +326,7 @@ impl FromSpecValue for std::num::NonZeroU64 {
         let n = match v {
             Value::Uint(u) => i128::from(*u),
             Value::Int(i) => i128::from(*i),
-            _ => anyhow::bail!("invalid: expected int, got: {}", v.to_starlark()),
+            _ => anyhow::bail!("invalid: expected int, got: {}", v.render()),
         };
         u64::try_from(n)
             .ok()

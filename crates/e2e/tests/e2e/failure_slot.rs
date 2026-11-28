@@ -8,6 +8,8 @@
 )]
 
 use crate::common::Workspace;
+use hcore::failure::LogRef;
+use hcore::failure_log::{TailRead, open_tail};
 use heph::engine::error::TargetFailure;
 use heph::engine::{Config, Engine, OutputMatcher, RemoteCacheDef, ResultOptions};
 use heph::htaddr::parse_addr;
@@ -136,7 +138,7 @@ async fn a_failed_targets_sandbox_is_removed() -> anyhow::Result<()> {
     let [failure] = f.as_slice() else {
         panic!("one failure, got {}", f.len());
     };
-    let tail = failure.log_tail.as_ref().expect("the recorded tail");
+    let tail = crate::common::failure_tail(failure).expect("the recorded tail");
     assert_eq!(tail.text, "removed-marker");
     let out = render(&f);
     assert!(out.contains("│ removed-marker"), "{out}");
@@ -217,6 +219,12 @@ target(name = "grp", driver = "group", deps = ["//p:a"])
             .result_addr(rs.clone(), &grp, OutputMatcher::All, &opts),
     );
     assert!(ra.is_err() && rg.is_err());
+    // The claim's diagnostic joins the one fill; writing it is no fill.
+    ws.engine.failure_slots().writes_drained().await;
+    assert!(
+        hcore::failure_log::read_diagnostic(&ws.engine.failure_slots().slot_dir(&a)).is_some(),
+        "the claim wrote its diagnostic"
+    );
     assert_eq!(ws.engine.failure_slots().fills(), 1);
     let f = rs.take_failures();
     assert!(render(&f).contains("│ once"), "{}", render(&f));
@@ -380,8 +388,11 @@ async fn failure_slot_cleared_on_cache_hit() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A rerun that fails having printed nothing replaces the slot with one
+/// whose `log.txt` is empty (RUN-19): the old run's log is never shown as
+/// the new one's.
 #[tokio::test]
-async fn failure_slot_cleared_when_rerun_fails_without_log() -> anyhow::Result<()> {
+async fn rerun_failing_without_output_replaces_the_slot() -> anyhow::Result<()> {
     let ws = Workspace::new();
     let ctl = tempfile::tempdir()?;
     toggled(&ws, ctl.path(), false);
@@ -392,7 +403,7 @@ async fn failure_slot_cleared_when_rerun_fails_without_log() -> anyhow::Result<(
     std::fs::write(ctl.path().join("noout"), "")?;
     let f = failures(&ws.engine, "//p:t", &ResultOptions::default()).await?;
     assert!(!render(&f).contains("first-marker"), "{}", render(&f));
-    assert!(!slot_exists(&ws.engine, "//p:t"));
+    assert_eq!(slot_log(&ws.engine, "//p:t").as_deref(), Some(""));
     Ok(())
 }
 
@@ -455,11 +466,21 @@ async fn concurrent_failures_same_target_slot_never_mixed() -> anyhow::Result<()
             .map(|l| l.rsplit('│').next().unwrap_or(l).trim().to_string());
         lines.all(|l| Some(l.rsplit('│').next().unwrap_or(l).trim().to_string()) == first)
     };
+    // A box reads the slot by its fill id: the run whose slot the other
+    // replaced says so rather than show the other's lines, and the one
+    // that kept it shows its own.
+    let mut shown = 0;
     for f in [fa?, fb?] {
         let out = render(&f);
+        if out.contains("log replaced by a newer failed run") {
+            assert!(!out.contains("run-"), "{out}");
+            continue;
+        }
         assert!(out.contains("run-"), "{out}");
         assert!(homogeneous(&out), "a box mixes two runs: {out}");
+        shown += 1;
     }
+    assert!(shown >= 1, "the slot's own run shows its log");
     let log = slot_log(&ws.engine, "//p:t").expect("a complete slot");
     assert_eq!(log.lines().count(), 200);
     assert!(homogeneous(&log), "the slot mixes two runs");
@@ -571,6 +592,70 @@ target(name = "t", driver = "auth.credential", sources = ["//auth:fetch"],
     Ok(())
 }
 
+/// E2 / fq M4: a credential producer's failure keeps its log's tail in
+/// memory, never on disk, within the 8 KiB record cap — its end kept, whole
+/// lines — and the record says it was cut (`truncated`). I8's per-failure
+/// bound holds for it too.
+#[tokio::test]
+async fn credential_target_tail_from_memory() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    // 400 lines of 64 bytes: ~25 KiB, over the record cap, under the tail's.
+    ws.write_build_file(
+        "auth",
+        r#"
+target(name = "fetch", driver = "bash", out = {"credential": "cred.json"}, cache = False,
+       run = ["for ((i = 1; i <= 400; i++)); do printf 'producer-line-%04d-%045d\n' $i 0; done", "exit 4"])
+target(name = "t", driver = "auth.credential", sources = ["//auth:fetch"],
+       present = {"env": {"T": "${token}"}})
+"#,
+    );
+    ws.write_build_file(
+        "app",
+        r#"target(name = "a", driver = "bash", out = "o.txt", cache = False,
+       credentials = ["//auth:t"], run = ["printf '%s' \"$T\" > o.txt"])"#,
+    );
+    let f = failures(&ws.engine, "//app:a", &ResultOptions::default()).await?;
+    assert!(!slot_exists(&ws.engine, "//auth:fetch"), "no log on disk");
+    let tails: Vec<_> = f
+        .iter()
+        .filter_map(|f| {
+            let log = f.record.log.as_ref()?;
+            Some((f, log, log.memory_tail.as_deref()?))
+        })
+        .collect();
+    let [(failure, log, tail)] = tails.as_slice() else {
+        panic!(
+            "one record with an in-memory tail: {:#?}",
+            f.iter().map(|f| &f.record).collect::<Vec<_>>()
+        );
+    };
+    assert_eq!(log.path, None, "the tail is the only copy: {log:?}");
+    assert!(
+        tail.len() <= hcore::failure::RECORD_CAP,
+        "{} bytes, over the record cap",
+        tail.len()
+    );
+    assert!(
+        tail.ends_with(&format!("producer-line-0400-{:045}", 0)),
+        "the end is kept: {tail}"
+    );
+    assert!(
+        tail.starts_with("producer-line-"),
+        "whole lines: {}",
+        tail.get(..80).unwrap_or(tail)
+    );
+    assert!(!tail.contains("producer-line-0001-"), "the head is cut");
+    assert!(
+        failure.record.diagnostic.truncated,
+        "the record says it was cut"
+    );
+    assert!(failure.record.text_len() <= hcore::failure::RECORD_CAP);
+    // What a renderer reads is that tail, from memory.
+    let read = crate::common::failure_tail(failure).expect("the tail");
+    assert_eq!(read.text.lines().last(), tail.lines().last());
+    Ok(())
+}
+
 #[tokio::test]
 async fn dep_failure_shows_dep_log() -> anyhow::Result<()> {
     let ws = Workspace::new();
@@ -596,6 +681,228 @@ target(name = "top", driver = "bash", deps = ["//p:dep"], run = "true")
     assert!(
         out.contains(&format!("full log: {}", path.display())),
         "{out}"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// A record's log reference, read back (P12, P28)
+// ---------------------------------------------------------------------------
+
+/// `addr`'s recorded log reference.
+fn log_ref(f: &[Arc<TargetFailure>], addr: &str) -> LogRef {
+    f.iter()
+        .find(|f| f.addr.format() == addr)
+        .and_then(|f| f.record.log.clone())
+        .expect("the failure records a log reference")
+}
+
+/// The text a read streams, for a read that streams.
+fn streamed(read: TailRead) -> String {
+    assert!(
+        matches!(read, TailRead::Stream(_) | TailRead::CannotTell(_)),
+        "expected a stream, got {read:?}"
+    );
+    let open = match read {
+        TailRead::Stream(open) | TailRead::CannotTell(open) => Some(open),
+        _ => None,
+    }
+    .expect("a stream");
+    let mut out = Vec::new();
+    open.stream(&mut out).expect("stream the tail");
+    String::from_utf8(out).expect("utf-8")
+}
+
+fn read(log: &LogRef) -> TailRead {
+    open_tail(log, 100, 64 * 1024)
+}
+
+/// `addr`'s slot manifest rewritten as an older heph writes it: no fill id.
+/// After every claim write landed, so none races the rewrite.
+async fn strip_fill_id(engine: &Engine, addr: &str) {
+    engine.failure_slots().writes_drained().await;
+    let path = engine
+        .failure_slots()
+        .slot_dir(&parse_addr(addr).expect("addr"))
+        .join("manifest.json");
+    let mut m: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("manifest")).expect("json");
+    m.as_object_mut().expect("object").remove("fill_id");
+    std::fs::write(&path, serde_json::to_vec(&m).expect("json")).expect("rewrite");
+}
+
+/// A record whose slot was filled again by a newer failed run says so, and
+/// the newer record still reads its own log.
+#[tokio::test]
+async fn slot_replaced_says_newer_failed_run() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    let ctl = tempfile::tempdir()?;
+    toggled(&ws, ctl.path(), false);
+    std::fs::write(ctl.path().join("fail"), "marker-one\n")?;
+    let first = log_ref(
+        &failures(&ws.engine, "//p:t", &ResultOptions::default()).await?,
+        "//p:t",
+    );
+    std::fs::write(ctl.path().join("fail"), "marker-two\n")?;
+    let second = log_ref(
+        &failures(&ws.engine, "//p:t", &ResultOptions::default()).await?,
+        "//p:t",
+    );
+    assert_ne!(first.fill_id, second.fill_id);
+    assert!(
+        matches!(read(&first), TailRead::Replaced),
+        "{:?}",
+        read(&first)
+    );
+    assert_eq!(streamed(read(&second)), "marker-two");
+    Ok(())
+}
+
+/// A record whose slot a passing run cleared says the log was cleared.
+#[tokio::test]
+async fn slot_cleared_says_cleared() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    let ctl = tempfile::tempdir()?;
+    toggled(&ws, ctl.path(), false);
+    std::fs::write(ctl.path().join("fail"), "cleared-marker\n")?;
+    let log = log_ref(
+        &failures(&ws.engine, "//p:t", &ResultOptions::default()).await?,
+        "//p:t",
+    );
+    std::fs::remove_file(ctl.path().join("fail"))?;
+    let rs = ws.engine.new_state();
+    ws.engine
+        .clone()
+        .result_addr(
+            rs,
+            &parse_addr("//p:t")?,
+            OutputMatcher::All,
+            &ResultOptions::default(),
+        )
+        .await?;
+    assert!(!slot_exists(&ws.engine, "//p:t"));
+    assert!(matches!(read(&log), TailRead::Cleared), "{:?}", read(&log));
+    Ok(())
+}
+
+/// Neither the reader nor the slot (an older heph's) names a fill: the log
+/// is shown, with no claim about whose it is.
+#[tokio::test]
+async fn slot_without_fill_id_cannot_tell() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "p",
+        r#"target(name = "t", driver = "bash", run = "echo old-heph-marker; exit 1")"#,
+    );
+    let mut log = log_ref(
+        &failures(&ws.engine, "//p:t", &ResultOptions::default()).await?,
+        "//p:t",
+    );
+    strip_fill_id(&ws.engine, "//p:t").await;
+    log.fill_id = None;
+    let read = read(&log);
+    assert!(matches!(read, TailRead::CannotTell(_)), "{read:?}");
+    assert_eq!(streamed(read), "old-heph-marker");
+    Ok(())
+}
+
+/// A record that names its fill, over a slot that names none (an older heph
+/// filled it since): the log is not the record's.
+#[tokio::test]
+async fn slot_without_fill_id_where_record_has_one_reads_replaced() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "p",
+        r#"target(name = "t", driver = "bash", run = "echo marker; exit 1")"#,
+    );
+    let log = log_ref(
+        &failures(&ws.engine, "//p:t", &ResultOptions::default()).await?,
+        "//p:t",
+    );
+    assert!(log.fill_id.is_some());
+    strip_fill_id(&ws.engine, "//p:t").await;
+    assert!(matches!(read(&log), TailRead::Replaced), "{:?}", read(&log));
+    Ok(())
+}
+
+/// A log opened before its slot is replaced streams the bytes it opened:
+/// the record's own run, never the newer one's.
+#[tokio::test]
+async fn slot_replaced_after_open_streams_the_old_fd() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    let ctl = tempfile::tempdir()?;
+    toggled(&ws, ctl.path(), false);
+    std::fs::write(ctl.path().join("fail"), "marker-one\n")?;
+    let log = log_ref(
+        &failures(&ws.engine, "//p:t", &ResultOptions::default()).await?,
+        "//p:t",
+    );
+    let TailRead::Stream(open) = read(&log) else {
+        panic!("the record's own log streams");
+    };
+    std::fs::write(ctl.path().join("fail"), "marker-two\n")?;
+    failures(&ws.engine, "//p:t", &ResultOptions::default()).await?;
+    assert_eq!(
+        slot_log(&ws.engine, "//p:t").as_deref(),
+        Some("marker-two\n")
+    );
+    let mut out = Vec::new();
+    open.stream(&mut out)?;
+    assert_eq!(String::from_utf8(out)?, "marker-one");
+    Ok(())
+}
+
+/// A BUILD file that does not evaluate keeps a slot of its own, keyed by
+/// the file: a manifest naming it (no revision, the package it was reached
+/// through) and `diagnostic.json`. No target gets one.
+#[tokio::test]
+async fn eval_failure_leaves_a_slot_with_diagnostic_json() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file("d", "target(name = \"t\"\nbroken(\n");
+    failures(&ws.engine, "//d:t", &ResultOptions::default()).await?;
+    ws.engine.failure_slots().writes_drained().await;
+    let slots = ws.engine.failure_slots();
+    let m = slots.read_file("d/BUILD").expect("the file's slot");
+    assert_eq!(m.addr, "file:d/BUILD");
+    assert_eq!(m.hashin, None);
+    assert_eq!(m.packages, ["d"]);
+    let rec = hcore::failure_log::read_diagnostic(&slots.file_slot_dir("d/BUILD"))
+        .expect("diagnostic.json");
+    assert_eq!(rec.diagnostic.stage, hcore::diagnostic::Stage::Eval);
+    assert!(!slot_exists(&ws.engine, "//d:t"));
+    Ok(())
+}
+
+/// A run that fails having printed nothing keeps a slot with an empty
+/// `log.txt` (RUN-19), and its record names it: zero lines, its fill.
+#[tokio::test]
+async fn empty_log_failure_fills_a_slot() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "p",
+        r#"target(name = "t", driver = "bash", run = "exit 3")"#,
+    );
+    let log = log_ref(
+        &failures(&ws.engine, "//p:t", &ResultOptions::default()).await?,
+        "//p:t",
+    );
+    assert_eq!(slot_log(&ws.engine, "//p:t").as_deref(), Some(""));
+    assert_eq!(log.lines, 0);
+    assert_eq!(
+        log.fill_id,
+        ws.engine
+            .failure_slots()
+            .read(&parse_addr("//p:t")?)
+            .and_then(|m| m.fill_id)
+    );
+    assert_eq!(streamed(read(&log)), "");
+    ws.engine.failure_slots().writes_drained().await;
+    assert!(
+        hcore::failure_log::read_diagnostic(
+            &ws.engine.failure_slots().slot_dir(&parse_addr("//p:t")?)
+        )
+        .is_some(),
+        "the claim's diagnostic joined the slot"
     );
     Ok(())
 }

@@ -46,11 +46,12 @@ pub(crate) struct Selected {
 /// that does not parse, names its own user (two identities for one request,
 /// with the client choosing), or is not `https` to a non-loopback host.
 ///
-/// Never quotes `url`: at run it is the *resolved* value of a `${read://…}`
-/// reference, which is the producer's content (I7). The caller's context names
-/// the reference as written.
+/// Quotes `url` as every message does, without its userinfo, query or
+/// fragment (`hfetch::redact_url`): the password it is refused for is
+/// credential material (I7).
 pub(crate) fn check_url(url: &str) -> anyhow::Result<()> {
-    let parsed = url::Url::parse(url).context("parse url")?;
+    let parsed =
+        url::Url::parse(url).with_context(|| format!("parse url {:?}", hfetch::redact_url(url)))?;
     anyhow::ensure!(
         parsed.username().is_empty() && parsed.password().is_none(),
         "the url carries a username or password and the target names `credentials`; drop the \
@@ -60,7 +61,10 @@ pub(crate) fn check_url(url: &str) -> anyhow::Result<()> {
         Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
         Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
         Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
-        None => anyhow::bail!("the url has no host to authenticate to"),
+        None => anyhow::bail!(
+            "url {:?} has no host to authenticate to",
+            hfetch::redact_url(url)
+        ),
     };
     anyhow::ensure!(
         parsed.scheme() == "https" || loopback,
@@ -75,13 +79,17 @@ pub(crate) fn check_url(url: &str) -> anyhow::Result<()> {
 /// declared credentials received (see
 /// [`check_presented`](hdriver_support::credential::check_presented)).
 ///
-/// Reads the presented files, so call it off the async workers. Never quotes
-/// `url`, as [`check_url`] does not.
+/// Reads the presented files, so call it off the async workers. Quotes `url`
+/// as [`check_url`] does.
 pub(crate) fn select_for(mounts: &[CredentialMount], url: &str) -> anyhow::Result<Selected> {
-    let parsed = url::Url::parse(url).context("parse url")?;
-    let host = parsed
-        .host_str()
-        .context("the url has no host to authenticate to")?;
+    let parsed =
+        url::Url::parse(url).with_context(|| format!("parse url {:?}", hfetch::redact_url(url)))?;
+    let host = parsed.host_str().with_context(|| {
+        format!(
+            "url {:?} has no host to authenticate to",
+            hfetch::redact_url(url)
+        )
+    })?;
     select(mounts, &normalize_host(host))
 }
 

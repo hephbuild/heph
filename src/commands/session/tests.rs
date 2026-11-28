@@ -525,6 +525,7 @@ async fn commands_run_against_any_source() {
                         record(
                             T0 + 5_500,
                             BuildEventKind::ResultEnd {
+                                failure: None,
                                 duplicate: false,
                                 upstream_file: None,
                                 path: Vec::new(),
@@ -765,6 +766,7 @@ async fn next_is_structured_for_every_state() {
             record(
                 T0 + 2,
                 BuildEventKind::ResultEnd {
+                    failure: None,
                     duplicate: false,
                     upstream_file: None,
                     path: Vec::new(),
@@ -948,6 +950,83 @@ async fn next_is_structured_for_every_state() {
                 "{out}"
             );
         }
+    }
+}
+
+/// CLI-16/18: a failed session's `next` names `heph inspect failure` for a
+/// culprit only. A target a dependency took down has no record of its own, so
+/// it is never the one named, even when it ended first; with no culprit
+/// recorded at all, the hint is a rerun.
+#[tokio::test]
+async fn session_show_next_hint_only_for_culprits() {
+    let end = |at: u64, addr: &str, upstream_of: Option<&str>| {
+        record(
+            at,
+            BuildEventKind::ResultEnd {
+                failure: None,
+                duplicate: false,
+                upstream_file: None,
+                path: Vec::new(),
+                left_behind: None,
+                cancelled: false,
+                addr: addr.into(),
+                error: Some("boom".to_owned()),
+                upstream_of: upstream_of.map(Into::into),
+                exit_status: None,
+                exit_code: None,
+                log_tail: None,
+                timed_out: None,
+            },
+        )
+    };
+    let start = |at: u64, addr: &str| record(at, BuildEventKind::ResultStart { addr: addr.into() });
+    let id = SessionId::new(T0, 1);
+    let failed = || {
+        entry(
+            meta(id, 1, &["/bin/heph", "run", "//a:b"]),
+            false,
+            Some(ended(Some(1), NOW)),
+        )
+    };
+    // (records, next kind, next command)
+    let cases: Vec<(Vec<SessionRecord>, &str, &str)> = vec![
+        // The skipped consumer ended before its culprit: the culprit is named.
+        (
+            vec![
+                start(T0 + 1, "//a:b"),
+                start(T0 + 1, "//a:dep"),
+                end(T0 + 2, "//a:b", Some("//a:dep")),
+                end(T0 + 3, "//a:dep", None),
+            ],
+            "inspect_failure",
+            "heph inspect failure //a:dep",
+        ),
+        // Only a skipped target recorded: nothing to inspect.
+        (
+            vec![
+                start(T0 + 1, "//a:b"),
+                end(T0 + 2, "//a:b", Some("//a:dep")),
+            ],
+            "rerun",
+            "heph run //a:b",
+        ),
+    ];
+    for (n, (records, kind, command)) in cases.into_iter().enumerate() {
+        let source = FakeSource {
+            sessions: vec![(failed(), records)],
+        };
+        let sources: [&dyn SessionSource; 1] = [&source];
+        let json: serde_json::Value =
+            serde_json::from_str(&run_show(&sources, &id.encode(), true).await.expect("json"))
+                .expect("json");
+        assert_eq!(json["state"], "failed", "case {n}: {json}");
+        assert_eq!(json["next"]["kind"], kind, "case {n}: {json}");
+        assert_eq!(json["next"]["command"], command, "case {n}: {json}");
+        let out = run_show(&sources, &id.encode(), false).await.expect("show");
+        assert!(
+            out.contains(&format!("\nNext: {command}\n")),
+            "case {n}: {out}"
+        );
     }
 }
 
@@ -1253,6 +1332,7 @@ async fn status_lists_are_capped_and_show_has_them_all() {
         records.push(record(
             T0 + 2,
             BuildEventKind::ResultEnd {
+                failure: None,
                 duplicate: false,
                 upstream_file: None,
                 path: Vec::new(),

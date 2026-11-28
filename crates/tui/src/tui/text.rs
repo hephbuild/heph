@@ -24,6 +24,11 @@ use std::borrow::Cow;
 
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+/// heph's own text with every control but newline and tab escaped
+/// (`\x1b`): what [`message`] ends with, for text that has no paths to
+/// rewrite (a source line, a diff).
+pub use hcore::diagnostic::escape_control;
+
 /// Columns between tab stops when [`expand_tabs`] lays a line out.
 pub const TAB_STOP: usize = 8;
 
@@ -108,7 +113,7 @@ fn strip_controls(s: &str, out: &mut String) {
 /// params digits and `;` only, at most [`SGR_PARAMS_MAX`] of them; `None`
 /// when `s` does not start with one. An SGR is ASCII, so its length in bytes
 /// is its length in chars.
-fn sgr_len(s: &str) -> Option<usize> {
+pub(crate) fn sgr_len(s: &str) -> Option<usize> {
     let rest = s.strip_prefix("\x1b[")?;
     let params = rest
         .bytes()
@@ -916,6 +921,66 @@ mod tests {
             if !tty {
                 assert!(!got.contains('\x1b'), "{name}: {got:?}");
             }
+        }
+    }
+
+    /// U26: every Unicode format character a log tail can carry to reorder or
+    /// hide text is shown escaped like a control byte, on a terminal or not:
+    /// alone, between ASCII, doubled, at either end of a line, as the first
+    /// character of a tail cut by lines, and next to a kept SGR. The
+    /// sanitizer strips the same set.
+    #[test]
+    fn log_tail_escapes_unicode_format_characters() {
+        let format_chars = [
+            '\u{61c}', '\u{200e}', '\u{200f}', '\u{2028}', '\u{2029}', '\u{202a}', '\u{202b}',
+            '\u{202c}', '\u{202d}', '\u{202e}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}',
+            '\u{feff}',
+        ];
+        for c in format_chars {
+            let e = format!("\\u{{{:x}}}", u32::from(c));
+            let cases: [(&str, String, String); 5] = [
+                ("alone", c.to_string(), e.clone()),
+                (
+                    "between ascii",
+                    format!("txt{c}exe.sh\n"),
+                    format!("txt{e}exe.sh\n"),
+                ),
+                ("doubled", format!("{c}{c}x"), format!("{e}{e}x")),
+                (
+                    "line ends",
+                    format!("{c}a\nb{c}\n"),
+                    format!("{e}a\nb{e}\n"),
+                ),
+                (
+                    "beside an sgr",
+                    format!("\x1b[31m{c}r"),
+                    format!("\x1b[31m{e}r{SGR_RESET}"),
+                ),
+            ];
+            for (name, input, want) in &cases {
+                for tty in [true, false] {
+                    let got = escape_log_tail(input, tty);
+                    if tty {
+                        assert_eq!(&got, want, "{c:?} {name}");
+                    }
+                    assert!(!got.contains(c), "{c:?} {name} tty {tty}: {got:?}");
+                    assert!(
+                        !has_control(&sanitize_log(got.as_bytes())),
+                        "{c:?} {name} tty {tty}"
+                    );
+                }
+            }
+            // A tail cut by lines, its first shown line opening with `c`.
+            let log = format!("earlier\n{c}first shown\nlast\n");
+            let rows = crate::tui::failure_rows::tail_rows("//p:t", &log, 1, false, true, 2);
+            assert_eq!(rows.first_line, 2, "{c:?}");
+            assert_eq!(
+                escape_log_tail(rows.shown, true),
+                format!("{e}first shown\nlast\n"),
+                "{c:?} at the tail's cut"
+            );
+            // The sanitizer drops it, as every other control.
+            assert_eq!(sanitize_log(format!("a{c}b").as_bytes()), "ab", "{c:?}");
         }
     }
 

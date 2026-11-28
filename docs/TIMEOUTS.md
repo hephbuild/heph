@@ -36,7 +36,7 @@ by ignoring it:
 3. Either way the target fails:
 
    ```
-   //p:integration timed out after 10m (its `timeout`)
+   //p:integration timed out after 10m (its timeout)
    ```
 
    (the limit exactly as declared, `hcore::units::format_duration`; `heph

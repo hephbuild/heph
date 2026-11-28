@@ -33,9 +33,13 @@ impl fmt::Display for CancelledError {
 
 impl std::error::Error for CancelledError {}
 
-/// True if `e` (anywhere in its source chain) is a `CancelledError`.
+/// True if `e` (anywhere in its source chain) is a `CancelledError`, or a
+/// surfaced [`TargetFailure`] whose record says it was a stop: the failure it
+/// stands for is no longer on the chain (D7b), only its record's facts.
 pub fn is_cancelled(e: &anyhow::Error) -> bool {
     hcore::hmemoizer::downcast_chain_ref::<CancelledError>(e).is_some()
+        || hcore::hmemoizer::downcast_chain_ref::<TargetFailure>(e)
+            .is_some_and(|t| t.record.cancelled)
 }
 
 /// A hash-only request reached a target it would have had to *build* to answer.
@@ -84,15 +88,21 @@ pub struct RevisionChangedError {
     pub hashin: String,
 }
 
-impl fmt::Display for RevisionChangedError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{}: its cached output (revision {}) changed or was removed by another heph \
-             process while this build was using it; re-run",
-            self.addr.format(),
+impl RevisionChangedError {
+    /// What happened, without the address: the message of a failure whose
+    /// record already names [`addr`](Self::addr).
+    pub fn what(&self) -> String {
+        format!(
+            "its cached output (revision {}) changed or was removed by another heph process \
+             while this build was using it; re-run",
             self.hashin
         )
+    }
+}
+
+impl fmt::Display for RevisionChangedError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.addr.format(), self.what())
     }
 }
 
@@ -243,8 +253,9 @@ impl std::error::Error for UpstreamFailed {}
 /// What a failure is recorded against: the one thing that is actually wrong.
 ///
 /// A target whose own spec, def or run failed, or that declared a dependency
-/// that does not exist, is a [`Culprit::Target`]. A BUILD (or `.bzl`) file
-/// that did not evaluate is a [`Culprit::File`]: none of its targets was ever
+/// that does not exist, is a [`Culprit::Target`]. A source file a provider
+/// reported as not evaluating ([`FileEvalFailed`]; e.g. the buildfile
+/// provider's BUILD file) is a [`Culprit::File`]: none of its targets was ever
 /// defined, so none of them is to blame. The file is the workspace-relative
 /// path, and it never goes into an [`Addr`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -335,7 +346,8 @@ pub struct MissingDep {
 impl fmt::Display for MissingDep {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Until targets carry their source location, the package is the
-        // closest the message can point to: the BUILD file that declares it.
+        // closest the message can point to: whatever source its provider
+        // declared it from is that package's.
         let pkg = self.declarer.package.as_str();
         write!(
             f,
@@ -345,9 +357,9 @@ impl fmt::Display for MissingDep {
             self.origin_id,
         )?;
         if pkg.is_empty() {
-            f.write_str("the BUILD file at the workspace root)")
+            f.write_str("the root package)")
         } else {
-            write!(f, "the BUILD file in {pkg}/)")
+            write!(f, "package //{pkg})")
         }
     }
 }
@@ -387,13 +399,17 @@ impl MissingDep {
     }
 }
 
-/// Context: the evaluation of this file failed. `file` is workspace-relative.
+/// Context: a provider's evaluation of this source file failed (e.g. the
+/// buildfile provider's `d/BUILD`). `file` is workspace-relative, as the
+/// provider reported it.
 ///
 /// Data riding the chain, not text: its `Display` is empty, so the message
 /// reads as the file's own [`Diagnostic`](crate::diagnostic::Diagnostic)
 /// does (which already names the file, workspace-relative).
 ///
-/// A file that loads a broken file adds none of its own, so the one
+/// The provider attaches it once, for the file that is itself broken: a
+/// file that failed only through another (one it loads, say) adds none of
+/// its own, so the one
 /// `FileEvalFailed` on a chain is the innermost: the file that is actually
 /// broken.
 #[derive(Debug, Clone)]
@@ -439,6 +455,33 @@ impl fmt::Display for ProcessFailed {
 impl std::error::Error for ProcessFailed {}
 
 pub use hcore::process::Exit;
+
+/// A run whose process exited zero, failing in a step past it: collecting
+/// its declared outputs (one missing, or of the wrong kind). The host's
+/// record reads it as `FailedIn::AfterRun`, as it does a failure while
+/// hashing the artifacts: the process went fine, so a run that streamed its
+/// output still gets its box, and that box says so rather than repeating the
+/// log. Empty `Display`: it marks a chain, it adds no words to it.
+///
+/// In-process only: it does not cross the plugin seam, where the failure is
+/// a message, so a cdylib driver's collection failure stays `BeforeRun`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AfterProcess;
+
+impl AfterProcess {
+    /// `e`, marked as failing past a process that went fine.
+    pub fn mark(e: anyhow::Error) -> anyhow::Error {
+        e.context(Self)
+    }
+}
+
+impl fmt::Display for AfterProcess {
+    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Ok(())
+    }
+}
+
+impl std::error::Error for AfterProcess {}
 
 /// A run failure that crossed the plugin seam with a structured exit status
 /// ([`ProcessFailed::exit`] on the plugin's side).
@@ -768,14 +811,24 @@ impl std::error::Error for RemoteProcessFailed {}
 /// The structured exit status anywhere in `err`'s chain: a [`ProcessFailed`]
 /// from an in-process driver, or a [`RemoteProcessFailed`] from a cdylib.
 /// `None` when no process exit is behind the failure, or the driver that
-/// produced it predates [`ProcessFailed::exit`].
+/// produced it predates [`ProcessFailed::exit`]. A surfaced
+/// [`TargetFailure`] answers from its record's exit.
 pub fn process_exit(err: &anyhow::Error) -> Option<Exit> {
     // Through the walker: a failure a memoizer shared, or one under a stage
     // frame, has its process behind a `SharedAnyhow` that `chain()` stops at.
     hcore::hmemoizer::walk(err, &mut |f| {
-        let exit = match f.downcast_ref::<ProcessFailed>() {
-            Some(pf) => pf.exit,
-            None => f.downcast_ref::<RemoteProcessFailed>().map(|r| r.exit),
+        let exit = if let Some(pf) = f.downcast_ref::<ProcessFailed>() {
+            pf.exit
+        } else if let Some(r) = f.downcast_ref::<RemoteProcessFailed>() {
+            Some(r.exit)
+        } else {
+            f.downcast_ref::<TargetFailure>()
+                .and_then(|t| t.record.exit.as_ref())
+                .and_then(|x| match (x.code, x.signal) {
+                    (Some(code), _) => Some(Exit::Code(code)),
+                    (None, Some(sig)) => Some(Exit::Signal(sig)),
+                    (None, None) => None,
+                })
         };
         match exit {
             Some(exit) => std::ops::ControlFlow::Break(exit),
@@ -789,17 +842,18 @@ pub fn process_exit(err: &anyhow::Error) -> Option<Exit> {
 /// once per addr in the per-request failure registry and rendered (custom, see
 /// `commands::errors`) at the end of execution.
 ///
-/// `source` is held behind an `Arc` so the whole diagnostic is `Clone`: the
-/// outermost `result_addr` frame surfaces a clone of the recorded failure to its
-/// direct caller (in place of the lightweight `UpstreamFailed` marker that
+/// It holds no error chain (D7b): what a renderer, `is_cancelled` or
+/// `process_exit` reads of the failure is its [`record`](Self::record). The
+/// outermost `result_addr` frame surfaces a clone of the recorded failure to
+/// its direct caller (in place of the lightweight `UpstreamFailed` marker that
 /// propagates internally), while the registry keeps the original for rendering.
 #[derive(Debug, Clone)]
 pub struct TargetFailure {
     /// The culprit target; for a file culprit, the address that led into the
     /// file (a target the file would have defined).
     pub addr: Addr,
-    /// The workspace-relative BUILD/`.bzl` file that did not evaluate, when
-    /// the culprit is that file rather than a target ([`Culprit::File`]).
+    /// The workspace-relative source file a provider reported as not
+    /// evaluating, when the culprit is that file rather than a target ([`Culprit::File`]).
     pub file: Option<std::sync::Arc<str>>,
     /// The shortest path from a requested target to [`addr`](Self::addr),
     /// inclusive (`[addr]` when it was itself requested), read off the
@@ -809,13 +863,10 @@ pub struct TargetFailure {
     /// on scheduling. Empty when no requested target reaches it, or when
     /// nobody computed it.
     pub path: Vec<Addr>,
-    /// The last lines of the target's process log (the full log is still saved
-    /// as the `log.txt` artifact), with the real starting line number so the box
-    /// renders true file positions. Rendered as a framed `log` box.
-    pub log_tail: Option<LogTail>,
-    /// The log `log_tail` was read from: the engine's copy in the target's
-    /// failure slot (open, with its path for the box's `full log:` footer), or
-    /// the tail in memory when no copy is kept.
+    /// Where the target's log is: the engine's copy in its failure slot, for
+    /// the box's `full log:` footer. Never its text: a renderer reads the
+    /// tail through the record's [`LogRef`](hcore::failure::LogRef), which
+    /// holds the scrubbed in-memory tail of a log kept nowhere on disk.
     pub log: Option<FailureLog>,
     /// The `out/` directory of the target's failure slot, when the failed run
     /// kept `failure_out` matches there: what the box prints as `outputs:`.
@@ -840,8 +891,23 @@ pub struct TargetFailure {
     /// (D6.1). False for a target that printed nothing, and for output that
     /// went to a file or a pipe.
     pub streamed: bool,
-    pub source: std::sync::Arc<anyhow::Error>,
+    /// The failure compacted (D7b): scrubbed, capped, with the typed facts a
+    /// renderer reads. The engine sets it when it records the culprit
+    /// (`engine::failure_record::compact`); one built here with
+    /// [`TargetFailure::new`] and never set says only which target failed,
+    /// so no unscrubbed text can reach it.
+    pub record: std::sync::Arc<FailureRecord>,
+    /// The failure was a revision this request resolved changing under it
+    /// ([`RevisionChangedError`]): a re-run resolves afresh. Kept typed
+    /// because the chain it was read from is not (D7b); it holds an address
+    /// and a hash, no text a scrub would have to see.
+    pub revision_changed: Option<RevisionChangedError>,
+    /// [`record`](Self::record) was set by [`with_record`](Self::with_record):
+    /// the failure's own compacted record, not the placeholder `new` makes.
+    compacted: bool,
 }
+
+pub use hcore::events::FailureRecord;
 
 /// What became of a failed run's sandbox, as the failure box reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -921,20 +987,45 @@ impl fmt::Display for FixesNotWritten {
 }
 
 impl TargetFailure {
-    pub fn new(addr: Addr, log_tail: Option<LogTail>, source: anyhow::Error) -> Self {
+    pub fn new(addr: Addr) -> Self {
+        let formatted = addr.format();
+        let mut record = FailureRecord::new(
+            crate::diagnostic::Diagnostic::new(
+                crate::diagnostic::Stage::Run,
+                format!("target failed: {formatted}"),
+            )
+            .with_addr(formatted.clone()),
+        );
+        record.addr = Some(formatted.clone());
+        record.entry = formatted;
         Self {
             addr,
             file: None,
             path: Vec::new(),
-            log_tail,
             log: None,
             outputs: None,
             fixes: None,
             sandbox: None,
             log_readable: None,
             streamed: false,
-            source: std::sync::Arc::new(source),
+            record: std::sync::Arc::new(record),
+            revision_changed: None,
+            compacted: false,
         }
+    }
+
+    /// The same failure, saying whether it was a revision changing under
+    /// the request.
+    pub fn with_revision_changed(mut self, changed: Option<RevisionChangedError>) -> Self {
+        self.revision_changed = changed;
+        self
+    }
+
+    /// The same failure with its compacted record.
+    pub fn with_record(mut self, record: std::sync::Arc<FailureRecord>) -> Self {
+        self.record = record;
+        self.compacted = true;
+        self
     }
 
     /// The same failure, saying whether its output streamed to a terminal.
@@ -1039,12 +1130,18 @@ pub fn left_behind(
                 root: root.to_string_lossy().into_owned(),
                 paths: paths.clone(),
                 list: list.as_ref().map(|l| l.to_string_lossy().into_owned()),
+                paths_more: 0,
             },
             FailureFixes::NotWritten(reason) => hcore::events::FixesData::NotWritten {
                 reason: reason.to_string(),
             },
         }),
         log_readable,
+        // Counted when the slot is filled, and carried by its record.
+        kept: Vec::new(),
+        kept_more: 0,
+        // The slot's, which only the engine knows.
+        log_fill_id: None,
     }
 }
 
@@ -1057,9 +1154,14 @@ impl fmt::Display for TargetFailure {
     }
 }
 
+/// The chain the failure was recorded from is not kept (D7b): its source is
+/// the record's diagnostic, already scrubbed and bounded, so `{:#}` of a
+/// surfaced failure still says its cause. A failure never compacted has
+/// none (its diagnostic only repeats [`Display`](fmt::Display)).
 impl std::error::Error for TargetFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(self.source.as_ref().as_ref())
+        self.compacted
+            .then_some(&self.record.diagnostic as &(dyn std::error::Error + 'static))
     }
 }
 
@@ -1102,246 +1204,65 @@ impl fmt::Display for ApprovalDeniedError {
 
 impl std::error::Error for ApprovalDeniedError {}
 
-/// A bounded slice of a process log prepared for display: the last lines of the
-/// full log, plus the real 1-based line number its first line had in the full log
-/// so the renderer can show true file positions (e.g. 91–100 for the last 10 of a
-/// 100-line log) instead of renumbering from 1.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LogTail {
-    pub text: String,
-    /// 1-based line number of `text`'s first line within the full log.
-    pub start_line: usize,
-}
+/// The tail of a log, as [`hcore::failure_log`] reads it: the one reader of a
+/// failure slot's format, re-exported here for the drivers and renderers
+/// that always named it from this module.
+pub use hcore::failure_log::{
+    LogTail, TAIL_CUT_MARK, TAIL_LINES_CAP, TAIL_MAX_BYTES, last_n_lines, last_n_lines_with_start,
+    read_tail_at, tail_window,
+};
 
-/// Returns the last `n` lines of `s`, joined with `\n`. A trailing newline does
-/// not count as an extra empty line (`str::lines` already drops it).
-pub fn last_n_lines(s: &str, n: usize) -> String {
-    last_n_lines_with_start(s, n).0
-}
-
-/// Like [`last_n_lines`] but also returns the 1-based line number of the first
-/// returned line within `s`, so callers can render real file positions rather
-/// than renumbering the tail from 1.
-pub fn last_n_lines_with_start(s: &str, n: usize) -> (String, usize) {
-    let lines: Vec<&str> = s.lines().collect();
-    let start = lines.len().saturating_sub(n);
-    let text = lines.get(start..).unwrap_or(&[]).join("\n");
-    (text, start + 1)
-}
-
-/// How much of a log [`read_tail_at`] reads per backward step.
-const TAIL_CHUNK: u64 = 8 * 1024;
-
-/// How much of the part before the tail [`read_tail_at`] reads per step to
-/// count its lines.
-const COUNT_CHUNK: usize = 64 * 1024;
-
-/// The most bytes of a log's end a tail holds, whatever its line count (D6.1b):
-/// a thousand lines of a minified bundle would otherwise be most of the file,
-/// in memory and on every event that carries the tail.
-pub const TAIL_MAX_BYTES: usize = 256 * 1024;
-
-/// What a tail starts with when [`TAIL_MAX_BYTES`] cut it inside a line.
-pub const TAIL_CUT_MARK: &str = "…";
-
-/// The last `n` lines of a log of `len` bytes, read through `read_at` (a
-/// positional read: `read_at(buf, offset)`), with the same text and start
-/// line [`last_n_lines_with_start`] gives for the whole log, lossily decoded.
-///
-/// At most [`TAIL_MAX_BYTES`] of the log are kept, whichever limit comes
-/// first. A cut inside a line resumes at a char boundary and starts with
-/// [`TAIL_CUT_MARK`]; `start_line` is then the number of the line it cut.
-///
-/// Seek-based: it reads backwards from the end in [`TAIL_CHUNK`] steps until
-/// it holds `n` line breaks, so only the tail is ever held in memory. The
-/// start line still needs the number of lines before the tail, which is
-/// counted in [`COUNT_CHUNK`] reads that are never kept — constant memory,
-/// one pass over the head of the file.
-pub fn read_tail_at(
-    len: u64,
-    mut read_at: impl FnMut(&mut [u8], u64) -> std::io::Result<usize>,
-    n: usize,
-) -> std::io::Result<LogTail> {
-    let (cut, window) = tail_window(len, &mut read_at, n)?;
-    let mut prefix_lines = 0usize;
-    let mut buf = vec![0u8; COUNT_CHUNK];
-    let mut off = 0u64;
-    while off < cut {
-        let want = usize::try_from((cut - off).min(COUNT_CHUNK as u64)).unwrap_or(COUNT_CHUNK);
-        let got = buf.get_mut(..want).unwrap_or_default();
-        read_exact_at(&mut read_at, got, off)?;
-        prefix_lines += got.iter().filter(|&&b| b == b'\n').count();
-        off += want as u64;
-    }
-    if n == 0 {
-        // No lines shown; the "next" line is one past the last, which an
-        // unterminated last line counts as.
-        let mut last = [0u8; 1];
-        let open = len > 0 && {
-            read_exact_at(&mut read_at, &mut last, len - 1)?;
-            last != *b"\n"
-        };
-        return Ok(LogTail {
-            text: String::new(),
-            start_line: prefix_lines + usize::from(open) + 1,
-        });
-    }
-    let text = String::from_utf8_lossy(&window);
-    let (text, local_start) = last_n_lines_with_start(&text, n);
-    Ok(LogTail {
-        text,
-        start_line: prefix_lines + local_start,
-    })
-}
-
-/// The backward half of [`read_tail_at`]: the offset the tail starts at (just
-/// past a line break, or 0) and the bytes from there to `len`, at most
-/// [`TAIL_MAX_BYTES`] of them. A cut inside a line is the exception: the
-/// offset is where the kept part of that line starts, and the bytes start
-/// with [`TAIL_CUT_MARK`].
-pub fn tail_window(
-    len: u64,
-    read_at: &mut impl FnMut(&mut [u8], u64) -> std::io::Result<usize>,
-    n: usize,
-) -> std::io::Result<(u64, Vec<u8>)> {
-    if n == 0 {
-        return Ok((len, Vec::new()));
-    }
-    let mut window: Vec<u8> = Vec::new();
-    let mut start = len;
-    loop {
-        // A line break that ends the log closes its last line rather than
-        // starting another, as `str::lines` has it.
-        let trailing = usize::from(window.last() == Some(&b'\n'));
-        let body = window.get(..window.len() - trailing).unwrap_or_default();
-        // The n-th break from the end precedes the first line of the tail.
-        if let Some((i, _)) = body
-            .iter()
-            .enumerate()
-            .rev()
-            .filter(|&(_, &b)| b == b'\n')
-            .nth(n - 1)
-        {
-            let tail = window.split_off(i + 1);
-            return Ok(cap_window(start + i as u64 + 1, tail));
-        }
-        // Past the cap with the byte before the cut in hand, which tells a
-        // cut at a line break from one inside a line.
-        if start == 0 || window.len() > TAIL_MAX_BYTES {
-            return Ok(cap_window(start, window));
-        }
-        let take = start.min(TAIL_CHUNK);
-        let off = start - take;
-        let mut chunk = vec![0u8; usize::try_from(take).unwrap_or(0)];
-        read_exact_at(read_at, &mut chunk, off)?;
-        chunk.extend_from_slice(&window);
-        window = chunk;
-        start = off;
-    }
-}
-
-/// `window`, which starts at `start` in the log, cut to its last
-/// [`TAIL_MAX_BYTES`]. A cut right after a line break keeps whole lines; one
-/// inside a line moves forward to a char boundary and is marked.
-fn cap_window(start: u64, mut window: Vec<u8>) -> (u64, Vec<u8>) {
-    let Some(drop) = window
-        .len()
-        .checked_sub(TAIL_MAX_BYTES)
-        .filter(|&drop| drop > 0)
-    else {
-        return (start, window);
-    };
-    let at_break = window.get(drop - 1) == Some(&b'\n');
-    let mut cut = drop;
-    if !at_break {
-        // A UTF-8 char is at most 4 bytes: at most 3 continuation bytes to skip.
-        while cut < drop + 3 && window.get(cut).is_some_and(|b| b & 0xC0 == 0x80) {
-            cut += 1;
-        }
-    }
-    let kept = window.split_off(cut);
-    if at_break {
-        return (start + cut as u64, kept);
-    }
-    let mut marked = Vec::with_capacity(TAIL_CUT_MARK.len() + kept.len());
-    marked.extend_from_slice(TAIL_CUT_MARK.as_bytes());
-    marked.extend_from_slice(&kept);
-    (start + cut as u64, marked)
-}
-
-fn read_exact_at(
-    read_at: &mut impl FnMut(&mut [u8], u64) -> std::io::Result<usize>,
-    mut buf: &mut [u8],
-    mut off: u64,
-) -> std::io::Result<()> {
-    while !buf.is_empty() {
-        match read_at(buf, off) {
-            Ok(0) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "log shrank while its tail was read",
-                ));
-            }
-            Ok(k) => {
-                buf = buf.get_mut(k..).unwrap_or_default();
-                off += k as u64;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(())
-}
-
-/// A failed run's log as the diagnostic holds it: the engine's copy in the
-/// target's failure slot, kept **open** so a later rerun replacing the slot
-/// cannot swap the log this run's box shows; or, for a target whose log may
-/// not be kept on disk (its outputs are credential material) or whose copy
-/// could not be made, the tail already read into memory.
-#[derive(Clone)]
+/// A failed run's log as the diagnostic holds it: the path of the engine's
+/// copy in the target's failure slot, never an open file (E2: a rerun
+/// replacing the slot is told apart by the record's fill id, not by holding
+/// the old inode); or, for a target whose log may not be kept on disk (its
+/// outputs are credential material) or whose copy could not be made, the
+/// tail already read into memory, within [`RECORD_CAP`](hcore::failure::RECORD_CAP).
+#[derive(Debug, Clone, Default)]
 pub struct FailureLog {
     path: Option<std::path::PathBuf>,
-    source: FailureLogSource,
+    memory: Option<LogTail>,
+    /// The in-memory tail was cut to fit the record cap.
+    memory_cut: bool,
     lines: usize,
 }
 
-#[derive(Clone)]
-enum FailureLogSource {
-    Open(std::sync::Arc<std::fs::File>),
-    Tail(LogTail),
-}
-
-impl fmt::Debug for FailureLog {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let kind = match self.source {
-            FailureLogSource::Open(_) => "open",
-            FailureLogSource::Tail(_) => "tail",
-        };
-        f.debug_struct("FailureLog")
-            .field("path", &self.path)
-            .field("source", &kind)
-            .finish()
-    }
-}
-
 impl FailureLog {
-    /// The slot's log at `path`, through `file` opened on it; its tail is the
-    /// last `lines` lines.
-    pub fn open(path: std::path::PathBuf, file: std::fs::File, lines: usize) -> Self {
+    /// The slot's log at `path`; its tail is the last `lines` lines.
+    pub fn on_disk(path: std::path::PathBuf, lines: usize) -> Self {
         Self {
             path: Some(path),
-            source: FailureLogSource::Open(std::sync::Arc::new(file)),
+            memory: None,
+            memory_cut: false,
             lines,
         }
     }
 
-    /// A tail with no file behind it.
-    pub fn in_memory(tail: LogTail) -> Self {
+    /// A tail with no file behind it; `cut` when it was cut to fit the
+    /// record cap, which the record then says (`truncated`, E2).
+    pub fn in_memory(tail: LogTail, cut: bool) -> Self {
         Self {
             path: None,
-            source: FailureLogSource::Tail(tail),
+            memory: Some(tail),
+            memory_cut: cut,
             lines: 0,
         }
+    }
+
+    /// The same log without its in-memory tail: what a holder that never
+    /// prints the tail keeps (the record holds the scrubbed copy).
+    pub fn without_memory(&self) -> Self {
+        Self {
+            path: self.path.clone(),
+            memory: None,
+            memory_cut: false,
+            lines: self.lines,
+        }
+    }
+
+    /// Whether the in-memory tail was cut to fit the record cap.
+    pub fn memory_cut(&self) -> bool {
+        self.memory_cut
     }
 
     /// Where the full log is, when there is one on disk.
@@ -1349,97 +1270,35 @@ impl FailureLog {
         self.path.as_deref()
     }
 
-    /// The last lines of the log, read from the open file (seek-based, see
-    /// [`read_tail_at`]) or the tail held in memory.
+    /// The tail held in memory, for a log with no file behind it; `None`
+    /// for one on disk. No IO.
+    pub fn memory_tail(&self) -> Option<&LogTail> {
+        self.memory.as_ref()
+    }
+
+    /// The last lines of the log: the tail held in memory, else read from
+    /// the slot's file at [`path`](Self::path) (seek-based, see
+    /// [`read_tail_at`]), whatever is there now.
     pub fn tail(&self) -> std::io::Result<LogTail> {
-        match &self.source {
-            FailureLogSource::Tail(t) => Ok(t.clone()),
-            FailureLogSource::Open(file) => {
-                use std::os::unix::fs::FileExt as _;
-                let len = file.metadata()?.len();
-                read_tail_at(len, |buf, off| file.read_at(buf, off), self.lines)
-            }
+        if let Some(t) = &self.memory {
+            return Ok(t.clone());
         }
+        let Some(path) = &self.path else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no log kept",
+            ));
+        };
+        use std::os::unix::fs::FileExt as _;
+        let file = std::fs::File::open(path)?;
+        let len = file.metadata()?.len();
+        read_tail_at(len, |buf, off| file.read_at(buf, off), self.lines)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn tail_of_bytes(bytes: &[u8], n: usize) -> LogTail {
-        read_tail_at(
-            bytes.len() as u64,
-            |buf, off| {
-                let src = bytes
-                    .get(usize::try_from(off).unwrap_or(usize::MAX)..)
-                    .unwrap_or_default();
-                let k = src.len().min(buf.len());
-                buf.get_mut(..k)
-                    .unwrap_or_default()
-                    .copy_from_slice(src.get(..k).unwrap_or_default());
-                Ok(k)
-            },
-            n,
-        )
-        .expect("tail")
-    }
-
-    /// 1000 lines of 1 KiB are ~1 MiB: the tail keeps the last 256 KiB. A cut
-    /// inside a line resumes at a char boundary (a 3-byte `€` is never split)
-    /// and is marked, and `start_line` is the number of the line it cut. A cut
-    /// that lands right after a break keeps whole lines and has no mark.
-    #[test]
-    fn tail_byte_cap_256k_with_long_lines() {
-        let line = "€".repeat(340); // 1020 bytes, +1 for the break.
-        let log: String = (0..1000).map(|_| format!("{line}\n")).collect();
-        let tail = tail_of_bytes(log.as_bytes(), 1000);
-        assert!(tail.text.starts_with(TAIL_CUT_MARK), "the cut is marked");
-        // The cap falls 253 bytes into line 744, mid-`€`: two continuation
-        // bytes are skipped (and the text drops the log's final break).
-        assert_eq!(
-            tail.text.len() - TAIL_CUT_MARK.len(),
-            TAIL_MAX_BYTES - 2 - 1
-        );
-        assert_eq!(tail.start_line, 744);
-        assert!(!tail.text.contains('\u{fffd}'), "no char was split");
-        assert!(tail.text.ends_with(&line), "the last line is whole");
-
-        // Lines of exactly 1 KiB: 256 of them are the cap, cut at a break.
-        let line = "x".repeat(1023);
-        let log: String = (0..1000).map(|_| format!("{line}\n")).collect();
-        let tail = tail_of_bytes(log.as_bytes(), 1000);
-        assert!(
-            !tail.text.starts_with(TAIL_CUT_MARK),
-            "whole lines: no mark"
-        );
-        assert_eq!(tail.text.lines().count(), 256);
-        assert_eq!(tail.start_line, 1000 - 256 + 1);
-
-        // One line past the cap and no break at all.
-        let log = "y".repeat(TAIL_MAX_BYTES + 10);
-        let tail = tail_of_bytes(log.as_bytes(), 1000);
-        assert_eq!(tail.text.len(), TAIL_CUT_MARK.len() + TAIL_MAX_BYTES);
-        assert_eq!(tail.start_line, 1);
-
-        // Exactly the cap is kept whole; one byte over is cut and marked.
-        let log = "y".repeat(TAIL_MAX_BYTES);
-        let tail = tail_of_bytes(log.as_bytes(), 1000);
-        assert_eq!((tail.text.as_str(), tail.start_line), (log.as_str(), 1));
-        let log = "y".repeat(TAIL_MAX_BYTES + 1);
-        let tail = tail_of_bytes(log.as_bytes(), 1000);
-        assert_eq!(tail.text.len(), TAIL_CUT_MARK.len() + TAIL_MAX_BYTES);
-        assert!(tail.text.starts_with(TAIL_CUT_MARK));
-
-        // The n-th break found, and the tail after it still over the cap:
-        // cut inside its first line, which is line 2.
-        let log = format!("a\n{}\nc\n", "b".repeat(TAIL_MAX_BYTES + 100));
-        let tail = tail_of_bytes(log.as_bytes(), 2);
-        assert!(tail.text.starts_with(TAIL_CUT_MARK), "the cut is marked");
-        assert!(tail.text.ends_with("b\nc"), "the last line is whole");
-        assert_eq!(tail.text.len(), TAIL_CUT_MARK.len() + TAIL_MAX_BYTES - 1);
-        assert_eq!(tail.start_line, 2);
-    }
 
     /// A captured child's failure lands in the log (appended, both streams),
     /// and the error carries that log and the exit — not the output itself.

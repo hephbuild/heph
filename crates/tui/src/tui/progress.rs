@@ -623,7 +623,7 @@ impl BuildState {
                     self.root_failed += 1;
                 }
             }
-            // A BUILD file that did not evaluate: one failure and one root,
+            // A source file that did not evaluate: one failure and one root,
             // on the row of the address that led into it (folded by `dash`).
             BuildEventKind::FileFailed { entry, error, .. } => {
                 self.errored += 1;
@@ -824,6 +824,15 @@ impl BuildState {
     /// matcher fully resolves). `None` if no `Matched` event has arrived.
     pub fn matched_total(&self) -> Option<usize> {
         self.dash.matched_total()
+    }
+
+    /// The selection matched `addr`: a target the user asked for, not one
+    /// of their dependencies.
+    pub fn is_matched(&self, addr: &str) -> bool {
+        self.dash
+            .id(addr)
+            .and_then(|id| self.dash.record(id))
+            .is_some_and(|r| r.matched())
     }
 
     /// Matched-target progress as `(done, total, complete)`: how many matched
@@ -2773,6 +2782,34 @@ fn live_failure_block(
     out
 }
 
+/// The tail of the slot log an end with no record names, read once when its
+/// block prints ([`hcore::failure_log::read_tail`]): at most `lines` lines,
+/// none when the end names no log, the slot holds none now, or a newer run
+/// filled it since: the slot is read with the end's fill id (U26), so a
+/// newer run's log is never shown as this one's. An older host's end names
+/// no fill, and its slot reads as whatever it holds.
+fn slot_tail(
+    left_behind: Option<&hcore::events::LeftBehindData>,
+    lines: usize,
+) -> Option<hcore::events::LogTailData> {
+    let left = left_behind?;
+    let path = left.log_path.clone()?;
+    if lines == 0 {
+        return None;
+    }
+    let log = hcore::events::LogRef {
+        path: Some(path),
+        fill_id: left.log_fill_id.clone(),
+        ..Default::default()
+    };
+    let tail = hcore::failure_log::read_tail(&log, lines, hcore::failure_log::TAIL_MAX_BYTES)?;
+    Some(hcore::events::LogTailData {
+        text: tail.text,
+        start_line: tail.start_line,
+        streamed: false,
+    })
+}
+
 /// `block` followed by the box's last rows, so the end of the run need not
 /// print the box. Not redacted: they are paths to open and commands to run,
 /// which the box prints whole too.
@@ -2812,6 +2849,18 @@ pub struct CiProgressView {
     /// Root failures already printed: a same-addr `ResultEnd` double-fire
     /// prints one block, not two.
     failures_printed: HashSet<String>,
+    /// Where a failure's box is written, as one write
+    /// ([`CIAppView::set_sink`]). `None` (a view no backend drove, as
+    /// `session attach` and unit tests build): through `tracing`.
+    sink: Option<crate::tui::log_sink::LogSink>,
+    /// The workspace a box names paths relative to and reads its excerpts
+    /// from ([`Self::with_workspace`]).
+    workspace: Option<(std::path::PathBuf, crate::tui::text::WorkspaceRel)>,
+    /// The culprits whose box went out, in print order (an address, or the
+    /// file that did not evaluate): the totals line names them.
+    culprits: Vec<String>,
+    /// Matched targets whose `skipped:` line went out: one each.
+    skipped_printed: HashSet<String>,
 }
 
 /// `heph run --log-lines`' default: how many tail lines a failure prints live
@@ -2827,6 +2876,61 @@ impl CiProgressView {
             stopped: false,
             log_lines: DEFAULT_LOG_LINES,
             failures_printed: HashSet::new(),
+            sink: None,
+            workspace: None,
+            culprits: Vec::new(),
+            skipped_printed: HashSet::new(),
+        }
+    }
+
+    /// A line of the view's own (a `skipped:` or totals line), through the
+    /// sink when it has one, as the boxes go.
+    fn print_line(&self, text: &str) {
+        match &self.sink {
+            Some(sink) => sink.write_diagnostic(&format!("{text}\n")),
+            None => tracing::info!("{text}"),
+        }
+    }
+
+    /// Draw failures' boxes against the workspace at `root`: paths under it
+    /// relative, excerpts read from it. Reads the filesystem once, here.
+    #[must_use]
+    pub fn with_workspace(mut self, root: &std::path::Path) -> Self {
+        self.workspace = Some((
+            root.to_path_buf(),
+            crate::tui::text::WorkspaceRel::workspace(root),
+        ));
+        self
+    }
+
+    /// The live box's context: line mode, never wrapped (a CI log), the
+    /// view's `--log-lines` and redaction.
+    fn render_ctx(&self) -> crate::tui::failure_report::RenderCtx {
+        crate::tui::failure_report::RenderCtx {
+            rel: self
+                .workspace
+                .as_ref()
+                .map(|(_, rel)| rel.clone())
+                .unwrap_or_default(),
+            redact: self.core.state.redact.clone(),
+            source_root: self.workspace.as_ref().map(|(root, _)| root.clone()),
+            width: None,
+            color: crate::tui::color::stderr_color_enabled(),
+            log_lines: self.log_lines,
+            mode: crate::tui::failure_report::RenderMode::Line,
+        }
+    }
+
+    /// `text`, a failure's whole box, as one write to the sink: the sink's
+    /// lock is held for it, so no line another thread logs lands inside it.
+    fn print_box(&self, text: &str) {
+        let text = text.trim_end_matches('\n');
+        if text.is_empty() {
+            return;
+        }
+        match &self.sink {
+            Some(sink) => sink.write_diagnostic(&format!("{text}\n")),
+            None => tracing::error!("{text}"),
         }
     }
 
@@ -2869,6 +2973,10 @@ impl CIAppView for CiProgressView {
 
     fn failures_printed(&self) -> HashSet<String> {
         self.failures_printed.clone()
+    }
+
+    fn set_sink(&mut self, sink: crate::tui::log_sink::LogSink) {
+        self.sink = Some(sink);
     }
 
     // No `begin`: the run opens with no "Running …" header line. The command
@@ -2955,46 +3063,89 @@ impl CIAppView for CiProgressView {
                 // announcing one carries the block (one box per culprit).
                 duplicate: false,
                 left_behind,
+                failure,
             } if !self.failures_printed.contains(addr) => {
                 self.failures_printed.insert(addr.clone());
-                let block = with_left_behind(
-                    live_failure_block(
+                // The record's box, the one the end of the run would have
+                // drawn. An end with no record (an older host's, or one this
+                // host sends without, a cycle's): the block built from the
+                // end's own fields, its tail the one an older host sent, else
+                // read from the slot the end names (P13).
+                let block = match failure {
+                    // A process that failed while its output streamed: the
+                    // CLI's wrapper printed its one line right after that
+                    // output (D6.1c). It is still a culprit for the totals.
+                    Some(rec) if rec.told_streamed() => String::new(),
+                    Some(rec) => crate::tui::failure_report::render_box(rec, &self.render_ctx()),
+                    None => with_left_behind(
+                        live_failure_block(
+                            addr,
+                            error,
+                            exit_status.as_deref(),
+                            timed_out.as_ref(),
+                            log_tail
+                                .clone()
+                                .or_else(|| slot_tail(left_behind.as_deref(), self.log_lines))
+                                .as_ref(),
+                            left_behind.as_deref(),
+                            (path, false),
+                            self.log_lines,
+                            &self.core.state.redact,
+                        ),
                         addr,
-                        error,
-                        exit_status.as_deref(),
-                        timed_out.as_ref(),
-                        log_tail.as_ref(),
                         left_behind.as_deref(),
-                        (path, false),
-                        self.log_lines,
-                        &self.core.state.redact,
                     ),
-                    addr,
-                    left_behind.as_deref(),
-                );
-                tracing::error!("{block}");
+                };
+                self.print_box(&block);
+                self.culprits.push(addr.clone());
             }
-            // A BUILD file that did not evaluate: its block, once, headed by
+            // A source file that did not evaluate: its block, once, headed by
             // the file (it is not a target).
             BuildEventKind::FileFailed {
                 file,
                 entry,
                 error,
                 path,
+                failure,
             } if !self.failures_printed.contains(entry) => {
                 self.failures_printed.insert(entry.clone());
-                let block = live_failure_block(
-                    file,
-                    error,
-                    None,
-                    None,
-                    None,
-                    None,
-                    (path, true),
-                    self.log_lines,
-                    &self.core.state.redact,
-                );
-                tracing::error!("{block}");
+                let block = match failure {
+                    Some(rec) => crate::tui::failure_report::render_box(rec, &self.render_ctx()),
+                    None => live_failure_block(
+                        file,
+                        error,
+                        None,
+                        None,
+                        None,
+                        None,
+                        (path, true),
+                        self.log_lines,
+                        &self.core.state.redact,
+                    ),
+                };
+                self.print_box(&block);
+                self.culprits.push(file.clone());
+            }
+            // A target the user asked for that did not run because a culprit
+            // it depends on failed: one line naming that culprit (D6.1c), as
+            // it ends. A dependency taken down prints nothing; the culprit's
+            // box and the totals line explain it.
+            BuildEventKind::ResultEnd {
+                addr,
+                error: Some(_),
+                upstream_of,
+                upstream_file,
+                cancelled: false,
+                duplicate,
+                ..
+            } if (upstream_of.is_some() || (*duplicate && upstream_file.is_some()))
+                && self.core.state.is_matched(addr)
+                && !self.skipped_printed.contains(addr) =>
+            {
+                if let Some(root) = upstream_file.as_deref().or(upstream_of.as_deref()) {
+                    self.skipped_printed.insert(addr.clone());
+                    self.print_line(&crate::tui::failure_report::skipped_line(addr, root));
+                }
             }
             _ => {}
         }
@@ -3015,6 +3166,14 @@ impl CIAppView for CiProgressView {
             tracing::info!("{line}");
         }
         tracing::info!("{}", self.summary_line());
+        // The run's last line (D6.1c): which culprits failed and how many
+        // requested targets they kept from running, the `skipped:` lines
+        // above it. None when nothing failed.
+        let totals =
+            crate::tui::failure_report::totals_line(&self.culprits, self.skipped_printed.len());
+        if !totals.is_empty() {
+            self.print_line(&totals);
+        }
     }
 
     fn set_stopped(&mut self) {
@@ -3259,6 +3418,7 @@ mod tests {
     }
     fn result_end(addr: &str, error: Option<String>) -> BuildEventKind {
         BuildEventKind::ResultEnd {
+            failure: None,
             duplicate: false,
             upstream_file: None,
             path: Vec::new(),
@@ -4635,6 +4795,7 @@ mod tests {
         tail: Option<&str>,
     ) -> BuildEventKind {
         BuildEventKind::ResultEnd {
+            failure: None,
             duplicate: false,
             upstream_file: None,
             path: Vec::new(),
@@ -4687,6 +4848,177 @@ mod tests {
         assert_eq!(ci_live_log(0, &[end]), "ERROR ✗ //a:b · exit status: 1\n");
     }
 
+    /// A culprit's record, as the engine attaches it to the announcing end.
+    fn record_of(addr: &str, message: &str) -> hcore::events::FailureRecord {
+        hcore::events::FailureRecord {
+            addr: Some(addr.to_owned()),
+            entry: addr.to_owned(),
+            path: vec![addr.to_owned()],
+            ..hcore::events::FailureRecord::new(
+                hcore::diagnostic::Diagnostic::new(hcore::diagnostic::Stage::Run, message)
+                    .with_addr(addr),
+            )
+        }
+    }
+
+    /// `failed_end` carrying `rec`.
+    fn failed_end_with(addr: &str, rec: hcore::events::FailureRecord) -> BuildEventKind {
+        let mut end = failed_end(addr, None, false, Some(TAIL));
+        if let BuildEventKind::ResultEnd { failure, .. } = &mut end {
+            *failure = Some(Box::new(rec));
+        }
+        end
+    }
+
+    /// An end that carries its culprit's record prints the record's box, the
+    /// one the end of the run draws, not the block built from the end's
+    /// flat fields; a `FileFailed` with one too. Each prints once.
+    #[test]
+    fn ci_view_prints_the_records_box_as_it_fails() {
+        let rec = record_of("//a:b", "the record's message");
+        let view = CiProgressView::new("Running").with_log_lines(3);
+        let want = crate::tui::failure_report::render_box(&rec, &view.render_ctx());
+        let end = failed_end_with("//a:b", rec);
+        let log = ci_view_log_of(
+            view,
+            HolderNames::default(),
+            &[ev(1, end.clone()), ev(2, end)],
+        );
+        assert_eq!(log, format!("ERROR {}\n", want.trim_end_matches('\n')));
+        assert!(log.contains("the record's message"), "{log}");
+        assert!(!log.contains("exit status: 1"), "the flat block: {log}");
+
+        let mut rec = record_of("//d:t", "evaluating d/BUILD: the record's");
+        rec.addr = None;
+        rec.file = Some("d/BUILD".into());
+        let view = CiProgressView::new("Running");
+        let want = crate::tui::failure_report::render_box(&rec, &view.render_ctx());
+        let file_failed = BuildEventKind::FileFailed {
+            file: "d/BUILD".into(),
+            entry: "//d:t".into(),
+            error: "evaluating d/BUILD: flat".into(),
+            path: vec!["//d:t".into()],
+            failure: Some(Box::new(rec)),
+        };
+        let log = ci_view_log_of(view, HolderNames::default(), &[ev(1, file_failed)]);
+        assert_eq!(log, format!("ERROR {}\n", want.trim_end_matches('\n')));
+        assert!(!log.contains("flat"), "{log}");
+    }
+
+    /// D6.1c in the line backend: a matched target a culprit took down gets
+    /// one `skipped:` line naming it (a target or a file), once; a dependency
+    /// taken down and a stop get none. The run ends with the totals line,
+    /// the culprits in print order; a run where nothing failed has none.
+    #[test]
+    fn ci_view_prints_skipped_and_totals_lines() {
+        let run = |events: &[BuildEventKind]| -> Vec<String> {
+            let sink = crate::tui::log_sink::LogSink::new_direct_with(std::sync::Arc::new(
+                crate::tui::session::SessionSlot::new(),
+            ));
+            let mut rx = sink.switch_to_buffered();
+            let mut v = CiProgressView::new("Running");
+            v.set_sink(sink);
+            for e in events {
+                v.apply(&ev(1, e.clone()));
+            }
+            v.finish();
+            let mut out = Vec::new();
+            while let Ok(line) = rx.try_recv() {
+                out.push(String::from_utf8(line.bytes).expect("utf-8"));
+            }
+            out
+        };
+        let mut dup = failed_end("//a:other", None, false, None);
+        if let BuildEventKind::ResultEnd {
+            duplicate,
+            upstream_file,
+            ..
+        } = &mut dup
+        {
+            *duplicate = true;
+            *upstream_file = Some("d/BUILD".into());
+        }
+        let lines = run(&[
+            matched(&["//a:root", "//a:other", "//a:stopped"], true),
+            failed_end("//c:y", None, false, None),
+            failed_end("//a:dep", Some("//c:y"), false, None),
+            failed_end("//a:root", Some("//c:y"), false, None),
+            failed_end("//a:root", Some("//c:y"), false, None),
+            failed_end("//a:stopped", Some("//c:y"), true, None),
+            BuildEventKind::FileFailed {
+                file: "d/BUILD".into(),
+                entry: "//d:t".into(),
+                error: "evaluating d/BUILD: boom".into(),
+                path: vec!["//d:t".into()],
+                failure: None,
+            },
+            dup,
+        ]);
+        let plain: Vec<&String> = lines.iter().filter(|l| !l.starts_with('✗')).collect();
+        // `skipped` counts the lines above it: requested targets, not the
+        // dependency taken down.
+        assert_eq!(
+            plain,
+            [
+                "– //a:root skipped: //c:y failed\n",
+                "– //a:other skipped: d/BUILD failed\n",
+                "2 failed: //c:y, d/BUILD · 2 skipped\n",
+            ],
+            "{lines:#?}"
+        );
+
+        let lines = run(&[matched(&["//a:ok"], true), result_end("//a:ok", None)]);
+        assert!(lines.is_empty(), "nothing failed: {lines:?}");
+    }
+
+    /// With the backend's sink, each box is one write: however many views
+    /// print boxes at once, every box is whole inside one sink line, with
+    /// no other line inside it.
+    #[test]
+    fn line_backend_boxes_never_interleave() {
+        const THREADS: usize = 8;
+        const PER: usize = 50;
+        let sink = crate::tui::log_sink::LogSink::new_direct_with(std::sync::Arc::new(
+            crate::tui::session::SessionSlot::new(),
+        ));
+        let mut rx = sink.switch_to_buffered();
+        let mut want = std::collections::HashSet::new();
+        std::thread::scope(|s| {
+            let mut handles = Vec::new();
+            for t in 0..THREADS {
+                let sink = sink.clone();
+                handles.push(s.spawn(move || {
+                    let mut view = CiProgressView::new("Running");
+                    view.set_sink(sink);
+                    let mut boxes = Vec::new();
+                    for i in 0..PER {
+                        let addr = format!("//t{t}:f{i}");
+                        let rec = record_of(&addr, &format!("line one {t}/{i}\nline two {t}/{i}"));
+                        let want = crate::tui::failure_report::render_box(&rec, &view.render_ctx());
+                        boxes.push(format!("{}\n", want.trim_end_matches('\n')));
+                        view.apply(&ev(1, failed_end_with(&addr, rec)));
+                    }
+                    boxes
+                }));
+            }
+            for h in handles {
+                want.extend(h.join().expect("printer thread"));
+            }
+        });
+        let mut got = Vec::new();
+        while let Ok(line) = rx.try_recv() {
+            got.push(String::from_utf8(line.bytes).expect("utf-8"));
+        }
+        assert_eq!(got.len(), THREADS * PER, "one write per box");
+        for line in &got {
+            assert!(line.lines().count() > 1, "a multi-line box: {line}");
+            assert!(
+                want.contains(line),
+                "a write that is not one whole box: {line}"
+            );
+        }
+    }
+
     /// D6.1 in the line backend: a tail that streamed to a terminal is not
     /// printed again; the block points at the log and counts it, from the
     /// tail's start line and its own lines.
@@ -4700,11 +5032,15 @@ mod tests {
             t.streamed = true;
             t.start_line = 96;
         }
-        // Without word that the log can be read, the pointer names no command.
+        // U26: without word that the log can be read there is no command to
+        // point at, so the tail is shown.
         assert_eq!(
             ci_live_log(3, std::slice::from_ref(&end)),
             "ERROR ✗ //a:b · exit status: 1\
-             \n  │ (output not shown here: 100 lines)\n",
+             \n  │ … 97 earlier lines\
+             \n  │ three\
+             \n  │ four\
+             \n  │ five\n",
         );
         if let BuildEventKind::ResultEnd { left_behind, .. } = &mut end {
             *left_behind = Some(Box::new(hcore::events::LeftBehindData {
@@ -4720,6 +5056,100 @@ mod tests {
         );
     }
 
+    /// U26: an end with no record and no tail reads the slot it names with
+    /// the end's fill id, so a newer run's log in that slot is never shown as
+    /// this failure's; an older host's end names no fill and reads whatever
+    /// the slot holds.
+    #[test]
+    fn ci_view_no_record_fallback_reads_the_slot_with_the_ends_fill() {
+        let ws = tempfile::tempdir().expect("ws");
+        let slot = ws.path().join("a_b");
+        std::fs::create_dir_all(&slot).expect("slot dir");
+        let fill = |id: &str, log: &str| {
+            std::fs::write(
+                slot.join(hcore::failure_log::MANIFEST),
+                format!(r#"{{"version":1,"fill_id":"{id}"}}"#),
+            )
+            .expect("manifest");
+            std::fs::write(slot.join(hcore::failure_log::LOG), log).expect("log");
+        };
+        let end_of = |fill_id: Option<&str>| {
+            let mut end = failed_end("//a:b", None, false, None);
+            if let BuildEventKind::ResultEnd { left_behind, .. } = &mut end {
+                *left_behind = Some(Box::new(hcore::events::LeftBehindData {
+                    log_path: Some(slot.join(hcore::failure_log::LOG).display().to_string()),
+                    log_fill_id: fill_id.map(str::to_owned),
+                    ..Default::default()
+                }));
+            }
+            end
+        };
+
+        fill("f1", "this-runs-line\n");
+        let own = ci_live_log(3, &[end_of(Some("f1"))]);
+        assert!(own.contains("  │ this-runs-line\n"), "{own}");
+
+        fill("f2", "a-newer-runs-line\n");
+        let replaced = ci_live_log(3, &[end_of(Some("f1"))]);
+        assert!(
+            !replaced.contains("a-newer-runs-line"),
+            "a newer run's log was shown as this failure's\n{replaced}"
+        );
+        assert!(replaced.starts_with("ERROR ✗ //a:b"), "{replaced}");
+
+        let older_host = ci_live_log(3, &[end_of(None)]);
+        assert!(
+            older_host.contains("  │ a-newer-runs-line\n"),
+            "{older_host}"
+        );
+    }
+
+    /// D6.1c, U6 in the line backend: a culprit whose process failed while
+    /// its output streamed was told in the CLI's one line, so the view prints
+    /// no box for it, yet still counts it in the totals line. One that
+    /// streamed and then failed after the run (its outputs, the cache store)
+    /// gets its box, and so does one that failed before it ran.
+    #[test]
+    fn ci_view_told_streamed_no_box_but_counted() {
+        let run = |events: &[BuildEventKind]| -> Vec<String> {
+            let sink = crate::tui::log_sink::LogSink::new_direct_with(std::sync::Arc::new(
+                crate::tui::session::SessionSlot::new(),
+            ));
+            let mut rx = sink.switch_to_buffered();
+            let mut v = CiProgressView::new("Running");
+            v.set_sink(sink);
+            for e in events {
+                v.apply(&ev(1, e.clone()));
+            }
+            v.finish();
+            let mut out = Vec::new();
+            while let Ok(line) = rx.try_recv() {
+                out.push(String::from_utf8(line.bytes).expect("utf-8"));
+            }
+            out
+        };
+        let streamed = |addr: &str, failed_in| {
+            let mut rec = record_of(addr, &format!("{addr} message"));
+            rec.streamed = true;
+            rec.failed_in = failed_in;
+            failed_end_with(addr, rec)
+        };
+        let lines = run(&[
+            streamed("//a:exec", hcore::events::FailedIn::Exec),
+            streamed("//a:after", hcore::events::FailedIn::AfterRun),
+            streamed("//a:before", hcore::events::FailedIn::BeforeRun),
+        ]);
+        let all = lines.concat();
+        assert!(!all.contains("//a:exec message"), "a told box: {lines:#?}");
+        assert!(all.contains("//a:after message"), "{lines:#?}");
+        assert!(all.contains("//a:before message"), "{lines:#?}");
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("3 failed: //a:exec, //a:after, //a:before\n"),
+            "{lines:#?}"
+        );
+    }
+
     /// The block ends with the rows the end-of-run box would have carried,
     /// after the tail and in the box's order, and the view says it printed
     /// it: the end of the run then leaves the box out. A collateral failure
@@ -4727,6 +5157,7 @@ mod tests {
     #[test]
     fn ci_view_live_block_carries_the_box_rows() {
         let end = BuildEventKind::ResultEnd {
+            failure: None,
             duplicate: false,
             upstream_file: None,
             path: Vec::new(),
@@ -4748,6 +5179,7 @@ mod tests {
                 outputs: Some("/h/failures/a_b/out".into()),
                 fixes: None,
                 log_readable: Some(true),
+                ..Default::default()
             })),
         };
         assert_eq!(
@@ -4812,6 +5244,7 @@ mod tests {
         assert_eq!(s.failure_split(), (1, 0), "one root, nothing taken down");
 
         let file = BuildEventKind::FileFailed {
+            failure: None,
             file: "d/BUILD".into(),
             entry: "//d:t".into(),
             error: "evaluating d/BUILD: boom".into(),
@@ -4832,6 +5265,7 @@ mod tests {
     fn duplicate_end_in_a_broken_file_is_taken_down_by_it() {
         use crate::tui::dashboard::RowState;
         let file = BuildEventKind::FileFailed {
+            failure: None,
             file: "d/BUILD".into(),
             entry: "//d:t1".into(),
             error: "evaluating d/BUILD: boom".into(),
@@ -4901,6 +5335,7 @@ mod tests {
         assert!(!log.contains("reached by:"), "{log}");
 
         let file = BuildEventKind::FileFailed {
+            failure: None,
             file: "d/BUILD".into(),
             entry: "//d:t".into(),
             error: "boom".into(),
@@ -4931,6 +5366,7 @@ mod tests {
     #[test]
     fn ci_view_live_block_words_and_sanitizing() {
         let timed_out = BuildEventKind::ResultEnd {
+            failure: None,
             duplicate: false,
             upstream_file: None,
             path: Vec::new(),
@@ -4968,6 +5404,7 @@ mod tests {
         );
 
         let no_status = BuildEventKind::ResultEnd {
+            failure: None,
             duplicate: false,
             upstream_file: None,
             path: Vec::new(),
@@ -5640,6 +6077,37 @@ mod tests {
         assert_eq!(s.elapsed_ms(9_000), 7_000);
     }
 
+    /// STAGE-18: a request's `RequestConfig`, sent before anything resolves,
+    /// starts the clock on its own. Through a slow provider no target event
+    /// arrives, and the line still counts the seconds; the first target event
+    /// does not move the anchor. bin-e2e: `tui_clock_ticks_during_slow_get`.
+    #[test]
+    fn elapsed_ticks_from_request_config() {
+        let mut v = TuiProgressView::new("L");
+        v.apply(&ev(
+            1_000,
+            BuildEventKind::RequestConfig {
+                max_workers: 4,
+                fail_fast: false,
+                scratch_disabled: false,
+                resources: Default::default(),
+                units: Default::default(),
+            },
+        ));
+        for (now, clock) in [(2_000, "1s · 0 done"), (4_000, "3s · 0 done")] {
+            let lines = v.snapshot_lines(now, 100);
+            let line = lines.first().map(ToString::to_string).unwrap_or_default();
+            assert!(line.contains(clock), "at {now}: {line}");
+        }
+        v.apply(&ev(6_000, result_start("//a:b")));
+        let lines = v.snapshot_lines(7_000, 100);
+        let line = lines.first().map(ToString::to_string).unwrap_or_default();
+        assert!(
+            line.starts_with("6s · ") || line.contains(" 6s · "),
+            "{line}"
+        );
+    }
+
     /// `heph session show`'s frame: the line, then the dashboard's All list
     /// with its titles, capped at 15 rows, no key hints, measured against
     /// the clock it is given.
@@ -6306,6 +6774,7 @@ mod tests {
                 });
             }
             ev(BuildEventKind::ResultEnd {
+                failure: None,
                 duplicate: false,
                 upstream_file: None,
                 path: Vec::new(),

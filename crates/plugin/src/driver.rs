@@ -1937,7 +1937,7 @@ impl Allotment {
         let Some(a) = allotment else {
             anyhow::bail!(
                 "{target}: `{}` is substituted from the run's allotment, and this run was told \
-                 none — a bug in heph rather than in the BUILD file",
+                 none — a bug in heph rather than in the target's definition",
                 r.raw
             );
         };
@@ -2871,7 +2871,7 @@ impl<'a, 'io> RunRequest<'a, 'io> {
             Some(DeferredValue::NeedsSandbox { .. }) => anyhow::bail!(
                 "{:?} names a `${{src://…}}` that was never completed — the sandbox path is \
                  filled in after an artifact is staged and before any driver runs, so this is a \
-                 bug in heph rather than in the BUILD file",
+                 bug in heph rather than in the target's definition",
                 d.raw()
             ),
             None => {}
@@ -2886,7 +2886,7 @@ impl<'a, 'io> RunRequest<'a, 'io> {
         if hcore::template::has_deferred_ref(d.raw()) {
             anyhow::bail!(
                 "the host did not resolve {:?} — a deferred field's value is filled in before the \
-                 run, so this is a bug in heph rather than in the BUILD file",
+                 run, so this is a bug in heph rather than in the target's definition",
                 d.raw()
             );
         }

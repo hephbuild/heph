@@ -473,7 +473,7 @@ pub struct Model {
     open: HashSet<Id>,
     /// How many records carry `IN_FLIGHT`.
     in_flight: usize,
-    /// Each BUILD file that did not evaluate, and the row its failure is on
+    /// Each source file that did not evaluate, and the row its failure is on
     /// (its `FileFailed` entry): the root a target in that file names. One
     /// per broken file.
     file_rows: HashMap<Box<str>, Id>,
@@ -665,7 +665,7 @@ impl Model {
                 };
                 self.set_state(id, state);
             }
-            // A BUILD file that did not evaluate: its failure is shown on the
+            // A source file that did not evaluate: its failure is shown on the
             // row of the address that led into it (the root its collateral
             // names), which never had a scope of its own.
             BuildEventKind::FileFailed {
@@ -839,6 +839,15 @@ impl Model {
             (Some(_), _) => roots.next(),
             (None, _) => deps.next(),
         })
+    }
+
+    /// The first culprit to end: a target that failed on its own, or the
+    /// entry row of a source file that did not evaluate. Never a target a
+    /// dependency or a broken file took down, which has no record of its own.
+    pub fn first_culprit(&self) -> Option<&str> {
+        self.failures()
+            .find(|id| self.state(*id) == Some(RowState::Failed))
+            .map(|id| self.addr(id))
     }
 
     /// A root failure's PHASE text.
@@ -1197,6 +1206,7 @@ mod tests {
         let redact = Redact::default();
         let mut m = Model::default();
         let end = |error: Option<&str>| BuildEventKind::ResultEnd {
+            failure: None,
             duplicate: false,
             upstream_file: None,
             path: Vec::new(),
@@ -1360,6 +1370,7 @@ mod tests {
                     _ => (Some("boom".to_owned()), Some(addr(rng)), false),
                 };
                 BuildEventKind::ResultEnd {
+                    failure: None,
                     duplicate: false,
                     upstream_file: None,
                     path: Vec::new(),

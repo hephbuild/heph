@@ -169,10 +169,11 @@ async fn a_def_that_does_not_resolve_is_announced() -> anyhow::Result<()> {
 }
 
 /// A dependent that failed only because its dependency did names that root,
-/// though its error reaches the end as `meta: …` around the memoizer's shared
-/// copy of the marker. Read off the chain, the end stopped at that copy and
-/// every view showed the dependent as a failure of its own — one the
-/// end-of-run report, which records only roots, never listed.
+/// though its error reaches the end wrapped in a `meta` stage frame around
+/// the memoizer's shared copy of the marker. Read off the chain, the end
+/// stopped at that copy and every view showed the dependent as a failure of
+/// its own — one the end-of-run report, which records only roots, never
+/// listed. The end's message leaves the stage frame out and names the root.
 #[tokio::test]
 async fn a_meta_failure_names_its_root() -> anyhow::Result<()> {
     let ws = workspace(vec![
@@ -181,7 +182,8 @@ async fn a_meta_failure_names_its_root() -> anyhow::Result<()> {
     ])?;
     let seen = single(&ws, "//a:top").await;
     let (error, root) = failed_end(&seen.events, "//a:top");
-    assert!(error.starts_with("meta"), "the case this pins: {error}");
+    assert!(!error.starts_with("meta"), "no stage frame: {error}");
+    assert!(error.contains("//a:root"), "names its root: {error}");
     assert_eq!(root.as_deref(), Some("//a:root"));
     let (_, root) = failed_end(&seen.events, "//a:root");
     assert_eq!(root, None);
@@ -204,5 +206,47 @@ async fn an_aggregate_of_dependency_failures_names_a_root() -> anyhow::Result<()
     let root = root.unwrap_or_else(|| panic!("collateral: {:#?}", seen.events));
     assert!(root == "//a:r1" || root == "//a:r2", "{root}");
     assert_eq!(seen.recorded, owned(&["//a:r1", "//a:r2"]));
+    Ok(())
+}
+
+/// A failing run's `ResultEnd` names its log and never carries it (P13,
+/// D7b): no tail on the end, and none of the log's text anywhere in the end
+/// as a session records it (`events.ndjson` is these events, serialized).
+/// The record's reference reads back the run's own log from its slot.
+#[tokio::test(flavor = "multi_thread")]
+async fn result_end_carries_log_reference_not_text() -> anyhow::Result<()> {
+    let ws = workspace(vec![bash(
+        "//a:t",
+        "for ((i = 1; i <= 50; i++)); do echo planted-line-$i; done; exit 3",
+        &[],
+    )])?;
+    let seen = single(&ws, "//a:t").await;
+    let end = seen
+        .events
+        .iter()
+        .find(|e| matches!(&e.kind, BuildEventKind::ResultEnd { addr, error: Some(_), .. } if addr == "//a:t"))
+        .unwrap_or_else(|| panic!("no failing end: {:#?}", seen.events));
+    let BuildEventKind::ResultEnd {
+        log_tail, failure, ..
+    } = &end.kind
+    else {
+        panic!("matched a ResultEnd")
+    };
+    assert!(log_tail.is_none(), "the end carries no tail: {log_tail:?}");
+    let json = serde_json::to_string(end)?;
+    assert!(
+        !json.contains("planted-line"),
+        "no log text on the wire: {json}"
+    );
+
+    let log = failure
+        .as_ref()
+        .and_then(|f| f.log.as_ref())
+        .unwrap_or_else(|| panic!("the record names the log: {failure:?}"));
+    assert!(log.memory_tail.is_none(), "not credential material");
+    assert!(log.fill_id.is_some(), "the slot's fill: {log:?}");
+    let tail = hcore::failure_log::read_tail(log, 2, hcore::failure_log::TAIL_MAX_BYTES)
+        .unwrap_or_else(|| panic!("the slot holds this run's log: {log:?}"));
+    assert_eq!(tail.text, "planted-line-49\nplanted-line-50");
     Ok(())
 }

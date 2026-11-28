@@ -48,6 +48,7 @@ const LAYOUTS: &[Layout] = &[
             "deferred.rs",
             "entrypoint.rs",
             "run_terminal.rs",
+            "failure_memory.rs",
         ],
         support: &["common"],
     },

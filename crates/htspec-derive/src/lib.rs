@@ -432,7 +432,7 @@ fn expand_spec_struct(input: DeriveInput) -> syn::Result<proc_macro2::TokenStrea
                 let __m = match __value {
                     crate::htvalue::Value::Map(__m) => __m,
                     __other => ::anyhow::bail!(
-                        "invalid: expected a map, got: {}", __other.to_starlark()
+                        "invalid: expected a map, got: {}", __other.render()
                     ),
                 };
 
@@ -529,7 +529,7 @@ fn expand_spec_enum(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream>
                     __other => ::anyhow::bail!(
                         "invalid: expected one of [{}], got: {}",
                         #valid,
-                        crate::htvalue::starlark_str(__other)
+                        crate::htvalue::quote_str(__other)
                     ),
                 }
             }
@@ -603,7 +603,7 @@ fn expand_spec_union(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream
                 ::anyhow::bail!(
                     "invalid: expected {}, got: {}",
                     <Self as crate::htspec::FromSpecValue>::spec_param_type().render(),
-                    __v.to_starlark()
+                    __v.render()
                 )
             }
 

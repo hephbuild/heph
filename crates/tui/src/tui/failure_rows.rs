@@ -25,25 +25,114 @@ pub fn shell_quote(s: &str) -> std::borrow::Cow<'_, str> {
 /// can open one; "none kept" when it cannot. A failure nobody asked the
 /// engine about points at `heph log` only beside `full log:`.
 pub fn left_behind_rows(addr: &str, left: &LeftBehindData) -> String {
+    left_behind_rows_in(addr, left, true, LogRow::Show(None))
+}
+
+/// What the rows end with ([`left_behind_rows_in`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogRow<'a> {
+    /// No `log:` row: a failure before the run has no log to name, or to say
+    /// none of.
+    Omit,
+    /// `log: heph log <addr>`, or `log: none kept` followed by why in
+    /// parentheses when the caller knows (PV-2).
+    Show(Option<&'a str>),
+}
+
+/// [`left_behind_rows`], for a screen that may not show the paths into
+/// heph's home (the report after the TUI, I9) when `paths` is false: no
+/// `full log:` row (the `log:` row names the command), and `outputs:` points
+/// at `heph inspect failure` instead of the slot's `out/`. A kept sandbox is
+/// named in both: the user asked for it. `log_row` says whether a `log:` row
+/// ends them, and why none was kept when that is known.
+pub fn left_behind_rows_in(
+    addr: &str,
+    left: &LeftBehindData,
+    paths: bool,
+    log_row: LogRow<'_>,
+) -> String {
     let mut out = String::new();
-    if let Some(path) = &left.log_path {
+    if paths && let Some(path) = &left.log_path {
         out.push_str(&format!("  full log: {path}\n"));
     }
     if let Some(sandbox) = &left.sandbox {
         out.push_str(&format!("  sandbox: {sandbox}\n"));
     }
     if let Some(outputs) = &left.outputs {
-        out.push_str(&format!("  outputs: {outputs}\n"));
+        // What was kept, then where: the path, or the command that names it.
+        let what = kept_groups(left);
+        if paths && what.is_empty() {
+            out.push_str(&format!("  outputs: {outputs}\n"));
+        } else if paths {
+            out.push_str(&format!("  outputs: {what} · {outputs}\n"));
+        } else {
+            let what = if what.is_empty() { "kept" } else { &what };
+            out.push_str(&format!(
+                "  outputs: {what} · heph inspect failure {}\n",
+                shell_quote(addr)
+            ));
+        }
     }
     if let Some(fixes) = &left.fixes {
-        fixes_rows(&mut out, fixes);
+        fixes_rows(&mut out, fixes, (!paths).then_some(addr));
     }
+    let LogRow::Show(why) = log_row else {
+        return out;
+    };
     if log_readable(left) {
         out.push_str(&format!("  log: heph log {}\n", shell_quote(addr)));
     } else if left.log_readable == Some(false) {
-        out.push_str("  log: none kept\n");
+        match why {
+            Some(why) => out.push_str(&format!("  log: none kept ({why})\n")),
+            None => out.push_str("  log: none kept\n"),
+        }
     }
     out
+}
+
+/// The kept `failure_out` groups, as a row names them: `report/ (3 files),
+/// a.txt +2 more`. Empty when the slot counted none.
+fn kept_groups(left: &LeftBehindData) -> String {
+    let mut groups: Vec<String> = left
+        .kept
+        .iter()
+        .map(|g| {
+            let name = crate::tui::text::clean_inline(&g.name);
+            match g.files {
+                1 if !name.ends_with('/') => name.into_owned(),
+                1 => format!("{name} (1 file)"),
+                n => format!(
+                    "{name} ({} files)",
+                    hcore::units::thousands(usize::try_from(n).unwrap_or(usize::MAX))
+                ),
+            }
+        })
+        .collect();
+    if left.kept_more > 0 {
+        groups.push(format!("+{} more", left.kept_more));
+    }
+    groups.join(", ")
+}
+
+/// The `took down:` row of a culprit others failed because of: the first
+/// few by name, then `+N more`. `None` when it took down nothing.
+pub fn took_down_row(td: &hcore::events::TookDownData) -> Option<String> {
+    if td.total == 0 {
+        return None;
+    }
+    let mut named = td
+        .named
+        .iter()
+        .map(|a| crate::tui::text::clean_inline(a).into_owned())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more = td
+        .total
+        .saturating_sub(u64::try_from(td.named.len()).unwrap_or(u64::MAX));
+    if more > 0 {
+        named.push_str(&format!(" +{more} more"));
+    }
+    Some(format!("took down: {named}"))
 }
 
 /// A path of more targets than this is elided in text (error-reporting U3,
@@ -56,25 +145,38 @@ const PATH_SHOWN_WHOLE: usize = 5;
 /// is the one to edit, so it is always shown. `--json` carries the whole
 /// path; only text elides it.
 fn elide_path<S: AsRef<str>>(path: &[S]) -> String {
-    let shown = |p: &[&S]| {
+    let shown = |p: &[S]| {
         p.iter()
             .map(|a| crate::tui::text::clean_inline(a.as_ref()).into_owned())
             .collect::<Vec<_>>()
             .join(" → ")
     };
-    match path {
-        [a, b, hidden @ .., y, z] if path.len() > PATH_SHOWN_WHOLE => format!(
-            "{} → … {} more (--json has the full path) … → {}",
-            shown(&[a, b]),
-            hidden.len(),
-            shown(&[y, z]),
+    match path_elision(path) {
+        (head, 0, _) => shown(head),
+        (head, hidden, tail) => format!(
+            "{} → … {hidden} more (--json has the full path) … → {}",
+            shown(head),
+            shown(tail),
         ),
-        _ => shown(&path.iter().collect::<Vec<_>>()),
     }
 }
 
+/// The one elision rule, for text and for `--json`'s skipped records
+/// (U23): `(head, hidden, tail)`, where a path of more than
+/// [`PATH_SHOWN_WHOLE`] targets keeps the requested target and the first hop
+/// in `head` and the last two in `tail`, `hidden` counting the targets
+/// between. A shorter path is `(path, 0, [])`.
+pub fn path_elision<T>(path: &[T]) -> (&[T], usize, &[T]) {
+    if path.len() > PATH_SHOWN_WHOLE
+        && let (Some(head), Some(tail)) = (path.get(..2), path.get(path.len().saturating_sub(2)..))
+    {
+        return (head, path.len().saturating_sub(4), tail);
+    }
+    (path, 0, &[])
+}
+
 /// The rows a culprit's box prints for how the request reached it, from its
-/// `path` (from a requested target to the culprit, inclusive; for a BUILD
+/// `path` (from a requested target to the culprit, inclusive; for a source
 /// file that did not evaluate, to the address that led into it), each
 /// ending in a newline and without indentation:
 /// - `reached by: //a:root → //b:x → //c:y`, elided as [`elide_path`] does;
@@ -141,11 +243,12 @@ pub fn log_line_count(text: &str, start_line: usize) -> usize {
 /// tail's own (no total is carried; the tail's start says the rest).
 /// - N = 0: `(no output)`, streamed or not.
 /// - `streamed` (its output reached a terminal while it ran, so the user saw
-///   it there): the pointer `(output not shown here: N lines · heph log //t)`
-///   and no line of the tail (U5). The command only when `readable` (`heph
-///   log` can open the log): a pointer must not name a command with nothing
-///   to show.
-/// - Otherwise the tail's last `max_lines` lines, after an
+///   it there) and `readable` (`heph log` can open the log): the pointer
+///   `(output not shown here: N lines · heph log //t)` and no line of the
+///   tail (U5).
+/// - Otherwise, a streamed tail whose log cannot be opened included (U26: a
+///   pointer with no command to follow would leave nothing to read), the
+///   tail's last `max_lines` lines, after an
 ///   `… N earlier lines` row when the log has lines before them. The row
 ///   names no command: the box's own `log:` / `full log:` row does, and
 ///   says when there is none.
@@ -176,16 +279,12 @@ pub fn tail_rows<'a>(
             first_line: first,
         };
     }
-    if streamed {
-        let note = if readable {
-            format!(
-                "(output not shown here: {} · heph log {})",
-                lines(total, "line"),
-                shell_quote(addr)
-            )
-        } else {
-            format!("(output not shown here: {})", lines(total, "line"))
-        };
+    if streamed && readable {
+        let note = format!(
+            "(output not shown here: {} · heph log {})",
+            lines(total, "line"),
+            shell_quote(addr)
+        );
         return TailRows {
             note: Some(note),
             shown: "",
@@ -218,24 +317,56 @@ pub fn tail_rows<'a>(
 /// and with `--literal-pathspecs`, since git reads a pathspec as a glob:
 /// `web/[id].ts` would also revert `web/i.ts`. It restores the index version,
 /// so it says that uncommitted edits to those files go with it.
-fn fixes_rows(out: &mut String, fixes: &FixesData) {
+/// `+N more (full list: where)`, or `(full list: where)` when every path
+/// was named.
+fn push_full_list(out: &mut String, more: usize, where_: &str) {
+    if more > 0 {
+        out.push_str(&format!("    +{more} more (full list: {where_})\n"));
+    } else {
+        out.push_str(&format!("    (full list: {where_})\n"));
+    }
+}
+
+/// The write-back's rows. `inspect` is the failure's address on a screen
+/// that names no path into heph's home (I9): the slot's fixes list is then
+/// named by the command that prints it, never by its path.
+fn fixes_rows(out: &mut String, fixes: &FixesData, inspect: Option<&str>) {
     const RESTORE: &str =
         "  restore with (takes the index version; uncommitted edits to these files are lost):\n";
     match fixes {
         FixesData::Written { paths, .. } if paths.is_empty() => {}
-        FixesData::Written { root, paths, list } => {
+        FixesData::Written {
+            root,
+            paths,
+            list,
+            paths_more,
+        } => {
             let git = format!("git -C {} --literal-pathspecs checkout", shell_quote(root));
             out.push_str(
                 "  fixes written, target still failed (re-run to verify; \
                  codegen = \"in_place_on_success\" opts out):\n",
             );
             for p in paths.iter().take(FIXES_SHOWN) {
-                out.push_str(&format!("    {p}\n"));
+                out.push_str(&format!("    {}\n", crate::tui::text::clean_inline(p)));
             }
-            let more = paths.len().saturating_sub(FIXES_SHOWN);
-            match list {
-                Some(list) if more > 0 => {
-                    out.push_str(&format!("    +{more} more (full list: {list})\n"));
+            // A record names the first paths and counts the rest (I8).
+            let more = paths.len().saturating_sub(FIXES_SHOWN)
+                + usize::try_from(*paths_more).unwrap_or(usize::MAX);
+            // A path a terminal cannot show as typed goes through the list
+            // too: the restore below would not paste back as written.
+            let unprintable = paths.iter().any(|p| p.chars().any(char::is_control));
+            match (list, inspect) {
+                (Some(_), Some(inspect)) if more > 0 || unprintable => {
+                    let addr = shell_quote(inspect);
+                    push_full_list(out, more, &format!("heph inspect failure {addr}"));
+                    out.push_str(RESTORE);
+                    out.push_str(&format!(
+                        "    {git} --pathspec-from-file=<the fixes file heph inspect failure \
+                         {addr} names>\n"
+                    ));
+                }
+                (Some(list), _) if more > 0 || unprintable => {
+                    push_full_list(out, more, list);
                     // The list is one path per line, which is what git's
                     // `--pathspec-from-file` reads: no xargs word splitting.
                     out.push_str(RESTORE);
@@ -355,6 +486,7 @@ mod tests {
                 reason: "--frozen checks the tree, it never writes it".into(),
             }),
             log_readable: Some(true),
+            ..LeftBehindData::default()
         };
         assert_eq!(
             left_behind_rows("//p:x", &left),
@@ -377,13 +509,13 @@ mod tests {
         let rows =
             |text, start, streamed, max| tail_rows("//p:t", text, start, streamed, true, max);
 
-        assert_eq!(
-            tail_rows("//p:t", "a\nb\n", 999, true, false, 1000)
-                .note
-                .as_deref(),
-            Some("(output not shown here: 1,000 lines)"),
-            "no log to read: the pointer names no command"
-        );
+        // U26: no log to read, so no pointer: the streamed tail is shown.
+        let r = tail_rows("//p:t", "a\nb\n", 999, true, false, 1000);
+        assert_eq!(r.note.as_deref(), Some("… 998 earlier lines"));
+        assert_eq!((r.shown, r.first_line), ("a\nb\n", 999));
+        let r = tail_rows("//p:t", "a\nb\nc\n", 1, true, false, 2);
+        assert_eq!(r.note.as_deref(), Some("… 1 earlier line"));
+        assert_eq!(r.shown, "b\nc\n", "the streamed tail, cut to max_lines");
         let r = tail_rows("//p:t", "a\nb\n", 41, false, false, 1000);
         assert_eq!(r.note.as_deref(), Some("… 40 earlier lines"));
         assert_eq!(r.shown, "a\nb\n", "an unreadable log's tail is still shown");
@@ -461,6 +593,18 @@ mod tests {
         assert_eq!(
             rows(path, Some(false)),
             "  full log: /h/log.txt\n  log: none kept\n"
+        );
+        let unreadable = LeftBehindData {
+            log_readable: Some(false),
+            ..LeftBehindData::default()
+        };
+        assert_eq!(
+            left_behind_rows_in("//p:a", &unreadable, true, LogRow::Show(Some("why"))),
+            "  log: none kept (why)\n"
+        );
+        assert_eq!(
+            left_behind_rows_in("//p:a", &unreadable, true, LogRow::Omit),
+            ""
         );
     }
 }

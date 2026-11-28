@@ -1,0 +1,420 @@
+//! I7 (narrowed by U20): nothing heph records or prints for a failure holds
+//! a secret, and a secret is what heph knows for sure is one: credential
+//! material. One request fails three ways with secrets planted in each: a
+//! fetch whose `${read://}` URL carries a password, a query and a fragment
+//! (which no message quotes a URL with, `hfetch::redact_url`); a run handed a
+//! credential and a `${read://}` value that prints both before it exits; a
+//! credential whose material is not the shape its field mapping asks for.
+//! Each output a failure reaches is then searched for every secret: stderr
+//! (the CI box and the interactive report), `run --json`, `inspect failure
+//! --json`, the events and the slot's `diagnostic.json`. A resolved
+//! `${read://}` value is not a secret: it is shown where it is printed.
+#![expect(
+    clippy::panic_in_result_fn,
+    clippy::let_underscore_must_use,
+    reason = "restriction/style lints scoped to production code; tests are exempt"
+)]
+
+use crate::common::Workspace;
+use crate::run_json::{JsonRun, run_json};
+use heph::commands::inspect::failure::{FailureView, inspect_view, print_to};
+use heph::engine::Engine;
+use heph::htaddr::parse_addr;
+use heph::htmatcher::Matcher;
+use std::io::{Read as _, Write as _};
+
+/// The `${read://}` URL's password, query and fragment.
+const URL_SECRETS: [&str; 3] = [
+    "URL-USERINFO-SECRET-1",
+    "URL-QUERY-SECRET-2",
+    "URL-FRAGMENT-SECRET-3",
+];
+/// A `${read://}` value the run prints: not a secret (U20).
+const READ_VALUE: &str = "DEFERRED-ENV-VALUE-4";
+/// A credential's material the run prints.
+const CRED_SECRET: &str = "CRED-MATERIAL-SECRET-5";
+/// Material at a field the mapping wants a string at, but is an object.
+const SUBTREE_SECRET: &str = "CRED-SUBTREE-SECRET-6";
+
+/// Every planted secret.
+fn secrets() -> impl Iterator<Item = &'static str> {
+    URL_SECRETS.into_iter().chain([CRED_SECRET, SUBTREE_SECRET])
+}
+
+/// The three culprits.
+const CULPRITS: [&str; 3] = ["//app:fetch", "//app:cred", "//app:badcred"];
+
+/// A loopback server that answers every request 404.
+fn serve_404() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let host = listener.local_addr().expect("addr").to_string();
+    std::thread::spawn(move || {
+        for sock in listener.incoming() {
+            let Ok(mut sock) = sock else { return };
+            let mut buf = [0u8; 1024];
+            let _ = sock.read(&mut buf);
+            let _ = sock.write_all(
+                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+        }
+    });
+    host
+}
+
+/// The workspace: `//app:all` depends on the three culprits.
+fn workspace() -> Workspace {
+    let host = serve_404();
+    let [pw, query, fragment] = URL_SECRETS;
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "val",
+        &format!(
+            r#"
+target(name = "url", driver = "bash", out = "url.txt",
+       run = "printf '%s' 'http://heph-user:{pw}@{host}/asset?sig={query}#{fragment}' > url.txt")
+target(name = "plain", driver = "bash", out = "v.txt",
+       run = "printf '%s' '{READ_VALUE}' > v.txt")
+"#
+        ),
+    );
+    ws.write_build_file(
+        "auth",
+        &format!(
+            r#"
+target(name = "t", driver = "auth.credential",
+       sources = [heph.auth.exec(["sh", "-c", "printf '{{\"token\":\"{CRED_SECRET}\"}}'"],
+           fields = {{"token": "token"}})],
+       present = {{"env": {{"TOKEN": "${{token}}"}}}})
+target(name = "bad", driver = "auth.credential",
+       sources = [heph.auth.exec(["sh", "-c", "printf '{{\"token\":{{\"inner\":\"{SUBTREE_SECRET}\"}}}}'"],
+           fields = {{"token": "token"}})],
+       present = {{"env": {{"TOKEN": "${{token}}"}}}})
+"#
+        ),
+    );
+    ws.write_build_file(
+        "app",
+        r#"
+target(name = "fetch", driver = "http_fetch", out = "asset", url = "${read://val:url}")
+target(name = "cred", driver = "bash", out = "o.txt", credentials = ["//auth:t"],
+       env = {"V": "${read://val:plain}"},
+       run = ['echo "token=$TOKEN v=$V" >&2', "exit 3"])
+target(name = "badcred", driver = "bash", out = "o.txt", credentials = ["//auth:bad"],
+       run = "true")
+target(name = "all", driver = "bash", out = "o.txt",
+       deps = [":fetch", ":cred", ":badcred"], run = "true > o.txt")
+"#,
+    );
+    ws
+}
+
+/// `heph run //app:all --json` over [`workspace`], its slots written.
+async fn failed_run(ws: &Workspace) -> JsonRun {
+    let m = Matcher::Addr(parse_addr("//app:all").expect("addr"));
+    let run = run_json(&ws.engine, &m, &["--json"], None).await;
+    assert!(run.res.is_err(), "//app:all must fail");
+    ws.engine.failure_slots().writes_drained().await;
+    // The fixture has teeth: each culprit failed, for the planted reason.
+    for addr in CULPRITS {
+        assert_eq!(
+            run.entry(addr)["outcome"],
+            "failed",
+            "{addr}: {:?}",
+            run.entries
+        );
+    }
+    let fetch = run.entry("//app:fetch")["error"].to_string();
+    assert!(
+        fetch.contains("404"),
+        "the fetch reached the server: {fetch}"
+    );
+    let log = std::fs::read_to_string(
+        ws.engine
+            .failure_slots()
+            .slot_dir(&parse_addr("//app:cred").expect("addr"))
+            .join("log.txt"),
+    )
+    .expect("//app:cred's log");
+    assert!(
+        log.contains(&format!("token=[redacted] v={READ_VALUE}")),
+        "the run printed its credential, scrubbed, and its read value, kept: {log}"
+    );
+    run
+}
+
+/// Panic naming `what` if `text` holds any planted secret.
+fn assert_no_secret(what: &str, text: &str) {
+    assert_no(secrets(), what, text);
+}
+
+/// Panic naming `what` if `text` holds any of `secrets`.
+fn assert_no<'a>(secrets: impl IntoIterator<Item = &'a str>, what: &str, text: &str) {
+    for s in secrets {
+        assert!(!text.contains(s), "{what} holds {s}:\n{text}");
+    }
+}
+
+/// `heph inspect failure --json <addr>`.
+fn inspect_json(engine: &Engine, addr: &str) -> anyhow::Result<String> {
+    let addr = parse_addr(addr)?;
+    let view = inspect_view(engine, &addr)?;
+    let json = output::JsonArgs::<FailureView>::try_parse_from(["--json"])?;
+    let mut buf = Vec::new();
+    print_to(
+        &json,
+        &addr,
+        view.as_ref(),
+        &mut buf,
+        output::Style::Compact,
+    )?;
+    Ok(String::from_utf8(buf)?)
+}
+
+/// I7 on stderr: the CI box and the interactive report hold no URL or
+/// credential secret. The `${read://}` value the run printed is in its log
+/// tail, as printed (U20).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_secret_on_stderr() -> anyhow::Result<()> {
+    let ws = workspace();
+    let run = failed_run(&ws).await;
+    for addr in CULPRITS {
+        assert!(run.boxes.contains(addr), "{addr} has a box:\n{}", run.boxes);
+        assert!(
+            run.report.contains(addr),
+            "{addr} is reported:\n{}",
+            run.report
+        );
+    }
+    assert_no_secret("the CI boxes", &run.boxes);
+    assert_no_secret("the report", &run.report);
+    assert!(
+        run.boxes.contains(READ_VALUE),
+        "the tail shows the read value:\n{}",
+        run.boxes
+    );
+    Ok(())
+}
+
+/// I7 in `--json`: `run --json`'s records, and `inspect failure --json` of
+/// each culprit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_secret_in_json() -> anyhow::Result<()> {
+    let ws = workspace();
+    let run = failed_run(&ws).await;
+    assert_no_secret("run --json", &serde_json::to_string(&run.entries)?);
+    for addr in CULPRITS {
+        let json = inspect_json(&ws.engine, addr)?;
+        assert_ne!(json.trim(), "null", "{addr} has a record");
+        assert_no_secret(&format!("inspect failure --json {addr}"), &json);
+    }
+    Ok(())
+}
+
+/// I7 on the event wire: no event of the failed request, as `events.ndjson`
+/// and plugin-gh read it (JSON), nor the spotlight line folded from them,
+/// holds a secret.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_secret_in_events() -> anyhow::Result<()> {
+    let ws = workspace();
+    let run = failed_run(&ws).await;
+    for ev in &run.events {
+        assert_no_secret("an event", &serde_json::to_string(ev)?);
+    }
+    let mut fold = heph::tui::progress::BuildState::new();
+    for ev in &run.events {
+        fold.apply(ev);
+    }
+    let at = run.events.last().map_or(0, |ev| ev.at_unix_ms);
+    let spot = fold.spotlight(at).map(|s| s.text()).unwrap_or_default();
+    assert!(spot.contains("//app:"), "the spotlight: {spot:?}");
+    assert_no_secret("the spotlight", &spot);
+    Ok(())
+}
+
+/// U20: a resolved `${read://}` value is not a secret. A run whose program
+/// is one that names no program fails with a spawn error quoting it, and the
+/// value reads as resolved in its end event, `run --json` and the CI box.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn read_value_is_shown_in_a_spawn_error() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "val",
+        &format!(
+            r#"
+target(name = "plain", driver = "bash", out = "v.txt",
+       run = "printf '%s' '{READ_VALUE}' > v.txt")
+"#
+        ),
+    );
+    ws.write_build_file(
+        "app",
+        r#"
+target(name = "spawn", driver = "exec", out = "o.txt", run = ["${read://val:plain}"])
+"#,
+    );
+    let m = Matcher::Addr(parse_addr("//app:spawn")?);
+    let run = run_json(&ws.engine, &m, &["--json"], None).await;
+    assert!(run.res.is_err(), "//app:spawn must fail");
+    assert_eq!(run.entry("//app:spawn")["outcome"], "failed");
+    let quoted = run.events.iter().any(|ev| {
+        matches!(&ev.kind, heph::engine::event::BuildEventKind::ResultEnd { addr, error: Some(e), .. }
+            if addr == "//app:spawn" && e.contains(READ_VALUE))
+    });
+    assert!(
+        quoted,
+        "//app:spawn's end quotes the value: {:?}",
+        run.events
+    );
+    let entries = serde_json::to_string(&run.entries)?;
+    assert!(entries.contains(READ_VALUE), "run --json: {entries}");
+    assert!(!entries.contains("[redacted]"), "run --json: {entries}");
+    assert!(run.boxes.contains(READ_VALUE), "the CI box:\n{}", run.boxes);
+    Ok(())
+}
+
+/// I7 on disk: each culprit's `diagnostic.json`, as written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_secret_in_diagnostic_json() -> anyhow::Result<()> {
+    let ws = workspace();
+    let _run = failed_run(&ws).await;
+    for addr in CULPRITS {
+        let path = ws
+            .engine
+            .failure_slots()
+            .slot_dir(&parse_addr(addr)?)
+            .join("diagnostic.json");
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| anyhow::anyhow!("{addr}: {}: {e}", path.display()))?;
+        assert_no_secret(&format!("{addr}'s diagnostic.json"), &text);
+    }
+    Ok(())
+}
+
+/// H-M2: a consumer's failure is scrubbed of a credential's material from
+/// the moment it is held, not only once every credential is presented. The
+/// consumer's second credential fails to acquire, and its command's stderr,
+/// which the error quotes, prints the first one's material.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn held_material_scrubs_a_later_credential_failure() -> anyhow::Result<()> {
+    const HELD: &str = "CRED-HELD-SECRET-7";
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "auth",
+        &format!(
+            r#"
+target(name = "a", driver = "auth.credential",
+       sources = [heph.auth.exec(["sh", "-c", "printf '{{\"token\":\"{HELD}\"}}'"],
+           fields = {{"token": "token"}})],
+       present = {{"env": {{"A": "${{token}}"}}}})
+target(name = "b", driver = "auth.credential",
+       sources = [heph.auth.exec(["sh", "-c", "echo 'denied for {HELD}' >&2; exit 1"],
+           fields = {{"token": "token"}})],
+       present = {{"env": {{"B": "${{token}}"}}}})
+"#
+        ),
+    );
+    ws.write_build_file(
+        "app",
+        r#"
+target(name = "two", driver = "bash", out = "o.txt", credentials = ["//auth:a", "//auth:b"],
+       run = "true > o.txt")
+"#,
+    );
+    let m = Matcher::Addr(parse_addr("//app:two")?);
+    let run = run_json(&ws.engine, &m, &["--json"], None).await;
+    assert!(run.res.is_err(), "//app:two must fail");
+    ws.engine.failure_slots().writes_drained().await;
+    let entries = serde_json::to_string(&run.entries)?;
+    // The fixture has teeth: the failure quotes //auth:b's stderr.
+    assert!(
+        entries.contains("denied for [redacted]"),
+        "run --json: {entries}"
+    );
+    assert_no([HELD], "run --json", &entries);
+    assert_no([HELD], "the CI boxes", &run.boxes);
+    assert_no([HELD], "the report", &run.report);
+    let json = inspect_json(&ws.engine, "//app:two")?;
+    assert_ne!(json.trim(), "null", "//app:two has a record");
+    assert_no([HELD], "inspect failure --json //app:two", &json);
+    assert_no_held_in_events(&run, [HELD], "//app:");
+    Ok(())
+}
+
+/// U20: a source's own credential is material, so the consumer's failure is
+/// scrubbed of it too. `//auth:outer`'s source needs `//auth:inner`, presented
+/// to its command, and the command fails printing the inner token on stderr,
+/// which the consumer's error quotes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn source_credential_material_is_scrubbed() -> anyhow::Result<()> {
+    const INNER: &str = "CRED-SOURCE-SECRET-8";
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "auth",
+        &format!(
+            r#"
+target(name = "inner", driver = "auth.credential",
+       sources = [heph.auth.exec(["sh", "-c", "printf '{{\"token\":\"{INNER}\"}}'"],
+           fields = {{"token": "token"}})],
+       present = {{"env": {{"INNER": "${{token}}"}}}})
+target(name = "outer", driver = "auth.credential",
+       sources = [heph.auth.exec(["sh", "-c", "echo \"vault denied $INNER\" >&2; exit 1"],
+           fields = {{"token": "token"}}, credentials = [":inner"])],
+       present = {{"env": {{"OUTER": "${{token}}"}}}})
+"#
+        ),
+    );
+    ws.write_build_file(
+        "app",
+        r#"
+target(name = "use", driver = "bash", out = "o.txt", credentials = ["//auth:outer"],
+       run = "true > o.txt")
+"#,
+    );
+    let m = Matcher::Addr(parse_addr("//app:use")?);
+    let run = run_json(&ws.engine, &m, &["--json"], None).await;
+    assert!(run.res.is_err(), "//app:use must fail");
+    ws.engine.failure_slots().writes_drained().await;
+    let error = run.entry("//app:use")["error"].to_string();
+    // The fixture has teeth: the failure quotes //auth:outer's stderr, which
+    // was handed //auth:inner's material.
+    assert!(
+        error.contains("vault denied [redacted]"),
+        "run --json error: {error}"
+    );
+    assert_no([INNER], "run --json error", &error);
+    assert_no([INNER], "run --json", &serde_json::to_string(&run.entries)?);
+    assert!(
+        run.boxes.contains("//app:use"),
+        "//app:use has a box:\n{}",
+        run.boxes
+    );
+    assert_no([INNER], "the CI boxes", &run.boxes);
+    assert_no([INNER], "the report", &run.report);
+    let json = inspect_json(&ws.engine, "//app:use")?;
+    assert_ne!(json.trim(), "null", "//app:use has a record");
+    assert_no([INNER], "inspect failure --json //app:use", &json);
+    assert_no_held_in_events(&run, [INNER], "//app:");
+    Ok(())
+}
+
+/// No event of `run`, as JSON, and not the spotlight folded from them,
+/// holds any of `secrets` (HERM r2, as [`no_secret_in_events`] checks).
+/// The spotlight names `culprit_prefix`, so the fold saw the failure.
+fn assert_no_held_in_events<'a>(
+    run: &JsonRun,
+    secrets: impl IntoIterator<Item = &'a str> + Clone,
+    culprit_prefix: &str,
+) {
+    for ev in &run.events {
+        let json = serde_json::to_string(ev).expect("an event serializes");
+        assert_no(secrets.clone(), "an event", &json);
+    }
+    let mut fold = heph::tui::progress::BuildState::new();
+    for ev in &run.events {
+        fold.apply(ev);
+    }
+    let at = run.events.last().map_or(0, |ev| ev.at_unix_ms);
+    let spot = fold.spotlight(at).map(|s| s.text()).unwrap_or_default();
+    assert!(spot.contains(culprit_prefix), "the spotlight: {spot:?}");
+    assert_no(secrets, "the spotlight", &spot);
+}

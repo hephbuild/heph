@@ -95,6 +95,12 @@ use std::collections::BTreeMap;
 
 use crate::capacity::Unit;
 
+/// The compact failure record that rides failing events (see
+/// [`crate::failure`]).
+pub use crate::failure::{
+    CAUSE_CAP, CAUSES_CAP, ExitData, FailedIn, FailureRecord, LogRef, RECORD_CAP, TookDownData,
+};
+
 /// An amount of a pool, as a person reads it, by the pool's unit: `cpu` in
 /// CPUs (`4`, `0.5`), `bytes` in binary units (`2.0 GiB`), `count` as the
 /// integer. Shared by every renderer of the admission events.
@@ -360,9 +366,9 @@ pub enum BuildEventKind {
         /// targets reporting the same underlying failure.
         #[serde(default)]
         upstream_of: Option<String>,
-        /// The workspace-relative BUILD/`.bzl` file that did not evaluate,
-        /// when it is why this target failed. A path never goes in an
-        /// address field. Two shapes carry it:
+        /// The workspace-relative source file a provider reported as not
+        /// evaluating (e.g. `d/BUILD`), when it is why this target failed. A
+        /// path never goes in an address field. Two shapes carry it:
         /// - beside `upstream_of`, which stays the address that led into the
         ///   file: a target the file took down;
         /// - on a `duplicate` end with no `upstream_of`: a target in that
@@ -397,8 +403,10 @@ pub enum BuildEventKind {
         /// predates it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         exit_code: Option<i32>,
-        /// The last lines of the target's process log. Only ever attached to a
-        /// failing result, so a green build pays nothing for it.
+        /// The last lines of the target's process log, from a host that
+        /// predates [`failure`](Self::ResultEnd::failure). This host always
+        /// sends `None`: the log is referenced from `failure.log`
+        /// ([`LogRef`]), and its tail is read from the file it names.
         #[serde(default)]
         log_tail: Option<LogTailData>,
         /// Set when the target failed because its run outlasted its `timeout`,
@@ -432,6 +440,14 @@ pub enum BuildEventKind {
         /// predates it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         left_behind: Option<Box<LeftBehindData>>,
+        /// The culprit's compacted record (D5): what every renderer draws
+        /// its box from, scrubbed and within its caps, the log by reference
+        /// ([`LogRef`]). Only on a culprit's own announcing end; a skipped,
+        /// duplicate, cancelled or successful end carries none. The fields
+        /// above stay filled beside it, for a consumer that predates it.
+        /// `None` from a host that predates it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        failure: Option<Box<FailureRecord>>,
     },
     ExecuteStart {
         addr: String,
@@ -809,7 +825,8 @@ pub enum BuildEventKind {
         #[serde(default)]
         addr: Option<String>,
     },
-    /// A BUILD or `.bzl` file that did not evaluate, announced once per
+    /// A source file a provider reported as not evaluating (e.g. the
+    /// buildfile provider's `d/BUILD`), announced once per
     /// file however many targets reached it: the file's own failure box. A
     /// file has no target scope, so it rides this kind rather than a
     /// `ResultEnd` (a path never goes in an address field, where
@@ -832,6 +849,10 @@ pub enum BuildEventKind {
         /// The shortest path from a requested target to `entry`, inclusive.
         #[serde(default)]
         path: Vec<String>,
+        /// The file's compacted record, as on [`BuildEventKind::ResultEnd`].
+        /// `None` from a host that predates it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        failure: Option<Box<FailureRecord>>,
     },
     /// `heph tool codegen import` recorded `files` stamped files and skipped
     /// `skipped` whose stamp it could not read.
@@ -953,7 +974,42 @@ pub struct LeftBehindData {
     /// then goes by whether `log_path` is set.
     #[serde(default)]
     pub log_readable: Option<bool>,
+    /// What `outputs` holds at the target's package, grouped by first path
+    /// component (`report/` and its file count, or a top-level file alone),
+    /// sorted by name: the first [`KEPT_GROUPS_CAP`]. Counted when the slot
+    /// is filled, so no renderer walks it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kept: Vec<KeptGroup>,
+    /// How many groups past `kept` were left out (`+N more`).
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub kept_more: u32,
+    /// The fill id of the slot `log_path` is in, as this failure filled it:
+    /// what a reader of an end with no record checks the slot against, so a
+    /// newer run's log is never read as this one's (U26). `None` from an
+    /// older host, and in a record, whose `log` carries its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_fill_id: Option<String>,
 }
+
+fn is_zero_u32(n: &u32) -> bool {
+    *n == 0
+}
+
+/// How many [`KeptGroup`]s a [`LeftBehindData`] names.
+pub const KEPT_GROUPS_CAP: usize = 5;
+
+/// One group of a failed run's kept `failure_out` files.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KeptGroup {
+    /// A directory (ending in `/`) or a top-level file.
+    pub name: String,
+    /// How many files are under it; 1 for a file.
+    pub files: u64,
+}
+
+/// How many written paths a failure record's [`FixesData::Written`] names
+/// when the slot's `fixes.txt` lists them all.
+pub const FIXES_PATHS_CAP: usize = 32;
 
 /// What a failed `in_place` run's write-back did, on [`LeftBehindData`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -964,10 +1020,15 @@ pub enum FixesData {
         /// The workspace root the paths are relative to.
         root: String,
         /// Every path written, sorted; empty when the fixes matched the tree.
+        /// In a failure record, with `list` kept, the first
+        /// [`FIXES_PATHS_CAP`] only: `list` names them all (I8).
         paths: Vec<String>,
         /// The slot's `fixes.txt` listing `paths`, when kept.
         #[serde(default)]
         list: Option<String>,
+        /// How many paths past `paths` were written: in `list`, not here.
+        #[serde(default, skip_serializing_if = "is_zero_u32")]
+        paths_more: u32,
     },
     /// Nothing was written, and why, in words.
     NotWritten { reason: String },
@@ -1228,6 +1289,7 @@ pub mod test_support {
         };
         let end = |addr: &str| BuildEventKind::ResultEnd {
             left_behind: None,
+            failure: None,
             addr: addr.to_string(),
             error: None,
             upstream_of: None,
@@ -1398,8 +1460,10 @@ mod tests {
                 cancelled,
                 duplicate,
                 left_behind,
+                failure,
             } => {
                 assert_eq!(addr, "//a:x");
+                assert!(failure.is_none(), "an older host sends no record");
                 assert!(!cancelled, "an older host's stop reads as a failure");
                 assert!(!duplicate, "an older host's end is the one announcing it");
                 assert_eq!(error.as_deref(), Some("boom"));
@@ -2028,6 +2092,7 @@ mod tests {
             at_unix_ms: 7,
             kind: BuildEventKind::ResultEnd {
                 left_behind: None,
+                failure: None,
                 duplicate: false,
                 addr: "//a:x".into(),
                 error: Some("target failed".into()),
@@ -2086,6 +2151,7 @@ mod tests {
             at_unix_ms: 7,
             kind: BuildEventKind::ResultEnd {
                 left_behind: None,
+                failure: None,
                 duplicate: true,
                 addr: "//d:t2".into(),
                 error: Some("evaluating d/BUILD: boom".into()),
@@ -2406,6 +2472,7 @@ mod tests {
                 entry: "//d:t".into(),
                 error: "evaluating d/BUILD: boom".into(),
                 path: vec!["//a:a".into(), "//d:t".into()],
+                failure: None,
             },
         };
         let json = serde_json::to_string(&ev).expect("encode");
@@ -2471,6 +2538,134 @@ mod tests {
                     OldKind::ResultStart { .. },
                     OldKind::ResultEnd { addr, error: Some(_) }
                 ] if addr == "//a:x"
+            ),
+            "{old:?}"
+        );
+    }
+
+    /// The culprit's record rides `ResultEnd` and `FileFailed` (D5, PR 4)
+    /// and round-trips; an end without one leaves the key off the wire. A
+    /// consumer that predates it, or ignores it, decodes the same frames and
+    /// still reads every older field, which the host keeps filled.
+    #[test]
+    fn failure_record_rides_the_end_and_older_decoders_ignore_it() {
+        use crate::diagnostic::{Diagnostic, Stage};
+        let mut rec = FailureRecord::new(Diagnostic::new(Stage::Run, "boom"));
+        rec.addr = Some("//a:x".into());
+        rec.log = Some(LogRef {
+            path: Some("/h/failures/a_x/log.txt".into()),
+            fill_id: Some("f1".into()),
+            lines: 3,
+            memory_tail: None,
+        });
+        let end = BuildEvent {
+            at_unix_ms: 7,
+            kind: BuildEventKind::ResultEnd {
+                left_behind: None,
+                duplicate: false,
+                addr: "//a:x".into(),
+                error: Some("boom".into()),
+                upstream_of: None,
+                upstream_file: None,
+                path: vec!["//a:x".into()],
+                exit_status: Some("exit status: 1".into()),
+                exit_code: Some(1),
+                log_tail: Some(LogTailData {
+                    text: "FAIL\n".into(),
+                    start_line: 1,
+                    streamed: false,
+                }),
+                timed_out: None,
+                cancelled: false,
+                failure: Some(Box::new(rec.clone())),
+            },
+        };
+        let mut file_rec = FailureRecord::new(Diagnostic::new(Stage::Eval, "bad"));
+        file_rec.file = Some("d/BUILD".into());
+        let file = BuildEvent {
+            at_unix_ms: 8,
+            kind: BuildEventKind::FileFailed {
+                file: "d/BUILD".into(),
+                entry: "//d:t".into(),
+                error: "bad".into(),
+                path: vec!["//d:t".into()],
+                failure: Some(Box::new(file_rec.clone())),
+            },
+        };
+        let frames: Vec<String> = [&end, &file]
+            .iter()
+            .map(|e| serde_json::to_string(e).expect("encode"))
+            .collect();
+        for frame in &frames {
+            assert!(frame.contains(r#""failure":{"#), "{frame}");
+        }
+        let back: Vec<BuildEvent> = frames
+            .iter()
+            .map(|f| serde_json::from_str(f).expect("decode"))
+            .collect();
+        assert!(
+            matches!(&back[0].kind, BuildEventKind::ResultEnd { failure: Some(r), .. } if **r == rec),
+            "{:?}",
+            back[0]
+        );
+        assert!(
+            matches!(&back[1].kind, BuildEventKind::FileFailed { failure: Some(r), .. } if **r == file_rec),
+            "{:?}",
+            back[1]
+        );
+        let bare = r#"{"at_unix_ms":1,"kind":{"type":"ResultEnd","addr":"//a:x","error":null}}"#;
+        let ev: BuildEvent = serde_json::from_str(bare).expect("an older host's end");
+        assert!(matches!(
+            ev.kind,
+            BuildEventKind::ResultEnd { failure: None, .. }
+        ));
+        let mut none = end.clone();
+        if let BuildEventKind::ResultEnd { failure, .. } = &mut none.kind {
+            *failure = None;
+        }
+        let json = serde_json::to_string(&none).expect("encode");
+        assert!(!json.contains("\"failure\""), "{json}");
+
+        // A consumer built before the field: the kinds it knows, with the
+        // fields it knows, and nothing else.
+        #[derive(serde::Deserialize)]
+        struct OldEvent {
+            kind: OldKind,
+        }
+        #[derive(serde::Deserialize, Debug)]
+        #[serde(tag = "type")]
+        enum OldKind {
+            ResultEnd {
+                addr: String,
+                error: Option<String>,
+                #[serde(default)]
+                exit_code: Option<i32>,
+                #[serde(default)]
+                log_tail: Option<LogTailData>,
+            },
+            FileFailed {
+                file: String,
+                error: String,
+            },
+            #[serde(other)]
+            Unknown,
+        }
+        let old: Vec<OldKind> = frames
+            .iter()
+            .map(|f| {
+                serde_json::from_str::<OldEvent>(f)
+                    .expect("old decoder")
+                    .kind
+            })
+            .collect();
+        assert!(
+            matches!(
+                old.as_slice(),
+                [
+                    OldKind::ResultEnd { addr, error: Some(e), exit_code: Some(1), log_tail: Some(t) },
+                    OldKind::FileFailed { file, error: fe },
+                ] if addr == "//a:x" && e == "boom" && t.text == "FAIL\n"
+                    && file == "d/BUILD" && fe == "bad"
             ),
             "{old:?}"
         );

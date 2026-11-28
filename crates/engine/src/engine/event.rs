@@ -46,13 +46,6 @@ pub struct ErrorDetail {
     /// The code the subprocess exited with: `None` for a signal, or when the
     /// driver reported no structured status.
     pub exit_code: Option<i32>,
-    /// The tail a recorded [`TargetFailure`](hplugin::error::TargetFailure)
-    /// on the chain already read.
-    pub log_tail: Option<hcore::events::LogTailData>,
-    /// The log `execute` kept in the failure slot, not read yet: only
-    /// `ResultEnd` reads its tail ([`result_log_tail`](Self::result_log_tail)),
-    /// so the inner scopes, which report only the message, pay no IO for it.
-    pub log: Option<hplugin::error::FailureLog>,
     /// The run outlasted the target's `timeout` (a
     /// [`TimedOutError`](crate::engine::run_timeout::TimedOutError) on the
     /// chain).
@@ -90,14 +83,19 @@ impl ErrorDetail {
         let slot =
             hcore::hmemoizer::downcast_chain_ref::<crate::engine::failure_slot::FailureSlot>(e);
         let mut d = Self {
-            // Not `{e:#}`: a failure's artifacts ride the chain as an
-            // empty-`Display` frame, which that would render as `: :`.
-            message: hcore::hmemoizer::chain_message(e),
+            // The cause as the user reads it: the diagnostic when one rides
+            // the chain, else its frames with the engine's stage frames
+            // (`execute //p:t`) and empty-`Display` frames (a failure's
+            // artifacts) left out. `chain_message` is for `debug!`.
+            message: hplugin::diagnostic::cause_frames(e).join(": "),
             cancelled: hplugin::error::is_cancelled(e),
             kept: slot.is_some(),
             streamed: crate::engine::failure_slot::RunStreamed::on(e),
-            left_behind: slot.map(|s| {
-                hplugin::error::left_behind(
+            left_behind: slot.map(|s| hcore::events::LeftBehindData {
+                // So a reader of an end with no record reads this fill of
+                // the slot, never a newer run's (U26).
+                log_fill_id: s.fill_id.clone(),
+                ..hplugin::error::left_behind(
                     s.log.as_ref(),
                     s.sandbox.as_ref(),
                     s.out.as_deref(),
@@ -107,18 +105,12 @@ impl ErrorDetail {
             }),
             ..Self::default()
         };
-        for cause in e.chain() {
-            if d.log_tail.is_none()
-                && let Some(t) = cause.downcast_ref::<TargetFailure>()
-                && let Some(tail) = &t.log_tail
-            {
-                d.streamed |= t.streamed;
-                d.log_tail = Some(hcore::events::LogTailData {
-                    text: tail.text.clone(),
-                    start_line: tail.start_line,
-                    streamed: d.streamed,
-                });
-            }
+        // Another request's recorded failure, surfaced at its top: its
+        // record says whether its run streamed. The log itself is never
+        // read here: `ResultEnd` carries the record's reference (P13).
+        let surfaced = hcore::hmemoizer::downcast_chain_ref::<TargetFailure>(e);
+        if let Some(t) = surfaced {
+            d.streamed |= t.streamed;
         }
         // Through the memoizer's shared wrappers: a run's own failure reaches
         // `ResultEnd` from the `execute` memoizer, so its `ProcessFailed` and
@@ -142,17 +134,37 @@ impl ErrorDetail {
             Some(hcore::process::Exit::Code(c)) => Some(c),
             _ => None,
         };
-        if d.log_tail.is_none() {
-            d.log = slot.and_then(|s| s.log.clone());
-        }
-        // Through the memoizer's shared wrappers too: a recorded failure
-        // reaches `ResultEnd` behind `TargetFailure`'s source.
+        // Through the memoizer's shared wrappers too.
         if let Some(t) = crate::engine::run_timeout::timed_out(e) {
             d.timed_out = Some(hcore::events::TimedOutData {
                 timeout_ms: t.timeout.as_millis(),
                 abandoned: t.abandoned_after.is_some(),
             });
         }
+        // A surfaced failure holds no chain (D7b): what the chain did not
+        // say, its record does.
+        if let Some(record) = surfaced.map(|t| &t.record) {
+            if d.exit_status.is_none()
+                && let Some(x) = &record.exit
+            {
+                d.exit_status = Some(x.status.clone());
+                d.exit_code = x.code;
+            }
+            if d.timed_out.is_none() {
+                d.timed_out.clone_from(&record.timed_out);
+            }
+        }
+        d
+    }
+
+    /// [`from_error`](Self::from_error) for an event: its message scrubbed
+    /// of what the request was handed to scrub, and within the message cap
+    /// ([`RequestStateData::scrub_event_text`], I7). Every detail an event
+    /// carries is built here: the event reaches `events.ndjson`, the session
+    /// store and hook plugins.
+    pub(crate) fn for_event(e: &anyhow::Error, data: &RequestStateData) -> Self {
+        let mut d = Self::from_error(e);
+        d.message = data.scrub_event_text(&d.message);
         d
     }
 
@@ -162,28 +174,6 @@ impl ErrorDetail {
     /// inner spans would only duplicate it.
     pub fn into_message(self) -> String {
         self.message
-    }
-
-    /// The log tail `ResultEnd` carries: the recorded failure's, or else the
-    /// last lines of the failure slot's log — one seek-based read bounded by
-    /// the request's `--log-lines`, the same read the recorded failure makes.
-    /// Kept whether or not the output streamed to a terminal (D6.1):
-    /// `streamed` rides on it, and a renderer decides what to show.
-    pub fn result_log_tail(
-        log_tail: Option<hcore::events::LogTailData>,
-        log: Option<&hplugin::error::FailureLog>,
-        streamed: bool,
-    ) -> Option<hcore::events::LogTailData> {
-        let mut tail = log_tail.or_else(|| {
-            let tail = log?.tail().ok()?;
-            Some(hcore::events::LogTailData {
-                text: tail.text,
-                start_line: tail.start_line,
-                streamed: false,
-            })
-        })?;
-        tail.streamed |= streamed;
-        Some(tail)
     }
 }
 
@@ -255,7 +245,7 @@ pub async fn emit_scope_with<T, F: Future<Output = ()>>(
     match fut.await {
         Ok(v) => Ok(v),
         Err(e) => {
-            guard.error = Some(ErrorDetail::from_error(&e));
+            guard.error = Some(ErrorDetail::for_event(&e, &rs.data));
             let (e, more) = on_error(e);
             if let Some(more) = more {
                 more.await;
@@ -295,6 +285,7 @@ mod tests {
 
     fn end(error: Option<ErrorDetail>) -> BuildEventKind {
         BuildEventKind::ResultEnd {
+            failure: None,
             duplicate: false,
             left_behind: None,
             cancelled: false,
@@ -359,5 +350,24 @@ mod tests {
             "one Start, one End carrying the body's failure"
         );
         Ok(())
+    }
+
+    /// The event's message is the cause as the user reads it: none of the
+    /// engine's stage frames (`execute //p:t`, `run`), and no empty frame
+    /// rendered as `: :`; the context a driver added stays.
+    #[test]
+    fn error_detail_message_leaves_out_stage_frames() {
+        use hplugin::diagnostic::{Boundary, with_stage};
+        let a = hmodel::htaddr::parse_addr("//p:t").expect("addr");
+        let e = anyhow::anyhow!("exit status: 1").context("driver run");
+        let e = with_stage(with_stage(e, Boundary::Run, &a), Boundary::Execute, &a);
+        assert_eq!(
+            ErrorDetail::from_error(&e).message,
+            "driver run: exit status: 1"
+        );
+        assert!(
+            hcore::hmemoizer::chain_message(&e).contains("execute //p:t"),
+            "the debug chain keeps them"
+        );
     }
 }
