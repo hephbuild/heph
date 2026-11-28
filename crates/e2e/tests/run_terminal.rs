@@ -90,7 +90,9 @@ impl Fds {
 
     fn raw_wrapper(&self) -> InteractiveWrapper {
         let (stdout, stderr) = (self.stdout.clone(), self.stderr.clone());
-        plain_output_wrapper(move || (appending(&stdout), appending(&stderr)))
+        plain_output_wrapper(heph::tui::failure_report::RenderCtx::default(), move || {
+            (appending(&stdout), appending(&stderr))
+        })
     }
 
     fn stdout(&self) -> String {
