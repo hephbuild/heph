@@ -72,8 +72,8 @@ fn ci_run_prints_a_target_failure_once() {
         let (out, err) = ws.run(addr);
         assert_eq!(out.status.code(), Some(1), "{addr}: {err}");
         for once in [
-            "✗ //p:bad · exit status: 3\n",
-            "  │ last words\n",
+            "✗ //p:bad · exit status 3\n",
+            "  2 │ last words\n",
             "  full log: ",
             "  log: heph log //p:bad\n",
         ] {
@@ -95,9 +95,10 @@ fn ci_run_prints_a_target_failure_once() {
 }
 
 /// A failure before the target ran — here a dep that does not exist, so its
-/// def never resolved — is printed live too, once, saying no log was kept;
-/// the end of the run does not box it again. It used to print nothing live
-/// and reach only the end box: no event announced it.
+/// def never resolved — is printed live too, once, as the record's box: no
+/// `log:` row, since it never had a log to keep. The end of the run does not
+/// box it again. It used to print nothing live and reach only the end box: no
+/// event announced it.
 #[test]
 fn ci_run_prints_a_failure_before_the_run_once_live() {
     let ws = Ws::new();
@@ -108,7 +109,7 @@ fn ci_run_prints_a_failure_before_the_run_once_live() {
     let live = err.find("✗ //p:nodep\n").expect("the live block");
     let rest = err.get(live..).unwrap_or_default();
     assert!(
-        rest.contains("target not found: //p:nope") && rest.contains("  log: none kept\n"),
+        rest.contains("target not found: //p:nope") && !rest.contains("  log: "),
         "{err}"
     );
     assert_eq!(

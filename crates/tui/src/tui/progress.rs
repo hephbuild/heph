@@ -2812,6 +2812,13 @@ pub struct CiProgressView {
     /// Root failures already printed: a same-addr `ResultEnd` double-fire
     /// prints one block, not two.
     failures_printed: HashSet<String>,
+    /// Where a failure's box is written, as one write
+    /// ([`CIAppView::set_sink`]). `None` (a view no backend drove, as
+    /// `session attach` and unit tests build): through `tracing`.
+    sink: Option<crate::tui::log_sink::LogSink>,
+    /// The workspace a box names paths relative to and reads its excerpts
+    /// from ([`Self::with_workspace`]).
+    workspace: Option<(std::path::PathBuf, crate::tui::text::WorkspaceRel)>,
 }
 
 /// `heph run --log-lines`' default: how many tail lines a failure prints live
@@ -2827,6 +2834,47 @@ impl CiProgressView {
             stopped: false,
             log_lines: DEFAULT_LOG_LINES,
             failures_printed: HashSet::new(),
+            sink: None,
+            workspace: None,
+        }
+    }
+
+    /// Draw failures' boxes against the workspace at `root`: paths under it
+    /// relative, excerpts read from it. Reads the filesystem once, here.
+    #[must_use]
+    pub fn with_workspace(mut self, root: &std::path::Path) -> Self {
+        self.workspace = Some((
+            root.to_path_buf(),
+            crate::tui::text::WorkspaceRel::workspace(root),
+        ));
+        self
+    }
+
+    /// The live box's context: line mode, never wrapped (a CI log), the
+    /// view's `--log-lines` and redaction.
+    fn render_ctx(&self) -> crate::tui::failure_report::RenderCtx {
+        crate::tui::failure_report::RenderCtx {
+            rel: self
+                .workspace
+                .as_ref()
+                .map(|(_, rel)| rel.clone())
+                .unwrap_or_default(),
+            redact: self.core.state.redact.clone(),
+            source_root: self.workspace.as_ref().map(|(root, _)| root.clone()),
+            width: None,
+            color: crate::tui::color::stderr_color_enabled(),
+            log_lines: self.log_lines,
+            mode: crate::tui::failure_report::RenderMode::Line,
+        }
+    }
+
+    /// `text`, a failure's whole box, as one write to the sink: the sink's
+    /// lock is held for it, so no line another thread logs lands inside it.
+    fn print_box(&self, text: &str) {
+        let text = text.trim_end_matches('\n');
+        match &self.sink {
+            Some(sink) => sink.write_diagnostic(&format!("{text}\n")),
+            None => tracing::error!("{text}"),
         }
     }
 
@@ -2869,6 +2917,10 @@ impl CIAppView for CiProgressView {
 
     fn failures_printed(&self) -> HashSet<String> {
         self.failures_printed.clone()
+    }
+
+    fn set_sink(&mut self, sink: crate::tui::log_sink::LogSink) {
+        self.sink = Some(sink);
     }
 
     // No `begin`: the run opens with no "Running …" header line. The command
@@ -2955,25 +3007,31 @@ impl CIAppView for CiProgressView {
                 // announcing one carries the block (one box per culprit).
                 duplicate: false,
                 left_behind,
-                failure: _,
+                failure,
             } if !self.failures_printed.contains(addr) => {
                 self.failures_printed.insert(addr.clone());
-                let block = with_left_behind(
-                    live_failure_block(
+                // The record's box, the one the end of the run would have
+                // drawn. An older host's end carries no record: the block
+                // built from the end's own fields.
+                let block = match failure {
+                    Some(rec) => crate::tui::failure_report::render_box(rec, &self.render_ctx()),
+                    None => with_left_behind(
+                        live_failure_block(
+                            addr,
+                            error,
+                            exit_status.as_deref(),
+                            timed_out.as_ref(),
+                            log_tail.as_ref(),
+                            left_behind.as_deref(),
+                            (path, false),
+                            self.log_lines,
+                            &self.core.state.redact,
+                        ),
                         addr,
-                        error,
-                        exit_status.as_deref(),
-                        timed_out.as_ref(),
-                        log_tail.as_ref(),
                         left_behind.as_deref(),
-                        (path, false),
-                        self.log_lines,
-                        &self.core.state.redact,
                     ),
-                    addr,
-                    left_behind.as_deref(),
-                );
-                tracing::error!("{block}");
+                };
+                self.print_box(&block);
             }
             // A BUILD file that did not evaluate: its block, once, headed by
             // the file (it is not a target).
@@ -2982,21 +3040,24 @@ impl CIAppView for CiProgressView {
                 entry,
                 error,
                 path,
-                failure: _,
+                failure,
             } if !self.failures_printed.contains(entry) => {
                 self.failures_printed.insert(entry.clone());
-                let block = live_failure_block(
-                    file,
-                    error,
-                    None,
-                    None,
-                    None,
-                    None,
-                    (path, true),
-                    self.log_lines,
-                    &self.core.state.redact,
-                );
-                tracing::error!("{block}");
+                let block = match failure {
+                    Some(rec) => crate::tui::failure_report::render_box(rec, &self.render_ctx()),
+                    None => live_failure_block(
+                        file,
+                        error,
+                        None,
+                        None,
+                        None,
+                        None,
+                        (path, true),
+                        self.log_lines,
+                        &self.core.state.redact,
+                    ),
+                };
+                self.print_box(&block);
             }
             _ => {}
         }
@@ -4689,6 +4750,111 @@ mod tests {
         assert_eq!(log.matches("  │ ").count(), 5, "{log}");
         // --log-lines 0: the header alone.
         assert_eq!(ci_live_log(0, &[end]), "ERROR ✗ //a:b · exit status: 1\n");
+    }
+
+    /// A culprit's record, as the engine attaches it to the announcing end.
+    fn record_of(addr: &str, message: &str) -> hcore::events::FailureRecord {
+        hcore::events::FailureRecord {
+            addr: Some(addr.to_owned()),
+            entry: addr.to_owned(),
+            path: vec![addr.to_owned()],
+            ..hcore::events::FailureRecord::new(
+                hcore::diagnostic::Diagnostic::new(hcore::diagnostic::Stage::Run, message)
+                    .with_addr(addr),
+            )
+        }
+    }
+
+    /// `failed_end` carrying `rec`.
+    fn failed_end_with(addr: &str, rec: hcore::events::FailureRecord) -> BuildEventKind {
+        let mut end = failed_end(addr, None, false, Some(TAIL));
+        if let BuildEventKind::ResultEnd { failure, .. } = &mut end {
+            *failure = Some(Box::new(rec));
+        }
+        end
+    }
+
+    /// An end that carries its culprit's record prints the record's box, the
+    /// one the end of the run draws, not the block built from the end's
+    /// flat fields; a `FileFailed` with one too. Each prints once.
+    #[test]
+    fn ci_view_prints_the_records_box_as_it_fails() {
+        let rec = record_of("//a:b", "the record's message");
+        let view = CiProgressView::new("Running").with_log_lines(3);
+        let want = crate::tui::failure_report::render_box(&rec, &view.render_ctx());
+        let end = failed_end_with("//a:b", rec);
+        let log = ci_view_log_of(
+            view,
+            HolderNames::default(),
+            &[ev(1, end.clone()), ev(2, end)],
+        );
+        assert_eq!(log, format!("ERROR {}\n", want.trim_end_matches('\n')));
+        assert!(log.contains("the record's message"), "{log}");
+        assert!(!log.contains("exit status: 1"), "the flat block: {log}");
+
+        let mut rec = record_of("//d:t", "evaluating d/BUILD: the record's");
+        rec.addr = None;
+        rec.file = Some("d/BUILD".into());
+        let view = CiProgressView::new("Running");
+        let want = crate::tui::failure_report::render_box(&rec, &view.render_ctx());
+        let file_failed = BuildEventKind::FileFailed {
+            file: "d/BUILD".into(),
+            entry: "//d:t".into(),
+            error: "evaluating d/BUILD: flat".into(),
+            path: vec!["//d:t".into()],
+            failure: Some(Box::new(rec)),
+        };
+        let log = ci_view_log_of(view, HolderNames::default(), &[ev(1, file_failed)]);
+        assert_eq!(log, format!("ERROR {}\n", want.trim_end_matches('\n')));
+        assert!(!log.contains("flat"), "{log}");
+    }
+
+    /// With the backend's sink, each box is one write: however many views
+    /// print boxes at once, every box is whole inside one sink line, with
+    /// no other line inside it.
+    #[test]
+    fn line_backend_boxes_never_interleave() {
+        const THREADS: usize = 8;
+        const PER: usize = 50;
+        let sink = crate::tui::log_sink::LogSink::new_direct_with(std::sync::Arc::new(
+            crate::tui::session::SessionSlot::new(),
+        ));
+        let mut rx = sink.switch_to_buffered();
+        let mut want = std::collections::HashSet::new();
+        std::thread::scope(|s| {
+            let mut handles = Vec::new();
+            for t in 0..THREADS {
+                let sink = sink.clone();
+                handles.push(s.spawn(move || {
+                    let mut view = CiProgressView::new("Running");
+                    view.set_sink(sink);
+                    let mut boxes = Vec::new();
+                    for i in 0..PER {
+                        let addr = format!("//t{t}:f{i}");
+                        let rec = record_of(&addr, &format!("line one {t}/{i}\nline two {t}/{i}"));
+                        let want = crate::tui::failure_report::render_box(&rec, &view.render_ctx());
+                        boxes.push(format!("{}\n", want.trim_end_matches('\n')));
+                        view.apply(&ev(1, failed_end_with(&addr, rec)));
+                    }
+                    boxes
+                }));
+            }
+            for h in handles {
+                want.extend(h.join().expect("printer thread"));
+            }
+        });
+        let mut got = Vec::new();
+        while let Ok(line) = rx.try_recv() {
+            got.push(String::from_utf8(line.bytes).expect("utf-8"));
+        }
+        assert_eq!(got.len(), THREADS * PER, "one write per box");
+        for line in &got {
+            assert!(line.lines().count() > 1, "a multi-line box: {line}");
+            assert!(
+                want.contains(line),
+                "a write that is not one whole box: {line}"
+            );
+        }
     }
 
     /// D6.1 in the line backend: a tail that streamed to a terminal is not

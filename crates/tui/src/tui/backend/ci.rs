@@ -30,6 +30,7 @@ pub async fn run<A: App + 'static>(
     // After `open`, so the process's own session is never named as a holder.
     let holders = super::lock_holders(&app, slot);
     view.name_lock_holders(holders.clone());
+    view.set_sink(sink.clone());
     view.begin();
 
     // We own the build-event channel: sender to the app via AppContext, we keep

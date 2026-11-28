@@ -595,6 +595,12 @@ pub trait CIAppView: Send {
     /// See [`TUIAppView::name_lock_holders`].
     fn name_lock_holders(&mut self, _names: HolderNames) {}
 
+    /// The sink the backend prints through, handed over before
+    /// [`Self::begin`]: a view that writes a multi-line block writes it as
+    /// one [`LogSink::write_diagnostic`], so no other line lands inside it.
+    /// Ignored by default.
+    fn set_sink(&mut self, _sink: crate::tui::log_sink::LogSink) {}
+
     /// The addrs whose failure this view has printed as it failed, with the
     /// rows the end-of-run box would have carried: the box leaves them out
     /// ([`AppContext::failures_printed`]). A view that prints none says so.

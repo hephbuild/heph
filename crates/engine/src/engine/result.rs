@@ -2615,9 +2615,16 @@ fn result_end_event(
             };
             let cancelled = rs.end_is_cancelled(&addr, &d);
             // The record is the culprit's box: a stop is no failure to box.
-            let failure = record
-                .filter(|_| !cancelled)
-                .map(|r| Box::new((*r).clone()));
+            // It answers whether the log is readable as the end does, as
+            // `take_failures_with_logs_where` makes the exit's record answer:
+            // the box reads only the record (`log: none kept`).
+            let failure = record.filter(|_| !cancelled).map(|r| {
+                let mut r = (*r).clone();
+                if log_readable.is_some() {
+                    r.left_behind.get_or_insert_default().log_readable = log_readable;
+                }
+                Box::new(r)
+            });
             // The final report's `took down:` row reads the same
             // `upstream_of` the event carries.
             if let Some(root) = &d.upstream_of
