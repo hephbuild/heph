@@ -899,7 +899,7 @@ fn raised_diagnostic_with_exit_is_shown() {
         "✗ //p:vet · exit status 1 · go vet found 2 issues"
     );
     assert_eq!(
-        streamed_exec_line(&raised, false),
+        streamed_exec_line(&raised, &ctx),
         "✗ //p:vet · exit status 1 · heph log //p:vet\n  \
          go vet found 2 issues\n  \
          run go vet ./... locally"
@@ -914,7 +914,7 @@ fn raised_diagnostic_with_exit_is_shown() {
     assert_eq!(b.matches("exit status 1").count(), 1, "{b}");
     assert_eq!(one_line(&status_only, &ctx), "✗ //p:t · exit status 1");
     assert_eq!(
-        streamed_exec_line(&status_only, false),
+        streamed_exec_line(&status_only, &ctx),
         "✗ //p:t · exit status 1 · heph log //p:t"
     );
 
@@ -938,12 +938,58 @@ fn raised_diagnostic_with_exit_is_shown() {
         "✗ //app:img · exit status 1 · select a builder with `builder = \"heph\"`"
     );
     assert_eq!(
-        streamed_exec_line(&remedy, false),
+        streamed_exec_line(&remedy, &ctx),
         "✗ //app:img · exit status 1 · heph log //app:img\n  \
          select a builder with `builder = \"heph\"`"
     );
     // The record keeps the whole message, for `--json`.
     assert!(remedy.diagnostic.message.ends_with(": exit status 1"));
+}
+
+#[test]
+/// CQ r2: the streamed line words paths as the box does: heph's home
+/// redacted, the workspace's paths relative to it.
+fn streamed_line_redacts_home_and_relativizes_workspace() {
+    let home = tempfile::tempdir().expect("home");
+    let ws = tempfile::tempdir().expect("ws");
+    let ctx = RenderCtx {
+        redact: Redact::heph_home(home.path()),
+        rel: WorkspaceRel::workspace(ws.path()),
+        ..RenderCtx::default()
+    };
+    let rec = FailureRecord {
+        exit: Some(ExitData {
+            code: Some(1),
+            signal: None,
+            status: "exit status: 1".into(),
+        }),
+        failed_in: FailedIn::Exec,
+        ..target(
+            "//p:t",
+            Diagnostic::new(
+                Stage::Run,
+                format!(
+                    "{}/sandbox/x/run.sh failed on {}/a/x.go",
+                    home.path().display(),
+                    ws.path().display()
+                ),
+            ),
+        )
+    };
+    let line = streamed_exec_line(&rec, &ctx);
+    let boxed = render_box(&rec, &ctx);
+    for needle in [
+        home.path().display().to_string(),
+        ws.path().display().to_string(),
+    ] {
+        assert!(!line.contains(&needle), "{needle} in {line}");
+    }
+    assert!(line.contains(" a/x.go"), "{line}");
+    let shown = line.lines().nth(1).expect("the message line").trim();
+    assert!(
+        boxed.contains(shown),
+        "{shown:?} not as the box words it:\n{boxed}"
+    );
 }
 
 #[test]
@@ -1077,10 +1123,16 @@ fn totals_skipped_fail_fast_and_streamed_lines() {
         ..target("//p:a b", Diagnostic::new(Stage::Run, "exit status 1"))
     };
     assert_eq!(
-        streamed_exec_line(&rec, false),
+        streamed_exec_line(&rec, &RenderCtx::default()),
         "✗ //p:a b · exit status 1 · heph log '//p:a b'"
     );
-    let painted = streamed_exec_line(&rec, true);
+    let painted = streamed_exec_line(
+        &rec,
+        &RenderCtx {
+            color: true,
+            ..RenderCtx::default()
+        },
+    );
     assert!(
         painted.contains("\x1b[") && painted.contains("heph log '//p:a b'"),
         "{painted:?}"

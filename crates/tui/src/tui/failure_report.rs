@@ -393,19 +393,19 @@ pub fn one_line(rec: &FailureRecord, ctx: &RenderCtx) -> String {
 /// right after its output; the header's red bold under `color`. A driver's
 /// own diagnostic is never hidden by it: its message's lines, then its
 /// hints, each follow on a line of its own, indented, as the box would show
-/// them (CQ-1). No newline after the last.
-pub fn streamed_exec_line(rec: &FailureRecord, color: bool) -> String {
+/// them (CQ-1), with `ctx`'s home redaction and workspace-relative paths,
+/// as a box words them. Only `ctx.color` and those two are read. No newline
+/// after the last.
+pub fn streamed_exec_line(rec: &FailureRecord, ctx: &RenderCtx) -> String {
     let addr = log_addr(rec);
     let mut line = format!("✗ {}", clean_inline(addr));
     if let Some(status) = status(rec) {
         line.push_str(" · ");
         line.push_str(&status);
     }
-    let mut line = paint(&line, Tone::RedBold, color);
+    let mut line = paint(&line, Tone::RedBold, ctx.color);
     let pointer = format!(" · heph log {}", shell_quote(addr));
-    line.push_str(&paint(&pointer, Tone::Dim, color));
-    // As the CI box words it: heph's home and the workspace as it does.
-    let ctx = RenderCtx::default();
+    line.push_str(&paint(&pointer, Tone::Dim, ctx.color));
     let d = &rec.diagnostic;
     if let Some(shown) = shown_message(rec) {
         let msg = message(shown, &ctx.redact, &ctx.rel);
@@ -416,7 +416,7 @@ pub fn streamed_exec_line(rec: &FailureRecord, color: bool) -> String {
     }
     for h in &d.hints {
         line.push_str("\n  ");
-        line.push_str(&hint_text(h, &ctx));
+        line.push_str(&hint_text(h, ctx));
     }
     line
 }
