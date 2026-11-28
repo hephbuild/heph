@@ -34,7 +34,7 @@ use hcore::events::{BuildEvent, BuildEventKind, CacheOutcomeKind, EventReceiver,
 use hplugin::error::{Culprit, TargetFailure};
 use serde::Serialize;
 
-use crate::engine::request_state::RequestState;
+use crate::engine::request_state::{RequestState, SkippedReport};
 use crate::engine::{Engine, OutputMatcher, ResultOptions};
 use crate::htaddr::Addr;
 use crate::tui::text::{Redact, WorkspaceRel};
@@ -555,15 +555,16 @@ impl Fold {
     /// on a matched set that never completed, then every held skipped
     /// record, filled from one request-end pass over the graph. Each culprit
     /// was written before this, so a culprit precedes its skipped records.
-    fn finish(&mut self, rs: &RequestState) -> Vec<RunEntry> {
-        let mut ready = if self.matched_complete {
+    ///
+    /// The skipped records are made one at a time, as the writer asks for
+    /// them: each one's `path` is the full chain to its culprit, so holding
+    /// them all would cost the square of a deep chain's depth.
+    fn finish(&mut self, rs: &RequestState) -> Finish {
+        let early = if self.matched_complete {
             Vec::new()
         } else {
             self.early_culprits()
         };
-        if self.held.is_empty() {
-            return ready;
-        }
         let held = std::mem::take(&mut self.held);
         let addrs: Vec<Option<Addr>> = held
             .iter()
@@ -574,38 +575,20 @@ impl Fold {
                     .and_then(|a| crate::htaddr::parse_addr(a).ok())
             })
             .collect();
-        // `skipped_report` reads each culprit, never its path: no path pass.
-        let failures = rs.failures_unpathed();
-        let report = rs.skipped_report(failures.iter().map(|f| &**f), addrs.iter().flatten());
-        for (h, addr) in held.into_iter().zip(&addrs) {
-            let mut entry = h.entry;
-            match addr.as_ref().and_then(|a| report.get(a)) {
-                Some(rec) => {
-                    match rec.root {
-                        Culprit::Target(a) => entry.root = Some(a.format()),
-                        Culprit::File(f) => entry.root_file = Some(f.to_string()),
-                    }
-                    entry.path = Some(rec.path.iter().map(Addr::format).collect());
-                    entry.more = Some(u64::try_from(rec.more).unwrap_or(u64::MAX));
-                }
-                // Not in the graph the pass walks: what the end named.
-                None => {
-                    let me = entry.addr.clone().unwrap_or_default();
-                    entry.path = Some(if me == h.of {
-                        vec![me]
-                    } else {
-                        vec![me, h.of.clone()]
-                    });
-                    match h.file {
-                        Some(file) => entry.root_file = Some(file),
-                        None => entry.root = Some(h.of),
-                    }
-                    entry.more = Some(0);
-                }
-            }
-            ready.push(entry);
+        let report = if held.is_empty() {
+            SkippedReport::default()
+        } else {
+            // `skipped_report` reads each culprit, never its path: no path
+            // pass.
+            let failures = rs.failures_unpathed();
+            rs.skipped_report(failures.iter().map(|f| &**f), addrs.iter().flatten())
+        };
+        Finish {
+            early: early.into_iter(),
+            held: held.into_iter().zip(addrs),
+            report,
+            paths: 0,
         }
-        ready
     }
 
     /// Every matched target has its entry, the matched set is final, and
@@ -614,6 +597,63 @@ impl Fold {
         self.matched_complete && self.pending.is_empty() && !self.cut
     }
 }
+
+/// [`Fold::finish`]'s entries, in order: each skipped record's `path` is
+/// built from the pass's next hops when it is asked for, so at most one is
+/// alive here at a time.
+#[derive(Debug)]
+struct Finish {
+    early: std::vec::IntoIter<RunEntry>,
+    held: std::iter::Zip<std::vec::IntoIter<Held>, std::vec::IntoIter<Option<Addr>>>,
+    report: SkippedReport,
+    /// Skipped records' paths built so far: one per record handed out.
+    paths: usize,
+}
+
+impl Iterator for Finish {
+    type Item = RunEntry;
+
+    fn next(&mut self) -> Option<RunEntry> {
+        if let Some(entry) = self.early.next() {
+            return Some(entry);
+        }
+        let (h, addr) = self.held.next()?;
+        self.paths += 1;
+        let mut entry = h.entry;
+        match addr.as_ref().and_then(|a| self.report.get(a)) {
+            Some(rec) => {
+                match rec.root {
+                    Culprit::Target(a) => entry.root = Some(a.format()),
+                    Culprit::File(f) => entry.root_file = Some(f.to_string()),
+                }
+                entry.path = Some(rec.path.iter().map(Addr::format).collect());
+                entry.more = Some(u64::try_from(rec.more).unwrap_or(u64::MAX));
+            }
+            // Not in the graph the pass walks: what the end named.
+            None => {
+                let me = entry.addr.clone().unwrap_or_default();
+                entry.path = Some(if me == h.of {
+                    vec![me]
+                } else {
+                    vec![me, h.of.clone()]
+                });
+                match h.file {
+                    Some(file) => entry.root_file = Some(file),
+                    None => entry.root = Some(h.of),
+                }
+                entry.more = Some(0);
+            }
+        }
+        Some(entry)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let n = self.early.len() + self.held.len();
+        (n, Some(n))
+    }
+}
+
+impl ExactSizeIterator for Finish {}
 
 /// What the fold needs to fill the fields an event does not carry.
 pub struct Sources<'a> {
@@ -876,7 +916,7 @@ impl Written {
     /// Complete and write each of `entries`, until stdout closes or fails.
     async fn write<W: Write>(
         &mut self,
-        entries: Vec<RunEntry>,
+        entries: impl IntoIterator<Item = RunEntry>,
         src: &Sources<'_>,
         list: &mut output::ListWriter<'_, RunEntry, W>,
     ) {
@@ -1317,7 +1357,7 @@ mod tests {
             ],
             &Known::default(),
         );
-        let entries = f.finish(&rs);
+        let entries: Vec<RunEntry> = f.finish(&rs).collect();
         assert_eq!(rs.report_passes(), 1);
         let got: Vec<_> = entries
             .iter()
@@ -1358,7 +1398,7 @@ mod tests {
             ]
         );
         let rs = engine.new_state_with_events(false, None);
-        assert!(Fold::default().finish(&rs).is_empty());
+        assert_eq!(Fold::default().finish(&rs).count(), 0);
         assert_eq!(rs.report_passes(), 0, "a green run pays for no pass");
     }
 
@@ -1399,7 +1439,6 @@ mod tests {
         );
         let got: Vec<_> = f
             .finish(&rs)
-            .into_iter()
             .map(|e| (e.addr, e.outcome, e.root, e.root_file, e.path))
             .collect();
         let o = |s: &str| Some(s.to_string());
@@ -1454,29 +1493,20 @@ mod tests {
             &Known::default(),
         );
         assert_eq!(f.held.len(), 2);
-        assert_eq!(f.finish(&rs).len(), 2);
+        assert_eq!(f.finish(&rs).count(), 2);
         assert!(f.held.is_empty(), "{:?}", f.held.len());
-        assert!(f.finish(&rs).is_empty(), "each record once");
+        assert_eq!(f.finish(&rs).count(), 0, "each record once");
         assert_eq!(rs.report_passes(), 1);
         // The culprits it hands `skipped_report` are read without a path
         // pass: `finish` never reads a failure's own path.
         assert_eq!(rs.path_passes(), 0);
     }
 
-    /// FQ-4: a pure chain of 5000 selected targets, all skipped under the
-    /// one culprit at its foot. Every node is asked for its record, and each
-    /// record carries the whole path down: the output is quadratic in the
-    /// chain's depth, 12,507,500 path entries for 5000 records, made by one
-    /// pass over the graph.
-    #[tokio::test]
-    async fn finish_pure_chain_output_size() {
-        const N: usize = 5_000;
-        let dir = tempfile::tempdir().expect("tempdir");
-        let engine =
-            Arc::new(Engine::new(crate::engine::Config::for_tests(dir.path())).expect("engine"));
-        let rs = engine.new_state_with_events(false, None);
+    /// A pure chain of `n` selected targets, all skipped under the one
+    /// culprit `//p:c` at its foot, folded and ready to finish.
+    fn skipped_chain(rs: &RequestState, n: usize) -> Fold {
         let a = |s: &str| crate::htaddr::parse_addr(s).expect("addr");
-        let names: Vec<String> = (0..N).map(|i| format!("//p:n{i:04}")).collect();
+        let names: Vec<String> = (0..n).map(|i| format!("//p:n{i:04}")).collect();
         let chain: Vec<Addr> = names.iter().map(|n| a(n)).collect();
         let c = a("//p:c");
         for w in chain.windows(2) {
@@ -1484,7 +1514,7 @@ mod tests {
                 rs.add_dep_for_test(from, to).expect("edge");
             }
         }
-        rs.add_dep_for_test(&chain[N - 1], &c).expect("edge");
+        rs.add_dep_for_test(&chain[n - 1], &c).expect("edge");
         rs.mark_requested(&chain[0]);
         rs.record_failure(
             Culprit::Target(c.clone()),
@@ -1497,20 +1527,58 @@ mod tests {
                     .map(|n| ev(1, end(n, Some("dependency failed"), Some("//p:c")))),
             )
             .collect();
-        let (_, mut f) = fold_with(events, &Known::default());
-        let entries = f.finish(&rs);
-        assert_eq!(rs.report_passes(), 1);
-        assert_eq!(entries.len(), N, "one record per skipped target");
-        let paths: Vec<usize> = entries
-            .iter()
+        fold_with(events, &Known::default()).1
+    }
+
+    /// FQ-4: a pure chain of 1000 selected targets, all skipped under the
+    /// one culprit at its foot. Every node is asked for its record, and each
+    /// record carries the whole path down: the output is quadratic in the
+    /// chain's depth, 501,500 path entries for 1000 records, made by one
+    /// pass over the graph.
+    #[tokio::test]
+    async fn finish_pure_chain_output_size() {
+        const N: usize = 1_000;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine =
+            Arc::new(Engine::new(crate::engine::Config::for_tests(dir.path())).expect("engine"));
+        let rs = engine.new_state_with_events(false, None);
+        let mut f = skipped_chain(&rs, N);
+        let paths: Vec<usize> = f
+            .finish(&rs)
             .map(|e| e.path.as_ref().map_or(0, Vec::len))
             .collect();
-        // `n_i`'s path is `n_i … n_4999, c`: N - i + 1 entries.
+        assert_eq!(rs.report_passes(), 1);
+        assert_eq!(paths.len(), N, "one record per skipped target");
+        // `n_i`'s path is `n_i … n_999, c`: N - i + 1 entries.
         assert_eq!(paths.first(), Some(&(N + 1)));
         assert_eq!(paths.last(), Some(&2));
         let total: usize = paths.iter().sum();
         assert_eq!(total, N * (N + 1) / 2 + N);
-        assert_eq!(total, 12_507_500);
+        assert_eq!(total, 501_500);
+    }
+
+    /// FQ round 2: `finish` streams. Each skipped record's path is built
+    /// when the writer asks for that record, never ahead of it, so what
+    /// `finish` holds is one path at a time, not the square of the chain.
+    #[tokio::test]
+    async fn finish_builds_one_path_at_a_time() {
+        const N: usize = 50;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine =
+            Arc::new(Engine::new(crate::engine::Config::for_tests(dir.path())).expect("engine"));
+        let rs = engine.new_state_with_events(false, None);
+        let mut f = skipped_chain(&rs, N);
+        let mut finish = f.finish(&rs);
+        assert_eq!(finish.paths, 0, "no path before the first record");
+        assert_eq!(finish.len(), N);
+        let mut handed = 0;
+        while let Some(entry) = finish.next() {
+            handed += 1;
+            assert!(entry.path.is_some(), "{entry:?}");
+            assert_eq!(finish.paths, handed, "built only the record handed out");
+            drop(entry);
+        }
+        assert_eq!(handed, N);
     }
 
     /// A dependency that built, then was blamed when it later ended failed,
