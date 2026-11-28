@@ -2995,7 +2995,9 @@ fn streamed_then_missing_output_box_without_log() {
 fn streamed_target_bad_option_full_box() {
     let build = concat!(
         "target(name = \"badopt\", driver = \"bash\", cache = False,",
-        " timeout = \"banana\", run = [\"echo badopt-line\"])\n",
+        // The run would print `badopt-42`, text the BUILD line the box
+        // quotes does not hold: only a run can put it on the screen.
+        " timeout = \"banana\", run = [\"echo badopt-$((6 * 7))\"])\n",
     );
     let b = boxed(build, r#""$HEPH" run //pkg:badopt"#);
     b.assert_failed();
@@ -3013,7 +3015,7 @@ fn streamed_target_bad_option_full_box() {
         b.report()
     );
     assert!(
-        !seen.contains("badopt-line"),
+        !seen.contains("badopt-42"),
         "a target that never ran printed\n{}",
         b.report()
     );

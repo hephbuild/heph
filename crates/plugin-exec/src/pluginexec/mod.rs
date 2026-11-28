@@ -1673,7 +1673,11 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
         let read_only_groups: std::collections::HashSet<String> =
             spec.read_only_deps.iter().cloned().collect();
 
-        let dep_inputs = build_dep_inputs(&pkg, spec.deps, "dep", true, true, &read_only_groups)?;
+        // Each named as its option, so a bad address's diagnostic points at
+        // that option of the declaring call (D3).
+        use hplugin::htspec::OptionContext;
+        let dep_inputs = build_dep_inputs(&pkg, spec.deps, "dep", true, true, &read_only_groups)
+            .context(OptionContext { key: "deps" })?;
         let hash_dep_inputs = build_dep_inputs(
             &pkg,
             spec.hash_deps,
@@ -1681,7 +1685,8 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
             true,
             false,
             &read_only_groups,
-        )?;
+        )
+        .context(OptionContext { key: "hash_deps" })?;
         let runtime_dep_inputs = build_dep_inputs(
             &pkg,
             spec.runtime_deps,
@@ -1689,7 +1694,10 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
             false,
             true,
             &read_only_groups,
-        )?;
+        )
+        .context(OptionContext {
+            key: "runtime_deps",
+        })?;
 
         let dep_group_inputs = grouped(&dep_inputs);
         let runtime_dep_group_inputs = grouped(&runtime_dep_inputs);

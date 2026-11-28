@@ -344,6 +344,20 @@ pub(crate) fn declared_origin(origin_id: &str) -> String {
     }
 }
 
+/// The option of the declaring call an origin (as [`declared_origin`] reads
+/// it) points into, for a diagnostic's location: the part before the first
+/// `.` when it is an identifier (`deps`, `transitive` for
+/// `transitive.deps`), else none (`${read://}`, an origin that names no
+/// option), and the diagnostic points at the call.
+pub(crate) fn origin_field(origin: &str) -> Option<&str> {
+    let head = origin.split('.').next()?;
+    let mut chars = head.chars();
+    let first = chars.next()?;
+    ((first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_'))
+    .then_some(head)
+}
+
 pub fn inputs_for_labelled(refs: &[DeferredRef], via: Option<&Addr>) -> Vec<Input> {
     // Keyed on the *cell* as well as the address. Deduping on the address alone
     // silently dropped one of them the moment two kinds existed: `collect` sorts
@@ -567,7 +581,7 @@ impl Engine {
                             &p.addr.r#ref,
                             consumer,
                             || format!("${{{READ}://}}"),
-                            |_| rs.decl_loc(consumer),
+                            |o| rs.decl_field_loc(consumer, origin_field(o)),
                             |e| e.context(format!("{consumer}: `{}` in `{}`", r.raw, r.path)),
                         )
                     })?;
@@ -717,6 +731,25 @@ impl Engine {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn origin_field_is_the_option_an_origin_names() {
+        for (origin, field) in [
+            ("deps", Some("deps")),
+            ("transitive.deps", Some("transitive")),
+            ("transitive.tools", Some("transitive")),
+            ("_private", Some("_private")),
+            ("${read://}", None),
+            ("${src://}", None),
+            ("dep|out|0", None),
+            ("", None),
+            (".deps", None),
+            ("9deps", None),
+            ("dépendances", None),
+        ] {
+            assert_eq!(origin_field(origin), field, "{origin:?}");
+        }
+    }
 
     fn cfg(pairs: &[(&str, Value)]) -> HashMap<String, Value> {
         pairs

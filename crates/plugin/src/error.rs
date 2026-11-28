@@ -18,6 +18,26 @@ impl fmt::Display for TargetNotFoundError {
 
 impl std::error::Error for TargetNotFoundError {}
 
+/// A target names a driver no plugin registered. Typed so a diagnostic can
+/// point at the target's `driver` option ([`DriverNotFound::FIELD`]).
+#[derive(Debug, Clone)]
+pub struct DriverNotFound {
+    pub driver: String,
+}
+
+impl DriverNotFound {
+    /// The option of the declaring call that names the driver.
+    pub const FIELD: &'static str = "driver";
+}
+
+impl fmt::Display for DriverNotFound {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "driver not found: {}", self.driver)
+    }
+}
+
+impl std::error::Error for DriverNotFound {}
+
 /// Returned the instant a request's cancellation token is observed set, so a
 /// cancelled build stops resolving and executing new targets immediately
 /// rather than draining the entire matched set. Callers match on this to

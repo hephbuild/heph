@@ -363,7 +363,9 @@ impl Engine {
         let driver = self
             .drivers_by_name
             .get(&spec.driver)
-            .with_context(|| format!("driver not found: {}", spec.driver))?
+            .ok_or_else(|| hplugin::error::DriverNotFound {
+                driver: spec.driver.clone(),
+            })?
             .clone();
         // Before anything builds or the terminal goes raw. The gate is on the
         // driver that actually spawns: a managed driver with no shell of its own

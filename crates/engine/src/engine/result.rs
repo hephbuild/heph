@@ -2324,6 +2324,27 @@ fn first_member(e: anyhow::Error) -> anyhow::Error {
     }
 }
 
+/// Where in `culprit`'s declaring call its failure `e` points, for a record
+/// that has no location of its own: the option the error is about (a field
+/// the driver's spec parse refused, an unknown option, the `driver` no plugin
+/// registered), else the call itself for a failure to parse the spec. `None`
+/// for any other failure: a run, a link or a cache failure is not about the
+/// declaration.
+fn culprit_location(
+    rs: &RequestState,
+    culprit: &Addr,
+    e: &anyhow::Error,
+    stage: hcore::diagnostic::Stage,
+) -> Option<hcore::diagnostic::SourceLoc> {
+    let field = hplugin::htspec::error_option(e).or_else(|| {
+        downcast_chain_ref::<hplugin::error::DriverNotFound>(e)
+            .map(|_| hplugin::error::DriverNotFound::FIELD)
+    });
+    (field.is_some() || stage == hcore::diagnostic::Stage::Parse)
+        .then(|| rs.decl_field_loc(culprit, field))
+        .flatten()
+}
+
 /// Records `e` against `culprit`, entered through `entry`, and returns the
 /// marker naming it, with whether this call's record won the claim.
 fn record_culprit(
@@ -2384,6 +2405,11 @@ fn record_culprit(
         };
         let mut record = crate::engine::failure_record::compact(&e, &culprit, &entry, &scrub);
         record.path = path.iter().map(Addr::format).collect();
+        if record.diagnostic.location.is_none()
+            && let Culprit::Target(c) = &culprit
+        {
+            record.diagnostic.location = culprit_location(rs, c, &e, record.diagnostic.stage);
+        }
         Arc::new(record)
     });
     let claim = record
@@ -7005,7 +7031,12 @@ impl Engine {
 
         let driver = match self.drivers_by_name.get(&spec.driver) {
             Some(driver) => driver,
-            None => anyhow::bail!("driver not found: {}", spec.driver),
+            None => {
+                return Err(hplugin::error::DriverNotFound {
+                    driver: spec.driver.clone(),
+                }
+                .into());
+            }
         };
 
         let res = driver
@@ -7220,7 +7251,12 @@ impl Engine {
                                 dep,
                                 declarer,
                                 || crate::engine::deferred::declared_origin(&input.origin_id),
-                                |_| rs.decl_loc(declarer),
+                                |o| {
+                                    rs.decl_field_loc(
+                                        declarer,
+                                        crate::engine::deferred::origin_field(o),
+                                    )
+                                },
                                 |e| hplugin::diagnostic::with_stage(e, Boundary::GetSpec, dep),
                             )
                         })?;

@@ -71,7 +71,9 @@ impl Engine {
         let driver = self
             .drivers_by_name
             .get(&spec.driver)
-            .ok_or_else(|| anyhow::anyhow!("driver not found: {}", spec.driver))
+            .ok_or_else(|| hplugin::error::DriverNotFound {
+                driver: spec.driver.clone(),
+            })
             .cloned()?;
         // A target run can reach the codegen index (the fs driver's lookups).
         self.open_codegen_index(&rs).await?;

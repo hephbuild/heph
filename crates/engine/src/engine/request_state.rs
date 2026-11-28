@@ -712,6 +712,9 @@ impl TookDown {
 
 /// The values a request's targets were handed to scrub
 /// ([`RequestStateData::scrubs`]).
+/// [`RequestStateData::source_indexes`]: (provider name, file) → index.
+type SourceIndexes = FxHashMap<(String, Arc<str>), Option<Arc<dyn hplugin::provider::SourceIndex>>>;
+
 #[derive(Default)]
 struct Scrubs {
     by_addr: FxHashMap<Addr, crate::engine::failure_record::Scrub>,
@@ -880,6 +883,15 @@ pub struct RequestStateData {
     /// read only on a failure. Never reaches a hash: the origin ids keep
     /// their text; this is the reverse lookup, held for the request.
     transitive_declarers: Mutex<FxHashMap<String, Addr>>,
+    /// Each source file's index, by (provider, workspace-relative file), as
+    /// the provider gave it ([`Provider::source_index`](hplugin::provider::Provider::source_index)),
+    /// `None` included: asked once per file per request, however many
+    /// diagnostics point into it. Filled only on a failure, read only by
+    /// [`RequestState::decl_field_loc`]; never reaches a hash (I1).
+    source_indexes: Mutex<SourceIndexes>,
+    /// How many times a provider was asked for a source index this request:
+    /// one per file is the budget ([`RequestState::source_index_loads`]).
+    source_index_loads: std::sync::atomic::AtomicUsize,
     /// How many request-end passes ([`RequestState::skipped_report`]) ran:
     /// one per failed request is the budget.
     report_passes: std::sync::atomic::AtomicUsize,
@@ -1565,13 +1577,58 @@ impl RequestState {
         out
     }
 
-    /// Where `addr` was declared, for a diagnostic about it: its spec's
-    /// [`SpecSource`](hplugin::provider::SpecSource) call, when this request
-    /// already resolved the spec and its provider reported a source. Never
-    /// resolves anything: a spec not yet resolved, or resolved with an error,
-    /// has no location here.
-    pub(crate) fn decl_loc(&self, addr: &Addr) -> Option<hcore::diagnostic::SourceLoc> {
-        Some(self.resolved_spec(addr)?.spec.source.as_ref()?.call_loc())
+    /// Where `addr` declared option `field`, for a diagnostic about it: the
+    /// span its provider's [`SourceIndex`](hplugin::provider::SourceIndex)
+    /// finds in the declaring call, else that call's start (its spec's
+    /// [`SpecSource`](hplugin::provider::SpecSource)); `field` `None` is the
+    /// call. Error path only: the first ask for a file asks the provider for
+    /// its index, once per file per request.
+    ///
+    /// Never resolves anything: a spec not yet resolved, resolved with an
+    /// error, or whose provider reported no source has no location here.
+    pub(crate) fn decl_field_loc(
+        &self,
+        addr: &Addr,
+        field: Option<&str>,
+    ) -> Option<hcore::diagnostic::SourceLoc> {
+        let spec = self.resolved_spec(addr)?;
+        let source = spec.spec.source.as_ref()?;
+        let found = field.and_then(|field| {
+            let index = self.source_index(&spec.provider, source.file_arc())?;
+            index.locate(source, &addr.name, field)
+        });
+        Some(match found {
+            Some(span) => span.start_in(source.file()),
+            None => source.call_loc(),
+        })
+    }
+
+    /// `provider`'s index of `file`, asked of the provider at most once per
+    /// request. The lock is held across the ask, so two diagnostics racing
+    /// on one file parse it once; it is a leaf, taken on the error path only.
+    fn source_index(
+        &self,
+        provider: &str,
+        file: &Arc<str>,
+    ) -> Option<Arc<dyn hplugin::provider::SourceIndex>> {
+        let mut indexes = self.data.source_indexes.lock();
+        let key = (provider.to_owned(), Arc::clone(file));
+        if let Some(index) = indexes.get(&key) {
+            return index.clone();
+        }
+        let index = self.data.engine.upgrade().and_then(|engine| {
+            let p = engine.providers_by_name.get(provider)?;
+            self.data.source_index_loads.fetch_add(1, Ordering::Relaxed);
+            p.provider.source_index(file)
+        });
+        indexes.insert(key, index.clone());
+        index
+    }
+
+    /// How many source indexes providers were asked for this request
+    /// ([`decl_field_loc`](Self::decl_field_loc)): at most one per file.
+    pub fn source_index_loads(&self) -> usize {
+        self.data.source_index_loads.load(Ordering::Relaxed)
     }
 
     /// `addr`'s spec, when this request already resolved it. Never
@@ -2567,6 +2624,8 @@ impl Engine {
             failures: Mutex::new(indexmap::IndexMap::new()),
             scrubs: Mutex::new(Scrubs::default()),
             transitive_declarers: Mutex::new(FxHashMap::default()),
+            source_indexes: Mutex::new(FxHashMap::default()),
+            source_index_loads: std::sync::atomic::AtomicUsize::new(0),
             report_passes: std::sync::atomic::AtomicUsize::new(0),
             path_passes: std::sync::atomic::AtomicUsize::new(0),
             took_down: Mutex::new(FxHashMap::default()),
