@@ -213,7 +213,9 @@ fn phases() -> &'static Mutex<HashMap<u64, &'static str>> {
 ///
 /// It reaches a body only once that body has suspended: during the inline
 /// first poll the caller that holds the cell's only interest is the one
-/// driving it, so the cell cannot be abandoned until the body yields.
+/// driving it, so the cell cannot be abandoned until the body yields. A body
+/// that holds its thread waiting on this token must therefore call
+/// [`leave_caller_stack`] first, or it can wait for ever.
 pub fn abandoned_token() -> Option<crate::hasync::StdCancellationToken> {
     task_cell::current_abandoned_token()
 }
@@ -223,6 +225,27 @@ pub fn abandoned_token() -> Option<crate::hasync::StdCancellationToken> {
 /// token.
 pub fn is_abandoned() -> bool {
     task_cell::current_is_abandoned()
+}
+
+/// Move the rest of the memoized body the caller is running in off its
+/// caller's stack and onto the cell's own task. A no-op outside a memoized
+/// body and on a body already on its own task (bar one harmless yield just
+/// after its spawn, before the inline flag is cleared).
+///
+/// A cold cell's body is first polled inline, on the stack of the caller
+/// that asked for it, and only gets a task of its own once it suspends. A
+/// body whose every await before some thread-holding wait happens to be
+/// ready (a `spawn_blocking` job that finished before its handle was polled)
+/// reaches that wait on the caller's stack. The caller is then stuck inside
+/// it: it cannot see a sibling fail, so it never drops its interest, so the
+/// cell is never abandoned and [`abandoned_token`] is never cancelled. The
+/// wait waits on itself. Called first, the body suspends once (one task
+/// spawn), the caller's poll returns, and the wait runs on a task the
+/// abandonment can reach.
+pub async fn leave_caller_stack() {
+    if task_cell::current_polled_inline() {
+        tokio::task::yield_now().await;
+    }
 }
 
 /// Tag the calling invocation with its next-await `phase`. No-op when

@@ -763,6 +763,14 @@ impl Engine {
         // included.
         let inherit = matches!(options.stdio, crate::engine::driver::RunStdio::Inherit(_));
 
+        // On the execute's own task from here on, whatever was ready before:
+        // a run may hold its thread (exec's output park on macOS), and on the
+        // caller's stack it would hold the caller too, so the caller would
+        // never hear a sibling fail, never abandon this execute, and `stop`
+        // would never be cancelled. Every await above can resolve on its
+        // first poll (`lease.prepare()`'s job finishing before its handle is
+        // polled), and then the run was reached inline.
+        hcore::hmemoizer::leave_caller_stack().await;
         // Taken here, on the execute's own task: the wrapper may run `inner`
         // anywhere, and only this task can see the memo cell it would be
         // abandoned through.

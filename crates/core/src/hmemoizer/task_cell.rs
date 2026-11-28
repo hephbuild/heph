@@ -96,9 +96,11 @@ pub(crate) struct TaskCell<V> {
     /// Set while [`TaskInner::process`] is driving this cell's body *inline*,
     /// before any task exists for it (see the inline-first path there).
     ///
-    /// Only [`Self::task_live`] reads it, and only so that window does not read
-    /// as "stranded": during it the cell is genuinely being driven, just by the
-    /// caller's own stack rather than by a spawned task.
+    /// [`Self::task_live`] reads it so that window does not read as
+    /// "stranded": during it the cell is genuinely being driven, just by the
+    /// caller's own stack rather than by a spawned task. The body reads it
+    /// through [`super::leave_caller_stack`], to get off that stack before it
+    /// holds its thread.
     inline: AtomicBool,
     /// Cancelled when the cell is abandoned, just before its task is aborted
     /// ([`super::abandoned_token`]). Created on first use, by the body asking
@@ -118,6 +120,11 @@ trait AbandonSignal: Send + Sync {
     /// Without creating the token: an abandonment always creates it, so a
     /// cell with none was not abandoned.
     fn is_abandoned(&self) -> bool;
+    /// Whether the body may still be in its inline first poll, on its
+    /// caller's stack. Read on the body's own thread during that poll it is
+    /// exact; on the spawned task it can still read `true` for an instant
+    /// (the flag is cleared just after the spawn), never `false` too early.
+    fn polled_inline(&self) -> bool;
 }
 
 impl<V: Send + Sync> AbandonSignal for TaskCell<V> {
@@ -131,6 +138,10 @@ impl<V: Send + Sync> AbandonSignal for TaskCell<V> {
         self.abandoned
             .get()
             .is_some_and(StdCancellationToken::is_cancelled)
+    }
+
+    fn polled_inline(&self) -> bool {
+        self.inline.load(Ordering::Acquire)
     }
 }
 
@@ -149,6 +160,14 @@ pub(crate) fn current_abandoned_token() -> Option<StdCancellationToken> {
 /// Whether the cell whose body is running on this task was abandoned.
 pub(crate) fn current_is_abandoned() -> bool {
     CURRENT_CELL.try_with(|c| c.is_abandoned()).unwrap_or(false)
+}
+
+/// Whether the cell whose body is running on this task may still be in its
+/// inline first poll (see [`AbandonSignal::polled_inline`]).
+pub(crate) fn current_polled_inline() -> bool {
+    CURRENT_CELL
+        .try_with(|c| c.polled_inline())
+        .unwrap_or(false)
 }
 
 impl<V> TaskCell<V> {
@@ -1027,6 +1046,52 @@ mod tests {
         }))
         .await;
         assert_eq!(fresh, 0, "a successor inherits a cancelled token");
+    }
+
+    /// A body none of whose awaits suspends reaches its thread-holding wait
+    /// in the inline first poll, on its caller's stack. When that caller is
+    /// a join whose sibling fails (the engine's dep join under fail-fast),
+    /// the join is stuck inside the wait, never sees the failure, never
+    /// abandons the cell, and the wait never hears its token: it waited on
+    /// itself. `leave_caller_stack` moves the body onto its own task first,
+    /// so the join sees the failure and the abandonment reaches the wait.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_body_holding_its_thread_off_its_callers_stack_hears_a_sibling_fail() {
+        let m: Arc<TaskInner<String, u32>> = Arc::new(inner("leave-stack"));
+        let entered = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel::<(bool, bool)>();
+        let body = {
+            let entered = Arc::clone(&entered);
+            async move {
+                let inline_before = current_polled_inline();
+                super::super::leave_caller_stack().await;
+                let token = current_abandoned_token().expect("inside a body");
+                entered.store(true, Ordering::SeqCst);
+                tokio::task::block_in_place(|| spin_until(|| token.is_cancelled()));
+                let _sent = tx.send((inline_before, token.is_cancelled()));
+                futures::future::pending::<()>().await;
+                0
+            }
+        };
+        let sibling = async {
+            while !entered.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+            Err::<u32, ()>(())
+        };
+        let wanted = async { Ok::<u32, ()>(m.process("k".to_string(), move || body).await) };
+        // Joined on this thread, as the dep join runs on its caller's stack.
+        let joined = futures::future::try_join(sibling, wanted).await;
+        assert!(joined.is_err(), "the sibling's failure ends the join");
+        let (inline_before, heard) = tokio::task::spawn_blocking(move || rx.recv_timeout(TIMEOUT))
+            .await
+            .expect("join")
+            .expect("the body reports");
+        assert!(
+            inline_before,
+            "the body was first polled on its caller's stack"
+        );
+        assert!(heard, "the wait never heard its cell abandoned");
     }
 
     /// A body that asks only after it was abandoned finds the token already
