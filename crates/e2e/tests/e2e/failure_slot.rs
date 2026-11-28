@@ -466,11 +466,21 @@ async fn concurrent_failures_same_target_slot_never_mixed() -> anyhow::Result<()
             .map(|l| l.rsplit('│').next().unwrap_or(l).trim().to_string());
         lines.all(|l| Some(l.rsplit('│').next().unwrap_or(l).trim().to_string()) == first)
     };
+    // A box reads the slot by its fill id: the run whose slot the other
+    // replaced says so rather than show the other's lines, and the one
+    // that kept it shows its own.
+    let mut shown = 0;
     for f in [fa?, fb?] {
         let out = render(&f);
+        if out.contains("log replaced by a newer failed run") {
+            assert!(!out.contains("run-"), "{out}");
+            continue;
+        }
         assert!(out.contains("run-"), "{out}");
         assert!(homogeneous(&out), "a box mixes two runs: {out}");
+        shown += 1;
     }
+    assert!(shown >= 1, "the slot's own run shows its log");
     let log = slot_log(&ws.engine, "//p:t").expect("a complete slot");
     assert_eq!(log.lines().count(), 200);
     assert!(homogeneous(&log), "the slot mixes two runs");

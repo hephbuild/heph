@@ -156,10 +156,13 @@ async fn failure_report_points_at_any_log_the_engine_holds() -> anyhow::Result<(
     ));
     let boxes = String::from_utf8(boxes)?;
     assert!(
-        boxes.contains("╰─▶ boom\n  log: heph log //p:t\n"),
+        boxes.starts_with("✗ //p:t\n  boom\n  log: heph log //p:t\n"),
         "{boxes}"
     );
-    assert!(boxes.contains("╰─▶ boom\n  log: none kept\n"), "{boxes}");
+    assert!(
+        boxes.ends_with("\n✗ //p:never\n  boom\n  log: none kept\n"),
+        "{boxes}"
+    );
     Ok(())
 }
 
