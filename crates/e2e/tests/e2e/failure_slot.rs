@@ -138,7 +138,7 @@ async fn a_failed_targets_sandbox_is_removed() -> anyhow::Result<()> {
     let [failure] = f.as_slice() else {
         panic!("one failure, got {}", f.len());
     };
-    let tail = failure.log_tail.as_ref().expect("the recorded tail");
+    let tail = crate::common::failure_tail(failure).expect("the recorded tail");
     assert_eq!(tail.text, "removed-marker");
     let out = render(&f);
     assert!(out.contains("│ removed-marker"), "{out}");

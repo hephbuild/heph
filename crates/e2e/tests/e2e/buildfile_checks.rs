@@ -182,7 +182,7 @@ async fn try_run(ws: &Ws, m: &Matcher) -> Result<Run, Unresolved> {
                 .file
                 .as_deref()
                 .map_or_else(|| f.addr.format(), str::to_owned);
-            (key, format!("{:#}", f.source))
+            (key, format!("{:#}", crate::common::failure_text(f)))
         })
         .collect();
     let batch = match batch {

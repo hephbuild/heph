@@ -230,7 +230,7 @@ pub fn require_complete_selection(gaps: &crate::engine::Gaps) -> anyhow::Result<
 /// never recorded as a [`TargetFailure`]; it aborts the build but is not a target
 /// fault, so commands surface it separately from the failure registry.
 pub fn is_cancelled(e: &anyhow::Error) -> bool {
-    downcast_chain_ref::<CancelledError>(e).is_some()
+    hplugin::error::is_cancelled(e)
 }
 
 /// Fold a keep-going batch into the single `res` that [`finalize`] expects.
@@ -946,12 +946,8 @@ mod tests {
     /// draws.
     fn failure(addr: &str, rec: FailureRecord) -> Arc<TargetFailure> {
         Arc::new(
-            TargetFailure::new(
-                crate::htaddr::parse_addr(addr).expect("addr"),
-                None,
-                anyhow::anyhow!("x"),
-            )
-            .with_record(Arc::new(rec)),
+            TargetFailure::new(crate::htaddr::parse_addr(addr).expect("addr"))
+                .with_record(Arc::new(rec)),
         )
     }
 
@@ -1458,11 +1454,9 @@ mod tests {
     async fn report_after_ctrl_c_lists_every_root() -> anyhow::Result<()> {
         let ctx = FakeCtx::new(true);
         let mut failures = two_failures();
-        failures.push(Arc::new(TargetFailure::new(
-            crate::htaddr::parse_addr("//simple_fail:stopped")?,
-            None,
-            anyhow::anyhow!("cancelled"),
-        )));
+        failures.push(Arc::new(TargetFailure::new(crate::htaddr::parse_addr(
+            "//simple_fail:stopped",
+        )?)));
         let mut rs = FakeRs::new(failures);
         rs.2.push("//simple_fail:stopped");
         let res: anyhow::Result<()> = Err(anyhow::Error::new(CancelledError));
@@ -1483,11 +1477,9 @@ mod tests {
     #[tokio::test]
     async fn report_after_ctrl_c_without_a_root_is_empty() -> anyhow::Result<()> {
         let ctx = FakeCtx::new(true);
-        let failures = vec![Arc::new(TargetFailure::new(
-            crate::htaddr::parse_addr("//simple_fail:stopped")?,
-            None,
-            anyhow::anyhow!("cancelled"),
-        ))];
+        let failures = vec![Arc::new(TargetFailure::new(crate::htaddr::parse_addr(
+            "//simple_fail:stopped",
+        )?))];
         let mut rs = FakeRs::new(failures);
         rs.2.push("//simple_fail:stopped");
         let res: anyhow::Result<()> = Err(anyhow::Error::new(CancelledError));

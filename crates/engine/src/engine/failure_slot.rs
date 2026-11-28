@@ -526,7 +526,7 @@ impl FailureSlots {
             });
             let out = out.and_then(|tar| staged_out_tar(&addr, tar, &roots));
             let tail_of = |source: &LogSource| match memory_tail(source, lines) {
-                Ok(t) => Some(FailureLog::in_memory(t)),
+                Ok(t) => Some(FailureLog::in_memory(capped_tail(t))),
                 Err(e) => {
                     tracing::warn!(addr = %addr, error = %e, "reading the failure log's tail");
                     None
@@ -566,10 +566,10 @@ impl FailureSlots {
                     Filled {
                         key: Some(key),
                         fill_id: manifest.fill_id,
-                        log_lines: built.log.as_ref().map_or(0, |l| l.2),
+                        log_lines: built.log.as_ref().map_or(0, |l| l.1),
                         log: built
                             .log
-                            .map(|(path, file, _)| FailureLog::open(path, file, lines))
+                            .map(|(path, _)| FailureLog::on_disk(path, lines))
                             .or(memory),
                         kept: built
                             .out
@@ -993,6 +993,47 @@ fn resolve_in_roots(path: &Path, roots: &[PathBuf]) -> io::Result<Option<PathBuf
     Ok(Some(real))
 }
 
+/// `tail` within [`RECORD_CAP`](hcore::failure::RECORD_CAP) (E2): a log
+/// kept only in memory is held on the error chain as long as the failure
+/// is, so it gets the record's cap, not [`TAIL_MAX_BYTES`]. Whole lines are
+/// dropped from the front, so no line is cut (a secret in it stays whole for
+/// the record's scrub) unless the last one alone is over the cap; then its
+/// end is kept, at a char boundary.
+///
+/// [`TAIL_MAX_BYTES`]: hcore::failure_log::TAIL_MAX_BYTES
+fn capped_tail(mut tail: LogTail) -> LogTail {
+    let cap = hcore::failure::RECORD_CAP;
+    if tail.text.len() <= cap {
+        return tail;
+    }
+    let len = tail.text.len();
+    let over = len - cap;
+    // The first line that starts at or past `over`, when one starts before
+    // the end; else the cut inside the last line.
+    let from = over.saturating_sub(1);
+    let line_start = tail
+        .text
+        .as_bytes()
+        .get(from..)
+        .and_then(|rest| rest.iter().position(|&b| b == b'\n'))
+        .map(|i| from + i + 1)
+        .filter(|&start| start < len);
+    let start = line_start.unwrap_or_else(|| {
+        let mut start = over;
+        while !tail.text.is_char_boundary(start) {
+            start += 1;
+        }
+        start
+    });
+    let dropped = tail
+        .text
+        .get(..start)
+        .map_or(0, |head| head.matches('\n').count());
+    tail.text.drain(..start);
+    tail.start_line += dropped;
+    tail
+}
+
 /// The tail of `source`, read into memory.
 fn memory_tail(source: &LogSource, lines: usize) -> io::Result<LogTail> {
     match source {
@@ -1051,10 +1092,8 @@ fn temp_name(key: &str) -> String {
 
 /// What [`fill_slot`] put in place.
 struct Built {
-    /// The log's final path and the log opened for reading — opened before
-    /// the rename, so it is this fill's copy whatever replaces the slot
-    /// afterwards — and its line count.
-    log: Option<(PathBuf, std::fs::File, u64)>,
+    /// The log's final path and its line count.
+    log: Option<(PathBuf, u64)>,
     /// The slot's `out/`, when the `failure_out` tar was unpacked in.
     out: Option<PathBuf>,
     /// Why the `failure_out` tar was not unpacked in, when the slot was kept
@@ -1105,11 +1144,12 @@ fn fill_slot(
                 LogSource::Fd(from) => copy_fd(from, &path)
                     .with_context(|| format!("copying the live log to {}", path.display()))?,
             }
+            // Opened only to count; nothing keeps the file (E2).
             let file = std::fs::File::open(&path)
                 .with_context(|| format!("opening {}", path.display()))?;
             let lines = hcore::failure_log::count_lines(&file)
                 .with_context(|| format!("counting the lines of {}", path.display()))?;
-            Some((file, lines))
+            Some(lines)
         }
         None => None,
     };
@@ -1172,7 +1212,7 @@ fn fill_slot(
     temp.disarm();
     drop(old);
     Ok(Built {
-        log: log.map(|(file, lines)| (dest.join(LOG), file, lines)),
+        log: log.map(|lines| (dest.join(LOG), lines)),
         out: moved.then(|| dest.join(OUT)),
         out_error,
         fixes: wrote_fixes.then(|| dest.join(FIXES)),
@@ -1603,7 +1643,7 @@ mod tests {
         let src = home.path().join("log.txt");
         std::fs::write(&src, "kept\n").expect("src");
         let a = addr("//p:a");
-        let (path, _file, lines) = fill_slot(
+        let (path, lines) = fill_slot(
             &home.path().join(FAILURES_DIR),
             &addr_key(&a),
             &manifest_for(&a),

@@ -159,7 +159,11 @@ async fn build_in(
     .map_err(|_elapsed| anyhow::anyhow!("the build hung past {DEADLINE:?}"))?;
     let mut msg = String::new();
     for f in rs.take_failures() {
-        msg.push_str(&format!("{}: {:#}\n", f.addr.format(), f.source));
+        msg.push_str(&format!(
+            "{}: {:#}\n",
+            f.addr.format(),
+            crate::common::failure_text(&f)
+        ));
     }
     match batch {
         Err(e) => msg.push_str(&format!("{e:#}\n")),
@@ -834,10 +838,10 @@ async fn a_run_cancelled_while_queued_on_the_sandbox_pool_is_a_cancellation() ->
     let failures = rs.take_failures();
     for f in &failures {
         assert!(
-            hplugin::error::is_cancelled(&f.source),
-            "{} recorded a failure, not a cancellation: {:#}",
+            f.record.cancelled,
+            "{} recorded a failure, not a cancellation: {}",
             f.addr.format(),
-            f.source
+            crate::common::failure_text(f)
         );
     }
 

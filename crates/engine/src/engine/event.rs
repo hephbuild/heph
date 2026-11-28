@@ -105,7 +105,8 @@ impl ErrorDetail {
         // Another request's recorded failure, surfaced at its top: its
         // record says whether its run streamed. The log itself is never
         // read here: `ResultEnd` carries the record's reference (P13).
-        if let Some(t) = hcore::hmemoizer::downcast_chain_ref::<TargetFailure>(e) {
+        let surfaced = hcore::hmemoizer::downcast_chain_ref::<TargetFailure>(e);
+        if let Some(t) = surfaced {
             d.streamed |= t.streamed;
         }
         // Through the memoizer's shared wrappers: a run's own failure reaches
@@ -130,13 +131,25 @@ impl ErrorDetail {
             Some(hcore::process::Exit::Code(c)) => Some(c),
             _ => None,
         };
-        // Through the memoizer's shared wrappers too: a recorded failure
-        // reaches `ResultEnd` behind `TargetFailure`'s source.
+        // Through the memoizer's shared wrappers too.
         if let Some(t) = crate::engine::run_timeout::timed_out(e) {
             d.timed_out = Some(hcore::events::TimedOutData {
                 timeout_ms: t.timeout.as_millis(),
                 abandoned: t.abandoned_after.is_some(),
             });
+        }
+        // A surfaced failure holds no chain (D7b): what the chain did not
+        // say, its record does.
+        if let Some(record) = surfaced.map(|t| &t.record) {
+            if d.exit_status.is_none()
+                && let Some(x) = &record.exit
+            {
+                d.exit_status = Some(x.status.clone());
+                d.exit_code = x.code;
+            }
+            if d.timed_out.is_none() {
+                d.timed_out.clone_from(&record.timed_out);
+            }
         }
         d
     }

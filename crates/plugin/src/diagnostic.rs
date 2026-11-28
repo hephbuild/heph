@@ -162,7 +162,8 @@ pub fn find_diagnostic(e: &anyhow::Error) -> Option<&Diagnostic> {
 /// `hcore::hmemoizer::chain_frames` does). `e`'s own [`Diagnostic`]
 /// ([`find_diagnostic`]) is printed alone: when there is one, it is the only
 /// frame. A [`MultiError`] is one frame listing each member's cause, so every
-/// member is shown, each as this function shows it.
+/// member is shown, each as this function shows it. A surfaced
+/// [`TargetFailure`](crate::error::TargetFailure) is its record's diagnostic.
 pub fn cause_frames(e: &anyhow::Error) -> Vec<String> {
     if let Some(d) = find_diagnostic(e) {
         return vec![d.to_string()];
@@ -170,9 +171,16 @@ pub fn cause_frames(e: &anyhow::Error) -> Vec<String> {
     let texts: Vec<String> = hcore::hmemoizer::frames(e)
         .into_iter()
         .filter(|f| f.downcast_ref::<StageFrame>().is_none())
-        .map(|f| match f.downcast_ref::<MultiError>() {
-            Some(multi) => members_cause(multi),
-            None => f.error().to_string(),
+        .map(|f| {
+            if let Some(multi) = f.downcast_ref::<MultiError>() {
+                members_cause(multi)
+            } else if let Some(t) = f.downcast_ref::<crate::error::TargetFailure>() {
+                // A surfaced failure holds no chain (D7b): its cause is its
+                // record's diagnostic.
+                t.record.diagnostic.to_string()
+            } else {
+                f.error().to_string()
+            }
         })
         .filter(|s| !s.is_empty())
         .collect();

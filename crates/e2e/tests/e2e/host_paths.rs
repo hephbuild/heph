@@ -287,7 +287,7 @@ async fn run(engine: &Arc<Engine>, addr: &str) -> Ran {
             let causes: Vec<String> = rs
                 .take_failures()
                 .iter()
-                .map(|f| format!("{}: {:#}", f.addr.format(), f.source))
+                .map(|f| format!("{}: {:#}", f.addr.format(), crate::common::failure_text(f)))
                 .collect();
             if causes.is_empty() {
                 err

@@ -113,7 +113,7 @@ async fn failure_report_points_at_any_log_the_engine_holds() -> anyhow::Result<(
     let rs = engine.new_state();
     for addr in ["//p:t", "//p:never"] {
         let a = parse_addr(addr)?;
-        let failure = TargetFailure::new(a.clone(), None, anyhow::anyhow!("boom"));
+        let failure = TargetFailure::new(a.clone());
         // The record the engine compacts from a run that failed: only a
         // failure in or after the run has a log to name, or none of.
         let mut record = failure.record.as_ref().clone();

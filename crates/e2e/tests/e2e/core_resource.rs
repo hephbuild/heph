@@ -164,7 +164,7 @@ async fn build_events(engine: &Arc<Engine>, addr: &str) -> anyhow::Result<Vec<Bu
         anyhow::bail!("{}: {e:#}", a.format());
     }
     if let Some(f) = rs.take_failures().into_iter().next() {
-        anyhow::bail!("{}: {:#}", f.addr.format(), f.source);
+        anyhow::bail!("{}: {:#}", f.addr.format(), crate::common::failure_text(&f));
     }
     drop(rs);
     let mut events = Vec::new();

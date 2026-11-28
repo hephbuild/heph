@@ -202,8 +202,19 @@ impl Workspace {
                 }
                 let mut msg = String::new();
                 for f in &failures {
-                    msg.push_str(&format!("{}: {:#}", f.addr.format(), f.source));
-                    if let Some(tail) = &f.log_tail {
+                    msg.push_str(&format!(
+                        "{}: {}",
+                        f.addr.format(),
+                        f.record.diagnostic.message
+                    ));
+                    let tail = f.record.log.as_ref().and_then(|log| {
+                        hcore::failure_log::read_tail(
+                            log,
+                            hcore::failure_log::TAIL_LINES_CAP,
+                            hcore::failure_log::TAIL_MAX_BYTES,
+                        )
+                    });
+                    if let Some(tail) = tail {
                         msg.push_str(&format!("\nlast log lines:\n{}", tail.text));
                     }
                     msg.push('\n');
