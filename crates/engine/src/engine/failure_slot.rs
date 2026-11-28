@@ -43,6 +43,14 @@
 //!   lock, and when its next run starts, under its execute lock. To keep a warm
 //!   run free of a syscall per target, an engine lists `failures/` once and
 //!   clears only the slots it saw or filled.
+//! - **A slot for every fresh claim** ([`write_claim`]). The claim's
+//!   compacted record is written as `diagnostic.json`: into the slot the run
+//!   filled, under that fill's id, or into a slot of its own (manifest and
+//!   `diagnostic.json`, no revision) for a failure that kept nothing — one
+//!   before the run, or a BUILD file that did not evaluate (keyed by
+//!   [`file_key`]). In the background, counted on the request's `bg_pending`;
+//!   a fill or a clear of the same slot waits for it. Not for credential
+//!   material, nor for a record another request surfaced.
 //! - **No log for credential material.** A target whose outputs are material
 //!   gets its tail read into memory instead; its `failure_out` matches still
 //!   get an `out/` (what a target lists there is its author's to judge).
@@ -50,12 +58,14 @@
 //!   error surfaces as it would have.
 
 use crate::engine::driver::outputartifact::{Content, OutputArtifact, Type as ArtifactType};
+use crate::engine::sandbox_cleaner::PendingCounter;
 use hmodel::htaddr::Addr;
 use hplugin::error::{FailureLog, LogTail};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// The directory under the home that holds every slot.
 pub(crate) const FAILURES_DIR: &str = "failures";
@@ -200,6 +210,9 @@ pub struct FailureSlot {
     /// How many lines the slot's `log.txt` has, counted after the copy; 0
     /// with no log on disk.
     pub log_lines: u64,
+    /// The target's outputs are credential material ([`Fill::material`]):
+    /// the claim's `diagnostic.json` is not written for it.
+    pub material: bool,
 }
 
 impl FailureSlot {
@@ -294,6 +307,13 @@ pub struct FailureSlots {
     /// Slot names this engine knows exist: what `failures/` held when it was
     /// first listed, plus the slots filled since. Listed on first use.
     known: tokio::sync::OnceCell<std::sync::Mutex<HashSet<String>>>,
+    /// Claim writes ([`write_claim`]) registered and not yet done.
+    writes: PendingCounter,
+    /// One exclusion per slot key, held by a fill, a claim write or a clear
+    /// while it changes that slot: a clear or a fill never lands under a
+    /// claim write registered before it. An entry no one holds is pruned on
+    /// the next lookup.
+    slot_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     #[cfg(any(test, feature = "test-support"))]
     fills: std::sync::atomic::AtomicU64,
 }
@@ -311,9 +331,36 @@ impl FailureSlots {
         Self {
             root: home.join(FAILURES_DIR),
             known: tokio::sync::OnceCell::new(),
+            writes: PendingCounter::default(),
+            slot_locks: std::sync::Mutex::default(),
             #[cfg(any(test, feature = "test-support"))]
             fills: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Resolve once every claim write registered so far is done. For tests:
+    /// a claim's `diagnostic.json` lands in the background.
+    pub async fn writes_drained(&self) {
+        self.writes.wait_drained().await;
+    }
+
+    /// The exclusion of the slot `key`, pruning the entries no one holds.
+    fn slot_lock(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self
+            .slot_locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        locks.retain(|_, l| Arc::strong_count(l) > 1);
+        Arc::clone(locks.entry(key.to_owned()).or_default())
+    }
+
+    /// Whether someone holds or awaits the exclusion of the slot `key`.
+    fn slot_busy(&self, key: &str) -> bool {
+        self.slot_locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(key)
+            .is_some_and(|l| Arc::strong_count(l) > 1)
     }
 
     /// `<home>/failures`.
@@ -364,22 +411,27 @@ impl FailureSlots {
     /// Remove `addr`'s slot, if this engine knows of one. The first call lists
     /// `failures/`; afterwards a target with no slot costs a hash and a set
     /// lookup, never a syscall. Best-effort: a failure to remove is logged.
+    ///
+    /// A claim write registered for the slot before this call
+    /// ([`write_claim`]) lands first, and is then removed with it.
     pub async fn clear(&self, addr: &Addr) {
         let known = self.known().await;
+        let pending = self.writes.load(std::sync::atomic::Ordering::Acquire) > 0;
         let key = {
             let mut set = known
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             // The common case, a home with no failures: not even the key.
-            if set.is_empty() {
+            if set.is_empty() && !pending {
                 return;
             }
             let key = addr_key(addr);
-            if !set.remove(&key) {
+            if !set.remove(&key) && !(pending && self.slot_busy(&key)) {
                 return;
             }
             key
         };
+        let _excl = self.slot_lock(&key).lock_owned().await;
         let dir = self.root.join(&key);
         let removed = hcore::blocking::run(move || match std::fs::remove_dir_all(&dir) {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -401,7 +453,8 @@ impl FailureSlots {
     /// [`fill`](Self::fill) from the run's live log
     /// ([`crate::engine::run_log`]), read through its open descriptor: when
     /// the run had one, it is the log, and any `Log` the failure carries was
-    /// already imported into it or dropped. An empty live log keeps no log.
+    /// already imported into it or dropped. An empty live log, or none, keeps
+    /// an empty `log.txt` (RUN-19): the slot says the run printed nothing.
     pub(crate) async fn fill_live(
         &self,
         fill: Fill<'_>,
@@ -420,9 +473,12 @@ impl FailureSlots {
         ops: SlotIo,
     ) -> FailureSlot {
         let source = match live {
+            // RUN-19: a run that printed nothing keeps an empty log. Material
+            // keeps only a memory tail, and an empty one is no tail.
             Some(file) => file
                 .filter(|f| f.metadata().is_ok_and(|m| m.len() > 0))
-                .map(LogSource::Fd),
+                .map(LogSource::Fd)
+                .or_else(|| (!fill.material).then(|| LogSource::Bytes(Vec::new()))),
             None if fill.keep_log => select_log(fill.addr, fill.err),
             None => None,
         };
@@ -435,10 +491,12 @@ impl FailureSlots {
         if source.is_none() && out.is_none() && written.is_empty() {
             return FailureSlot {
                 fixes,
+                material: fill.material,
                 ..FailureSlot::default()
             };
         }
         let key = addr_key(fill.addr);
+        let excl = self.slot_lock(&key).lock_owned().await;
         let manifest = SlotManifest {
             version: MANIFEST_VERSION,
             addr: fill.addr.format(),
@@ -487,6 +545,7 @@ impl FailureSlots {
                 slot_log.as_ref(),
                 out.as_ref(),
                 &written,
+                None,
                 ops,
             );
             // The tar was packed for this fill alone: freed once read, whatever
@@ -534,6 +593,7 @@ impl FailureSlots {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .insert(key);
         }
+        drop(excl);
         if let (Some(hplugin::error::FailureFixes::Written { list, .. }), Some(path)) =
             (fixes.as_mut(), filled.fixes)
         {
@@ -548,6 +608,190 @@ impl FailureSlots {
             streamed: false,
             fill_id: filled.fill_id,
             log_lines: filled.log_lines,
+            material: fill.material,
+        }
+    }
+}
+
+/// What a fresh claim writes into the culprit's slot (P28): the claim's
+/// record as `diagnostic.json`, beside the log the run kept, or in a slot of
+/// its own for a failure that kept nothing (one before the run, a BUILD
+/// file that did not evaluate).
+pub(crate) struct ClaimWrite {
+    pub culprit: hplugin::error::Culprit,
+    /// The claim's record, compacted and scrubbed.
+    pub record: Arc<hcore::failure::FailureRecord>,
+    /// The id of the fill that kept the run's log or `out/`: the slot the
+    /// diagnostic joins. `None` builds a slot of its own.
+    pub fill_id: Option<String>,
+    /// For a file culprit: the packages its targets were reached through.
+    pub packages: Vec<String>,
+}
+
+impl ClaimWrite {
+    fn key(&self) -> String {
+        match &self.culprit {
+            hplugin::error::Culprit::Target(a) => addr_key(a),
+            hplugin::error::Culprit::File(rel) => file_key(rel),
+        }
+    }
+}
+
+/// Counts a claim write on its counters until dropped, however its task
+/// ends.
+struct Registered([PendingCounter; 2]);
+
+impl Registered {
+    fn new(counters: [PendingCounter; 2]) -> Self {
+        for c in &counters {
+            c.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
+        Self(counters)
+    }
+}
+
+impl Drop for Registered {
+    fn drop(&mut self) {
+        for c in &self.0 {
+            c.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+}
+
+/// Write `claim` into the failure slots of `engine`, in the background.
+///
+/// Registered here, synchronously, before the claim's winner returns: on
+/// `bg_pending` (the process does not exit before it lands) and on the
+/// slots' own count, with the slot's exclusion taken now when it is free. A
+/// clear or a fill of the slot that comes later waits for it. With no
+/// runtime it is written inline.
+pub(crate) fn write_claim(
+    engine: Arc<crate::engine::Engine>,
+    bg_pending: PendingCounter,
+    claim: ClaimWrite,
+) {
+    let key = claim.key();
+    let slots = &engine.failure_slots;
+    let lock = slots.slot_lock(&key);
+    let held = Arc::clone(&lock).try_lock_owned().ok();
+    let registered = Registered::new([bg_pending, Arc::clone(&slots.writes)]);
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn(async move {
+                let _registered = registered;
+                let _excl = match held {
+                    Some(g) => g,
+                    None => lock.lock_owned().await,
+                };
+                let root = engine.failure_slots.root.clone();
+                let (new_slot, key) =
+                    hcore::blocking::run(move || (write_claim_logged(&root, &key, &claim), key))
+                        .await;
+                if new_slot {
+                    engine
+                        .failure_slots
+                        .known()
+                        .await
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(key);
+                }
+            });
+        }
+        Err(_) => {
+            let _registered = registered;
+            let _excl = held.unwrap_or_else(|| lock.blocking_lock_owned());
+            if write_claim_logged(&slots.root, &key, &claim)
+                && let Some(known) = slots.known.get()
+            {
+                known
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(key);
+            }
+        }
+    }
+}
+
+/// [`write_claim_files`], under the slot's exclusion. Never fails: it logs.
+fn write_claim_logged(root: &Path, key: &str, claim: &ClaimWrite) -> bool {
+    match write_claim_files(root, key, claim) {
+        Ok(new_slot) => new_slot,
+        Err(e) => {
+            tracing::warn!(culprit = %claim.culprit, error = %format!("{e:#}"), "keeping the failure's diagnostic");
+            false
+        }
+    }
+}
+
+/// [`write_claim`]'s files: into the slot the run filled, or a slot of its
+/// own. True when it built a slot of its own.
+fn write_claim_files(root: &Path, key: &str, claim: &ClaimWrite) -> anyhow::Result<bool> {
+    use anyhow::Context as _;
+    match &claim.fill_id {
+        Some(id) => {
+            let dir = root.join(key);
+            // The run's slot, unless it was replaced or cleared since.
+            match hcore::failure_log::peek_fill_id(&dir) {
+                Ok(Some(found)) if found == *id => {}
+                found => {
+                    tracing::debug!(culprit = %claim.culprit, ?found, "the run's slot is gone or replaced; no diagnostic");
+                    return Ok(false);
+                }
+            }
+            let bytes = hcore::failure_log::encode_diagnostic(&claim.record, Some(id))
+                .context("encoding the failure's diagnostic")?;
+            let tmp = dir.join(format!(
+                "{TEMP_PREFIX}diagnostic-{}",
+                uuid::Uuid::new_v4().as_simple()
+            ));
+            let written = std::fs::write(&tmp, bytes)
+                .with_context(|| format!("writing {}", tmp.display()))
+                .and_then(|()| {
+                    let to = dir.join(DIAGNOSTIC);
+                    std::fs::rename(&tmp, &to)
+                        .with_context(|| format!("renaming {} to {}", tmp.display(), to.display()))
+                });
+            match written {
+                Ok(()) => Ok(false),
+                Err(e) => {
+                    drop(std::fs::remove_file(&tmp));
+                    if e.downcast_ref::<io::Error>()
+                        .is_some_and(|e| e.kind() == io::ErrorKind::NotFound)
+                    {
+                        tracing::debug!(culprit = %claim.culprit, "the run's slot went while its diagnostic was written");
+                        return Ok(false);
+                    }
+                    Err(e)
+                }
+            }
+        }
+        None => {
+            let fill_id = new_fill_id();
+            let bytes = hcore::failure_log::encode_diagnostic(&claim.record, Some(&fill_id))
+                .context("encoding the failure's diagnostic")?;
+            let manifest = SlotManifest {
+                version: MANIFEST_VERSION,
+                addr: match &claim.culprit {
+                    hplugin::error::Culprit::Target(a) => a.format(),
+                    hplugin::error::Culprit::File(rel) => format!("{FILE_ADDR_PREFIX}{rel}"),
+                },
+                hashin: None,
+                failed_at: crate::engine::event::now_unix_ms(),
+                fill_id: Some(fill_id),
+                packages: claim.packages.clone(),
+            };
+            fill_slot(
+                root,
+                key,
+                &manifest,
+                None,
+                None,
+                &[],
+                Some(&bytes),
+                SlotIo::REAL,
+            )?;
+            Ok(true)
         }
     }
 }
@@ -768,6 +1012,13 @@ struct Built {
 /// rest of the slot, unless there is neither a log nor a fixes list to keep.
 /// Anything else that fails before the rename leaves the old slot as it was
 /// and the temporary directory removed.
+///
+/// `diagnostic` is a claim's `diagnostic.json`, for a slot that keeps only
+/// that ([`write_claim`]).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each a part of the slot, passed through from one of two fills"
+)]
 fn fill_slot(
     root: &Path,
     key: &str,
@@ -775,6 +1026,7 @@ fn fill_slot(
     log: Option<&LogSource>,
     out: Option<&OutputArtifact>,
     fixes: &[String],
+    diagnostic: Option<&[u8]>,
     ops: SlotIo,
 ) -> anyhow::Result<Built> {
     use anyhow::Context as _;
@@ -833,6 +1085,10 @@ fn fill_slot(
         let mut list = fixes.join("\n");
         list.push('\n');
         std::fs::write(&path, list).with_context(|| format!("writing {}", path.display()))?;
+    }
+    if let Some(bytes) = diagnostic {
+        let path = temp.path().join(DIAGNOSTIC);
+        std::fs::write(&path, bytes).with_context(|| format!("writing {}", path.display()))?;
     }
     // Last: a slot is complete exactly when its manifest exists.
     let json = serde_json::to_vec(manifest).context("encoding the failure manifest")?;
@@ -1213,6 +1469,7 @@ mod tests {
             Some(&LogSource::Bytes(b"old\n".to_vec())),
             None,
             &[],
+            None,
             SlotIo::REAL,
         )
         .expect("first fill");
@@ -1225,6 +1482,7 @@ mod tests {
             Some(&LogSource::File(src)),
             None,
             &[],
+            None,
             SlotIo {
                 copy: |from, to| {
                     // Half a copy, then the disk fills.
@@ -1259,6 +1517,7 @@ mod tests {
             Some(&LogSource::File(src.clone())),
             None,
             &[],
+            None,
             SlotIo::REAL,
         )
         .expect("fill")

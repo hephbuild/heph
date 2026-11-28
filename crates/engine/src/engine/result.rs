@@ -2312,6 +2312,11 @@ fn record_culprit(
     let slot = downcast_chain_ref::<crate::engine::failure_slot::FailureSlot>(&e);
     let fixes = slot.and_then(|s| s.fixes.clone());
     let sandbox = slot.and_then(|s| s.sandbox.clone());
+    // The run's slot the claim's diagnostic joins, and whether it is
+    // credential material's, which gets none (a lead decision: see
+    // `write_claim_for`).
+    let slot_fill = slot.and_then(|s| s.fill_id.clone());
+    let material = slot.is_some_and(|s| s.material);
     let streamed = crate::engine::failure_slot::RunStreamed::on(&e);
     // Walked before the claim, never under the failures lock (`dep_dag`
     // stays a leaf). Skipped when another caller already holds the claim:
@@ -2345,6 +2350,20 @@ fn record_culprit(
         record.path = path.iter().map(Addr::format).collect();
         Arc::new(record)
     });
+    let claim = record
+        .as_ref()
+        .filter(|r| !r.surface_top && !material)
+        .map(|r| crate::engine::failure_slot::ClaimWrite {
+            culprit: culprit.clone(),
+            record: Arc::clone(r),
+            fill_id: slot_fill,
+            // The package of the target that led into the file (the path
+            // ends there too, so it names no other).
+            packages: match &culprit {
+                Culprit::File(_) => vec![entry.package.as_str().to_owned()],
+                Culprit::Target(_) => Vec::new(),
+            },
+        });
     let mut failure = TargetFailure::new(entry, log_tail, e);
     if let Some(record) = record {
         failure = failure.with_record(record);
@@ -2365,10 +2384,31 @@ fn record_culprit(
                 .with_streamed(streamed),
         ),
     );
+    if fresh && let Some(claim) = claim {
+        write_claim_for(rs, claim);
+    }
     if fresh && let Some((detail, path, entry)) = announce {
         announce_culprit(rs, &culprit, &entry, detail, &path);
     }
     (UpstreamFailed { root: culprit }.into(), fresh)
+}
+
+/// A fresh claim's record into its culprit's failure slot, in the
+/// background, counted on `bg_pending` ([`failure_slot::write_claim`]).
+///
+/// Not for credential material: a run whose outputs are material keeps no
+/// log on disk, and its record keeps none either (a lead decision). A
+/// material target that fails before it runs has no slot on the chain to
+/// say so and still gets a slot holding only `diagnostic.json`, already
+/// scrubbed. Not for a record another request surfaced (`surface_top`):
+/// that request wrote it.
+///
+/// [`failure_slot::write_claim`]: crate::engine::failure_slot::write_claim
+fn write_claim_for(rs: &RequestState, claim: crate::engine::failure_slot::ClaimWrite) {
+    let Some(engine) = rs.data.engine.upgrade() else {
+        return;
+    };
+    crate::engine::failure_slot::write_claim(engine, rs.bg_pending(), claim);
 }
 
 /// [`FailureFate::Each`]: each culprit's members recorded against it, and a
@@ -12419,6 +12459,116 @@ mod tests {
         let _ = classify_failure(&rs, &addr, process_failed_with_log(&log_path));
         let recorded = rs.get_failure(&addr).expect("recorded");
         assert!(recorded.log_tail.is_none() && recorded.log.is_none());
+        Ok(())
+    }
+
+    /// A fresh claim's `diagnostic.json` lands in the background, counted on
+    /// the request's `bg_pending` from the moment the claim is won: the
+    /// process, which waits for that count, never exits before it lands.
+    /// It joins the slot the run filled, under that fill's id, and the
+    /// record names the log by the same id.
+    #[tokio::test]
+    async fn process_waits_for_the_write() -> anyhow::Result<()> {
+        let engine = engine_with(vec![static_target("//pkg:a", &[], &[])])?;
+        let rs = engine.new_state();
+        let addr = hmodel::htaddr::parse_addr("//pkg:a")?;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log_path = dir.path().join("log.txt");
+        std::fs::write(&log_path, "one\ntwo\n")?;
+        let e = slotted(
+            &engine,
+            &rs,
+            &addr,
+            dir.path(),
+            process_failed_with_log(&log_path),
+        )
+        .await;
+        let slot = engine.failure_slots.slot_dir(&addr);
+        let _ = classify_failure(&rs, &addr, e);
+        // Nothing has yielded since the claim: the write is registered, not
+        // done.
+        assert!(rs.bg_pending().load(Ordering::Acquire) > 0);
+        assert!(!slot.join(hcore::failure_log::DIAGNOSTIC).exists());
+
+        rs.bg_pending().wait_drained().await;
+        let diag = hcore::failure_log::read_diagnostic(&slot).expect("diagnostic.json");
+        assert_eq!(diag.diagnostic.addr.as_deref(), Some("//pkg:a"));
+        assert!(diag.log.is_none(), "the log is the slot's own file");
+        let recorded = rs.get_failure(&addr).expect("recorded");
+        let log = recorded.record.log.as_ref().expect("log ref");
+        let manifest = engine.failure_slots.read(&addr).expect("slot");
+        assert_eq!(log.fill_id, manifest.fill_id);
+        assert_eq!(log.lines, 2);
+        assert_eq!(engine.failure_slots.fills(), 1, "a diagnostic is no fill");
+        Ok(())
+    }
+
+    /// A failure before the run (no slot on the chain) gets a slot of its
+    /// own, and a clear of it that comes right after the claim waits for the
+    /// write and then removes it: the write never lands after the clear.
+    #[tokio::test]
+    async fn clear_waits_for_a_pending_write() -> anyhow::Result<()> {
+        let engine = engine_with(vec![static_target("//pkg:a", &[], &[])])?;
+        let addr = hmodel::htaddr::parse_addr("//pkg:a")?;
+        let slot = engine.failure_slots.slot_dir(&addr);
+
+        // The control: left alone, the write builds the slot.
+        let rs = engine.new_state();
+        let _ = classify_failure(&rs, &addr, anyhow::anyhow!("def failed"));
+        engine.failure_slots.writes_drained().await;
+        let manifest = engine.failure_slots.read(&addr).expect("a pre-run slot");
+        assert_eq!(manifest.hashin, None);
+        assert!(!slot.join(hcore::failure_log::LOG).exists());
+        let diag = hcore::failure_log::read_diagnostic(&slot).expect("diagnostic.json");
+        assert!(diag.diagnostic.message.contains("def failed"), "{diag:?}");
+        engine.failure_slots.clear(&addr).await;
+        assert!(!slot.exists());
+
+        // An engine that has listed `failures/` (empty) and has not seen the
+        // write land: the clear must still wait for it.
+        let rs = engine.new_state();
+        let _ = classify_failure(&rs, &addr, anyhow::anyhow!("def failed again"));
+        engine.failure_slots.clear(&addr).await;
+        engine.failure_slots.writes_drained().await;
+        assert!(!slot.exists(), "the write landed after the clear");
+        Ok(())
+    }
+
+    /// A fill of the slot that comes right after a claim's write waits for
+    /// it: the slot left is the fill's, never the write's over it.
+    #[tokio::test]
+    async fn fill_waits_for_a_pending_write() -> anyhow::Result<()> {
+        let engine = engine_with(vec![static_target("//pkg:a", &[], &[])])?;
+        let addr = hmodel::htaddr::parse_addr("//pkg:a")?;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log_path = dir.path().join("log.txt");
+        std::fs::write(&log_path, "the run\n")?;
+
+        let rs = engine.new_state();
+        let _ = classify_failure(&rs, &addr, anyhow::anyhow!("def failed"));
+        let e = slotted(
+            &engine,
+            &engine.new_state(),
+            &addr,
+            dir.path(),
+            process_failed_with_log(&log_path),
+        )
+        .await;
+        engine.failure_slots.writes_drained().await;
+        let fill = downcast_chain_ref::<crate::engine::failure_slot::FailureSlot>(&e)
+            .and_then(|s| s.fill_id.clone())
+            .expect("the fill's id");
+        let slot = engine.failure_slots.slot_dir(&addr);
+        let manifest = engine.failure_slots.read(&addr).expect("slot");
+        assert_eq!(manifest.fill_id.as_deref(), Some(fill.as_str()));
+        assert_eq!(
+            std::fs::read_to_string(slot.join(hcore::failure_log::LOG))?,
+            "the run\n"
+        );
+        assert!(
+            hcore::failure_log::read_diagnostic(&slot).is_none(),
+            "the write's diagnostic is not the fill's"
+        );
         Ok(())
     }
 
