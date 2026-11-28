@@ -207,6 +207,26 @@ fn failure_then_ctrl_c_exits_130() {
     );
 }
 
+/// RUN-24: under `--fail-fast`, `bad`'s failure stops its sibling `slow`.
+/// That stop is heph's, not the user's, so the run exits 1, never 130,
+/// whether `slow` was running, queued or not yet started when `bad` failed.
+/// Which one it is depends on scheduling, so the run is repeated.
+#[test]
+fn fail_fast_after_failure_exits_1() {
+    let dist = Dist::locate();
+    let ws = Workspace::new().expect("workspace");
+    ws.write("pkg/BUILD", CANCEL_BUILD).expect("write BUILD");
+    for i in 0..20 {
+        let out = ws
+            .run(
+                &dist,
+                &["run", "--fail-fast", "-e", "//pkg:slow || //pkg:bad"],
+            )
+            .expect("run");
+        assert_eq!(out.status.code(), Some(1), "run {i}: {}", describe(&out));
+    }
+}
+
 /// SIGTERM is a cancel, as Ctrl-C is: heph stops the build and exits 130,
 /// rather than dying of the signal.
 #[test]
