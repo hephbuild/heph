@@ -1,5 +1,5 @@
 use crate::engine::Engine;
-use crate::engine::deferred::declared_origin;
+use crate::engine::deferred::{declared_origin, origin_field};
 use crate::engine::driver::TargetAddr;
 use crate::engine::driver::targetdef::{Input, InputMode, TargetDef};
 use crate::engine::error::{InputDefFailed, MissingDep, MultiError};
@@ -554,7 +554,7 @@ impl Engine {
                                     transitive_origin(&input.origin_id)
                                         .unwrap_or_else(|| declared_origin(&input.origin_id))
                                 },
-                                |_| rs.decl_loc(declarer),
+                                |o| rs.decl_field_loc(declarer, origin_field(o)),
                                 |e| {
                                     e.context(InputDefFailed {
                                         input: dep.clone(),

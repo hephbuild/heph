@@ -628,9 +628,23 @@ async fn missing_dep_names_the_declaring_call() -> anyhow::Result<()> {
         text.contains("//c:y depends on //d:missing, which does not exist"),
         "{text}"
     );
-    assert!(text.contains("(`deps`, declared at c/BUILD:2:"), "{text}");
+    // At the `deps` option of the declaring call, not the call's start.
+    let col = c
+        .lines()
+        .nth(1)
+        .and_then(|l| l.find("deps"))
+        .expect("deps on line 2")
+        + 1;
+    assert!(
+        text.contains(&format!("(`deps`, declared at c/BUILD:2:{col}")),
+        "{text}"
+    );
     let at = f.record.diagnostic.location.as_ref().expect("a location");
-    assert_eq!((at.file.as_str(), at.line), ("c/BUILD", 2), "{at}");
+    assert_eq!(
+        (at.file.as_str(), at.line, at.col as usize),
+        ("c/BUILD", 2, col),
+        "{at}"
+    );
     Ok(())
 }
 
