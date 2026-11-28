@@ -13,7 +13,7 @@ import (
 
 // The page data format. A fix-round agent reads these files, not the page;
 // FORMAT.md beside the skill documents them.
-const pageFormat = "heph-review-brief/1"
+const pageFormat = "heph-review-brief/2"
 
 // Sums are a layer's changed lines per tier. The tiers sum to Total, which
 // equals `git diff --numstat` for the layer's range (I1).
@@ -26,6 +26,9 @@ type Sums struct {
 	AIClearedScout int `json:"ai_cleared_read_by_scout_only"`
 	Counted        int `json:"counted"`
 	Untriaged      int `json:"untriaged"`
+	// Settled is live lines only items the user settled in an earlier
+	// round cover, with their code unchanged: out of the tiers, still counted.
+	Settled int `json:"settled"`
 }
 
 type PageCommit struct {
@@ -97,6 +100,9 @@ type PageCard struct {
 	Provenance  Provenance  `json:"provenance"`
 	OtherLayers []PageOther `json:"other_layers,omitempty"`
 	Floors      []string    `json:"floors,omitempty"` // why a line under it could not go lower
+	// EarlierRound is the user's answer on an earlier round's page about
+	// this code, from the decisions file.
+	EarlierRound *PageEarlier `json:"earlier_round,omitempty"`
 }
 
 type PageCounted struct {
@@ -119,6 +125,7 @@ type PageLayer struct {
 	Overflow     bool          `json:"overflow"`
 	Confirmation string        `json:"confirmation,omitempty"`
 	Cards        []PageCard    `json:"cards"`
+	Settled      []PageCard    `json:"settled"` // settled in an earlier round, code unchanged
 	Untriaged    []PageRange   `json:"untriaged"`
 	Counted      []PageCounted `json:"counted"`
 	Weakenings   []Weakening   `json:"weakenings"`
@@ -186,6 +193,8 @@ type RenderInput struct {
 	Scouts         []Scout
 	SpecTests      []string
 	AllowUntriaged bool
+	// Decisions are the user's answers from earlier rounds' pages.
+	Decisions *DecisionsFile
 	// FreshnessAPI is where the page asks for each PR's head ("" is
 	// GitHub's API); tests point it at a local server.
 	FreshnessAPI string
@@ -241,6 +250,9 @@ func (st *Stack) Render(in RenderInput, pagePath, outDir string) error {
 			ref.add("scout %s: format %q, want %q", s.Agent, s.Format, scoutFormat)
 		}
 	}
+	if in.Decisions != nil {
+		ref = append(ref, in.Decisions.check(stackKeyOf(st.Pin))...)
+	}
 	Merge(t, in.Audit, &ref)
 
 	weak := map[int][]Weakening{}
@@ -286,7 +298,7 @@ func (st *Stack) Render(in RenderInput, pagePath, outDir string) error {
 		Repo:         st.Pin.Repo,
 		Trunk:        st.Pin.Trunk,
 		Mode:         st.Pin.Mode,
-		StackKey:     fmt.Sprintf("%s#%d", st.Pin.Repo, st.Layers[0].PR),
+		StackKey:     stackKeyOf(st.Pin),
 		FreshnessAPI: "https://api.github.com/repos/" + st.Pin.Repo + "/pulls/",
 		Decisions:    []PageDecision{},
 		NotInCode:    append([]NotInCode{}, t.NotInCode...),
@@ -299,8 +311,9 @@ func (st *Stack) Render(in RenderInput, pagePath, outDir string) error {
 	}
 	manifest := Manifest{Format: pageFormat, Files: map[string]string{}, Sums: map[string]Sums{}}
 	symbols := st.symbolIndex()
+	dc := st.newDecisionContext(in.Decisions)
 	for _, d := range st.Layers {
-		pl, diffs, err := st.renderLayer(d, t, in.Audit, untriaged[d.PR], weak[d.PR], symbols)
+		pl, diffs, err := st.renderLayer(d, t, in.Audit, untriaged[d.PR], weak[d.PR], symbols, dc)
 		if err != nil {
 			return fmt.Errorf("layer #%d: %w", d.PR, err)
 		}
@@ -521,9 +534,9 @@ func contextHash(lines []string, start, end int) string {
 	return hex.EncodeToString(h.Sum(nil))[:12]
 }
 
-func (st *Stack) renderLayer(d *LayerData, t *Triage, a *Audit, untriaged []*CLine, weak []Weakening, symbols map[int]map[string]map[string]bool) (*PageLayer, *PageDiffs, error) {
+func (st *Stack) renderLayer(d *LayerData, t *Triage, a *Audit, untriaged []*CLine, weak []Weakening, symbols map[int]map[string]map[string]bool, dc *decisionContext) (*PageLayer, *PageDiffs, error) {
 	pl := &PageLayer{Format: pageFormat, PR: d.PR, Live: d.LiveLines(), Weakenings: weak, Fingerprint: d.Fingerprint(),
-		Cards: []PageCard{}, Untriaged: []PageRange{}, Counted: []PageCounted{}}
+		Cards: []PageCard{}, Settled: []PageCard{}, Untriaged: []PageRange{}, Counted: []PageCounted{}}
 	if pl.Weakenings == nil {
 		pl.Weakenings = []Weakening{}
 	}
@@ -630,6 +643,7 @@ func (st *Stack) renderLayer(d *LayerData, t *Triage, a *Audit, untriaged []*CLi
 	}
 
 	tiers := lineTiers(d, t.Items)
+	var live, settled []Item // the items still in the tiers, and those the user settled earlier
 	for _, it := range t.Items {
 		if it.Layer != d.PR {
 			continue
@@ -697,6 +711,20 @@ func (st *Stack) renderLayer(d *LayerData, t *Triage, a *Audit, untriaged []*CLi
 		for _, tr := range it.Tests {
 			c.Tests = append(c.Tests, PageTest{Name: tr.Name, Link: st.testLink(d, tr)})
 		}
+		var hashes, anchors []string
+		for _, r := range c.Ranges {
+			hashes, anchors = append(hashes, r.Hash), append(anchors, r.Anchor)
+		}
+		moved, earlier := dc.forItem(hashes, anchors)
+		c.EarlierRound = earlier
+		if moved {
+			// Settled earlier, code unchanged: not asked again, and off the
+			// card budget, but its lines still count (I1).
+			settled = append(settled, it)
+			pl.Settled = append(pl.Settled, c)
+			continue
+		}
+		live = append(live, it)
 		if c.Tier == TierScrutinize {
 			pl.Used.Cards++
 			pl.Used.Lines += changed
@@ -704,6 +732,10 @@ func (st *Stack) renderLayer(d *LayerData, t *Triage, a *Audit, untriaged []*CLi
 		pl.Cards = append(pl.Cards, c)
 	}
 	sort.SliceStable(pl.Cards, func(i, j int) bool { return pl.Cards[i].Tier > pl.Cards[j].Tier })
+	// A line counts at the highest tier of the items still in the tiers;
+	// one only settled items cover counts as settled.
+	tiers = lineTiers(d, live)
+	settledLines := lineTiers(d, settled)
 	pl.Overflow = pl.Used.Cards > pl.Budget.Cards || pl.Used.Lines > pl.Budget.Lines
 
 	for _, rr := range collapse(untriaged) {
@@ -722,7 +754,12 @@ func (st *Stack) renderLayer(d *LayerData, t *Triage, a *Audit, untriaged []*CLi
 			pl.Sums.Counted++
 			continue
 		}
-		switch tiers[cl] {
+		tier, ok := tiers[cl]
+		if _, s := settledLines[cl]; !ok && s {
+			pl.Sums.Settled++
+			continue
+		}
+		switch tier {
 		case TierScrutinize:
 			pl.Sums.Scrutinize++
 		case TierGlance:
@@ -762,6 +799,9 @@ func (st *Stack) renderLayer(d *LayerData, t *Triage, a *Audit, untriaged []*CLi
 	}
 	for i := range pl.Cards {
 		fill(pl.Cards[i].Ranges)
+	}
+	for i := range pl.Settled {
+		fill(pl.Settled[i].Ranges)
 	}
 	fill(pl.Untriaged)
 	return pl, diffs, nil

@@ -9,8 +9,8 @@ import (
 // none of them carries a diff, a SHA or a line count (I2).
 
 const (
-	triageFormat  = "heph-review-brief-triage/2"
-	auditFormat   = "heph-review-brief-audit/1"
+	triageFormat  = "heph-review-brief-triage/3"
+	auditFormat   = "heph-review-brief-audit/2"
 	surfaceFormat = "heph-review-brief-surface/1"
 	scoutFormat   = "heph-review-brief-scout/1"
 )
@@ -82,9 +82,12 @@ type Item struct {
 }
 
 // Option is one answer to a card's question and what follows from it.
+// Change says whether the answer asks for a code change: picking one that
+// does not settles the card, picking one that does requests the change.
 type Option struct {
 	Choice string `json:"choice"`
 	Impact string `json:"impact"`
+	Change bool   `json:"change"`
 }
 
 // Example is a concrete picture of how a change shows up: an error message,

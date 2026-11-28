@@ -50,14 +50,15 @@ side, runs past the file's end, or holds none of the layer's changed lines.
 
 ## The four inputs
 
-### triage.json: `heph-review-brief-triage/2`
+### triage.json: `heph-review-brief-triage/3`
 
 The decider's answer. Version 2 added the card text a reviewer who has not read the code needs:
-`title`, `context`, `options`, `examples`, `diagram` and `used_by`. A version 1 file is refused.
+`title`, `context`, `options`, `examples`, `diagram` and `used_by`. Version 3 added each option's
+`change`, since a card's answer is now its decision. An older file is refused.
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `format` | string | `heph-review-brief-triage/2` |
+| `format` | string | `heph-review-brief-triage/3` |
 | `items` | Item[] | Every card and group |
 | `not_in_code` | NotInCode[], optional | Points with no code to show (I12). Not cards |
 | `reads` | Read[] | What the decider read |
@@ -88,8 +89,13 @@ The decider's answer. Version 2 added the card text a reviewer who has not read 
 | `tiered_by` | string, optional | Defaults to `decider` |
 | `raised_by` | string, optional | Set by render when the stack reviewer promotes the item. Leave it empty |
 
-**Option**: `choice` (at most 80 characters) and `impact` (at most 300): what follows if the
-reviewer picks that choice, who is affected, and what changes, breaks or stays deferred.
+**Option**: `choice` (at most 80 characters), `impact` (at most 300): what follows if the
+reviewer picks that choice, who is affected, and what changes, breaks or stays deferred; and
+`change` (bool): `true` when the answer asks for a code change, `false` when the code stays as
+it is (accept, ignore, defer). Picking a `change: false` answer settles the card; picking a
+`change: true` one requests the change. A Scrutinize card has at least one of each, so "it's
+fine" is always one click. Render refuses a card without one with `no option has change: false`
+or `no option has change: true`.
 
 **Example**: `label` (at most 40 characters, such as "Before", "After", "What a user sees") and
 `text` (plain text, at most 30 lines, shown preformatted).
@@ -116,13 +122,14 @@ reviewer picks that choice, who is affected, and what changes, breaks or stays d
 
 A live line's tier is the highest tier of any item covering it, so a line counts once.
 
-### audit.json: `heph-review-brief-audit/1`
+### audit.json: `heph-review-brief-audit/2`
 
-The stack reviewer's answer. It can only promote (I4).
+The stack reviewer's answer. It can only promote (I4). Version 2: its options carry `change`, as
+the triage's do.
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `format` | string | `heph-review-brief-audit/1` |
+| `format` | string | `heph-review-brief-audit/2` |
 | `assessment` | Assessment | One paragraph on the stack, top of the page. Required |
 | `promotions` | Promotion[], optional | Items it raises |
 | `items` | Item[], optional | New items, reason `stack-design` or `decision`. `proposed_by` and `tiered_by` default to `stack-review` |
@@ -185,6 +192,38 @@ line), `ranges`, and the optional proposals `context`, `examples`, `diagram` and
 the Item's shapes. Render does not check a scout's proposals; it checks what the decider copies
 into the triage.
 
+### decisions: `heph-review-brief-decisions/1`
+
+The user's answers, carried from one round's page to the next. The page's "Copy decisions for
+the next round" copies a block inside a ```` ```json ```` fence; the user pastes it into the next
+`/review-brief` session; `brief decisions merge --pin pin.json --in <block> --state
+$ST/decisions.json` folds it into the file kept across rounds, which has the same format. Merge
+accepts the block with or without its fence.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `format` | string | `heph-review-brief-decisions/1` |
+| `stack_key` | string | As in stack.json. A block from another stack is refused |
+| `bottom_pr` | int | The stack's bottom PR |
+| `heads` | object[] | Each `pr` and `head`: the pinned heads of the page it was copied from |
+| `copied_at` | string | RFC 3339 time of the copy |
+| `decisions` | Decision[] | One per card or item with an answer |
+
+**Decision**: `layer`, `card` (the item id), `title`, `question` (empty for a Glance or AI-cleared
+item), `decision` (`settled`: the answer keeps the code; `change`: it asks for a change),
+`choice` (the answer: an option's `choice`, `Something else`, `Fine` or `Needs a change`; empty
+for a legacy concern with no answer), `note`, `ranges` (each `path`, `side`, `start`, `end`,
+`hash`, `anchor` and `changed`, from the PageRange), and in the kept file `copied_at`, the time
+of the block it came from.
+
+Merge is keyed by range hash, newest block wins: a range's hash belongs to the newest decision
+naming it, and an older decision keeps only the ranges no newer one names.
+
+Where a decision's code is now, which index and render compute from the pins, never the model:
+**unchanged** (some layer still changes exactly the lines the hash was taken over, by
+`rangeHash`), **changed** (not all of them, but a live line at one of its anchors is still
+changed), or **gone**.
+
 ## Program-written intermediates
 
 These are written by `brief pin` and `brief index` and read back by the program. Agents read
@@ -199,7 +238,10 @@ them; nobody writes them by hand.
   `description` (the pinned PR description) and `commits` (the range's commits, oldest first,
   each `sha`, `subject`, `body`); `index.md` quotes both as data;
   `duplicates` (pairs of LayerRef `a`, `b`); `files_touched_by_several_layers` (`path`,
-  `layers`). `index.md` is the same content as text, one section per layer.
+  `layers`); with `--decisions`, `earlier_decisions` (each a Decision plus `status`, one of
+  `unchanged`, `changed`, `gone`; `instruction`, what the decider does with it; and `now`, the
+  live LayerRefs at its anchors when it changed). `index.md` is the same content as text, one
+  section per layer, then "Earlier decisions" with the user's notes quoted as data.
 
 **Weakening**: `id`, `kind` (`deleted-test`, `new-ignore`, `lost-assertions`,
 `missing-spec-test`), `test`, `range` (optional RangeRef), `detail`. Ids are
@@ -212,7 +254,8 @@ rebase keeps it; a changed diff or a changed set of live lines moves it.
 ## The page data
 
 `brief render` writes these into its output directory, through a temp directory swapped in
-whole, so a refused render changes nothing. Every file has `format: "heph-review-brief/1"`.
+whole, so a refused render changes nothing. Every file has `format: "heph-review-brief/2"`.
+Version 2 added the `settled` sum, the layer's `settled` list and the card's `earlier_round`.
 
 ### manifest.json
 
@@ -225,8 +268,10 @@ The page refuses to draw the ledger when a file's hash or a layer's sums do not 
 
 **Sums**: `total` (the layer's changed lines, equal to `git diff --numstat`), `scrutinize`,
 `glance`, `ai_cleared`, `ai_cleared_read_by_decider_or_stack_review`,
-`ai_cleared_read_by_scout_only`, `counted`, `untriaged`. The tiers, `counted` and `untriaged`
-sum to `total`; the two `ai_cleared_read_by_*` split `ai_cleared`.
+`ai_cleared_read_by_scout_only`, `counted`, `untriaged`, `settled`. The tiers, `counted`,
+`untriaged` and `settled` sum to `total`; the two `ai_cleared_read_by_*` split `ai_cleared`.
+`settled` is live lines that only items in the layer's `settled` list cover: a line any other
+item covers counts at that item's tier.
 
 ### stack.json
 
@@ -256,7 +301,8 @@ One per layer, N its PR number.
 | `budget`, `used` | `{lines, cards}` | The Scrutinize budget, and what the cards use |
 | `overflow` | bool | `used` is over `budget`. Every card is still in `cards` (I7) |
 | `confirmation` | string, optional | The stack reviewer's AI-approved line |
-| `cards` | Card[] | Every item of the layer, highest tier first |
+| `cards` | Card[] | Every item of the layer, highest tier first, except the settled ones |
+| `settled` | Card[] | Items whose every range hash the user settled in an earlier round (render `--decisions`), code unchanged. Out of the tiers and the card budget, shown under "Settled earlier" with the earlier answer |
 | `untriaged` | PageRange[] | Live lines no item covers. Empty on a valid brief |
 | `counted` | Counted[] | One row per file and class |
 | `weakenings` | Weakening[] | What the program found |
@@ -268,7 +314,11 @@ One per layer, N its PR number.
 `tests` (each `name` and
 `link`), `board` (BoardNote[]), `weakenings`, `provenance` (`proposed_by`, `tiered_by`,
 `raised_by`), `other_layers` (each `pr`, `symbol`, `link`: other layers that change the same
-function), `floors` (the flags that held a line at this tier, such as `protected`).
+function), `floors` (the flags that held a line at this tier, such as `protected`), and
+`earlier_round`, optional: the user's answer on an earlier page about this code, each `decision`
+(`settled` or `change`), `choice`, `note` and `code`. `code` is `unchanged` on a settled item
+and on a card whose code the user asked to change and that still has it ("not done yet"), and
+`changed` when the code moved since the answer ("in an earlier round you answered").
 
 `display` is `embed` (up to 80 changed lines: the diff is in the diffs file), `links` (larger:
 read the ranges in order), or `file` (a whole new or rewritten file: start from `start_from`).

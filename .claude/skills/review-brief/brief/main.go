@@ -6,7 +6,12 @@
 //	brief index  --pin pin.json [--spec-tests names.txt] --out DIR
 //	brief render --pin pin.json --triage triage.json [--audit audit.json]
 //	             [--surface surface.json] --scout scout.json... [--spec-tests names.txt]
-//	             --page page.html --out DIR [--allow-untriaged]
+//	             --page page.html --out DIR [--allow-untriaged] [--decisions decisions.json]
+//	brief decisions merge --pin pin.json --in block.json --state decisions.json
+//
+// decisions merge folds the block the page copies ("Copy decisions for the
+// next round") into the file kept across rounds; index and render read it
+// with --decisions (index also takes --decisions).
 //
 // index writes index.json and index.md: every changed line classified, the
 // live lines as ranges with their floors, the weakenings, the files several
@@ -41,6 +46,12 @@ func main() {
 		err = cmdIndex(os.Args[2:])
 	case "render":
 		err = cmdRender(os.Args[2:])
+	case "decisions":
+		if len(os.Args) < 3 || os.Args[2] != "merge" {
+			err = errors.New("usage: brief decisions merge --pin pin.json --in block.json --state decisions.json")
+			break
+		}
+		err = cmdDecisionsMerge(os.Args[3:])
 	default:
 		err = fmt.Errorf("unknown command %q", os.Args[1])
 	}
@@ -163,6 +174,7 @@ func cmdIndex(args []string) error {
 	pinPath := fs.String("pin", "", "pin.json")
 	specTests := fs.String("spec-tests", "", "file of test names the spec requires, one per line")
 	out := fs.String("out", "", "directory for index.json and index.md")
+	decPath := fs.String("decisions", "", "the decisions kept across rounds")
 	fs.Parse(args)
 	if *pinPath == "" || *out == "" {
 		return errors.New("index: --pin and --out are required")
@@ -175,7 +187,11 @@ func cmdIndex(args []string) error {
 	if err != nil {
 		return err
 	}
-	ix, err := st.BuildIndex(names)
+	dec, err := optionalDecisions(*decPath)
+	if err != nil {
+		return err
+	}
+	ix, err := st.BuildIndex(names, dec)
 	if err != nil {
 		return err
 	}
@@ -204,6 +220,7 @@ func cmdRender(args []string) error {
 	page := fs.String("page", "", "page.html")
 	out := fs.String("out", "", "output directory, replaced whole on success")
 	allow := fs.Bool("allow-untriaged", false, "publish untriaged live lines as raw diff (exit 2)")
+	decPath := fs.String("decisions", "", "the decisions kept across rounds")
 	var scouts multi
 	fs.Var(&scouts, "scout", "a scout's answer (repeatable)")
 	fs.Parse(args)
@@ -240,5 +257,42 @@ func cmdRender(args []string) error {
 	if in.SpecTests, err = readNames(*specTests); err != nil {
 		return err
 	}
+	if in.Decisions, err = optionalDecisions(*decPath); err != nil {
+		return err
+	}
 	return st.Render(in, *page, *out)
+}
+
+func optionalDecisions(path string) (*DecisionsFile, error) {
+	if path == "" {
+		return nil, nil
+	}
+	return loadDecisions(path)
+}
+
+func cmdDecisionsMerge(args []string) error {
+	fs := flag.NewFlagSet("decisions merge", flag.ExitOnError)
+	pinPath := fs.String("pin", "", "pin.json, whose stack the block must be from")
+	in := fs.String("in", "", "the pasted block")
+	state := fs.String("state", "", "the decisions kept across rounds, created if missing")
+	fs.Parse(args)
+	if *pinPath == "" || *in == "" || *state == "" {
+		return errors.New("decisions merge: --pin, --in and --state are required")
+	}
+	pin, err := LoadPin(*pinPath)
+	if err != nil {
+		return err
+	}
+	out, err := MergeDecisionsFile(*in, *state, pin)
+	if err != nil {
+		return err
+	}
+	settled := 0
+	for _, d := range out.Decisions {
+		if d.Decision == decisionSettled {
+			settled++
+		}
+	}
+	fmt.Printf("%s: %d decisions (%d settled, %d change requests)\n", *state, len(out.Decisions), settled, len(out.Decisions)-settled)
+	return nil
 }

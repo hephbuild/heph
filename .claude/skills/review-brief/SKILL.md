@@ -220,7 +220,10 @@ Its brief states:
 - `tests` names tests that pin the card's behavior; each must exist at the layer's head.
 - `proposed_by` is the board agent, `scout:<agent>`, or `decider`. Its own reads go in `reads`
   with `agent: "decider"`.
-- Output: `$SP/triage.json`, format `heph-review-brief-triage/2` (FORMAT.md). Return the path.
+- **Every option says whether it asks for a change** (`change: true`) or keeps the code as it is
+  (`change: false`: accept, ignore, defer). A Scrutinize card has at least one of each, so "it's
+  fine" is one click; render refuses it otherwise.
+- Output: `$SP/triage.json`, format `heph-review-brief-triage/3` (FORMAT.md). Return the path.
 
 ## 6. Stack review
 

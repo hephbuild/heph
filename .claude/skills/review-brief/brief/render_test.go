@@ -58,7 +58,7 @@ func cardText(it *Item) {
 	it.Title = "Title of " + it.ID
 	it.Context = "What " + it.ID + " is for, what reaches it and what a user sees."
 	it.Question = "Is this right?"
-	it.Options = []Option{{Choice: "Yes", Impact: "It ships as is."}, {Choice: "No", Impact: "It is reworked first."}}
+	it.Options = []Option{{Choice: "Yes", Impact: "It ships as is."}, {Choice: "No", Impact: "It is reworked first.", Change: true}}
 }
 
 func Test_every_changed_line_has_one_tier(t *testing.T) {
@@ -75,7 +75,7 @@ func Test_every_changed_line_has_one_tier(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := pl.Sums
-	if s.Total != n || s.Scrutinize+s.Glance+s.AICleared+s.Counted+s.Untriaged != n {
+	if s.Total != n || s.Scrutinize+s.Glance+s.AICleared+s.Counted+s.Untriaged+s.Settled != n {
 		t.Fatalf("sums %+v do not add up to numstat %d", s, n)
 	}
 	if s.Counted != 2 || s.Glance != 1 || s.AICleared != 2 {
@@ -283,7 +283,7 @@ func Test_audit_cannot_demote(t *testing.T) {
 	tr, scouts = b.triage(item("util", TierAICleared, b.utilAdded), item("core", TierGlance, b.coreAdded))
 	p := &audit.Promotions[0]
 	p.Title, p.Context = "first() is added with no caller", "A helper for the scheduler; nothing calls it yet."
-	p.Options = []Option{{Choice: "Keep it", Impact: "Dead until the next PR."}, {Choice: "Drop it", Impact: "The next PR adds it."}}
+	p.Options = []Option{{Choice: "Keep it", Impact: "Dead until the next PR."}, {Choice: "Drop it", Impact: "The next PR adds it.", Change: true}}
 	out := mustRender(t, b.st, RenderInput{Triage: tr, Scouts: scouts, Audit: audit})
 	for _, c := range readLayer(t, out, 1).Cards {
 		if c.ID == "util" && (c.Tier != TierScrutinize || !strings.Contains(c.Provenance.RaisedBy, "stack-review") ||

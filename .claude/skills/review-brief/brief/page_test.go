@@ -111,7 +111,7 @@ func servedBrief(t *testing.T, api func(w http.ResponseWriter, head string)) (di
 	it.Title = "A string constant joins a()"
 	it.Claim, it.Question = hostile, hostile
 	it.Context = "Context for the constant. " + hostile
-	it.Options = []Option{{Choice: "Keep the constant", Impact: "Callers of a() see it."}, {Choice: "Drop it", Impact: hostile}}
+	it.Options = []Option{{Choice: "Keep the constant", Impact: "Callers of a() see it."}, {Choice: "Drop it", Impact: hostile, Change: true}}
 	it.Examples = []Example{{Label: "What a user sees", Text: "error: the constant is shown\n  at src/a.rs:2"}, {Label: "Before", Text: hostile}}
 	it.Diagram = "flowchart LR\n  caller --> a"
 	it.UsedBy = []RangeRef{{Path: "src/use.rs", Start: 2, End: 2, Note: "caller() calls a()"}}

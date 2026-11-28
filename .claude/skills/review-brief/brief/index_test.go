@@ -24,7 +24,7 @@ func Test_index_carries_pr_description_and_commits(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ix, err := st.BuildIndex(nil)
+	ix, err := st.BuildIndex(nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

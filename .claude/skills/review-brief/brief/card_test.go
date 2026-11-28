@@ -17,7 +17,7 @@ func Test_card_text_refusals(t *testing.T) {
 	opts := func(n int) []Option {
 		var out []Option
 		for i := 0; i < n; i++ {
-			out = append(out, Option{Choice: "choice " + itoa(i), Impact: "impact " + itoa(i)})
+			out = append(out, Option{Choice: "choice " + itoa(i), Impact: "impact " + itoa(i), Change: i%2 == 1})
 		}
 		return out
 	}
@@ -34,6 +34,8 @@ func Test_card_text_refusals(t *testing.T) {
 		{"one option", func(it *Item) { it.Options = opts(1) }, "1 options: a question offers 2 to 4"},
 		{"five options", func(it *Item) { it.Options = opts(5) }, "5 options: a question offers 2 to 4"},
 		{"option without impact", func(it *Item) { it.Options[1].Impact = "" }, "option 2 needs a choice and its impact"},
+		{"no answer keeps the code", func(it *Item) { it.Options[0].Change = true }, `no option has change: false: a Scrutinize card offers at least one answer that keeps the code as it is`},
+		{"no answer asks for a change", func(it *Item) { it.Options[1].Change = false }, "no option has change: true: a Scrutinize card offers at least one answer that asks for a code change"},
 		{"long title", func(it *Item) { it.Title = long(titleCap + 1) }, "title is 91 characters, over the cap of 90"},
 		{"long title in runes", func(it *Item) { it.Title = strings.Repeat("é", titleCap+1) }, "title is 91 characters"},
 		{"long context", func(it *Item) { it.Context = long(contextCap + 1) }, "context is 601 characters, over the cap of 600"},

@@ -35,10 +35,10 @@ Report every range you read, honestly. The ledger splits AI-cleared lines into "
 
 ## What you produce
 
-`audit.json`, format `heph-review-brief-audit/1` (field by field in `.claude/skills/review-brief/FORMAT.md`):
+`audit.json`, format `heph-review-brief-audit/2` (field by field in `.claude/skills/review-brief/FORMAT.md`):
 
 - **`assessment`**: one paragraph on the stack, shown at the top of the page. Every statement cites code: `refs` lists a `{layer, path, start, end}` for each (I12). No statement without a range.
-- **`promotions`**: an item you are not willing to approve at its tier, raised. Each has the item's `id`, the new `tier`, a `note` saying why, and, when you raise it to Scrutinize, whatever the item lacks of: a `reason` from the closed list, a `title`, a `context`, a `question` the user can answer with yes, no or a choice, and 2 to 4 `options` with their impact. A promotion to a lower or equal tier does nothing or is refused.
+- **`promotions`**: an item you are not willing to approve at its tier, raised. Each has the item's `id`, the new `tier`, a `note` saying why, and, when you raise it to Scrutinize, whatever the item lacks of: a `reason` from the closed list, a `title`, a `context`, a `question` the user can answer with yes, no or a choice, and 2 to 4 `options` with their impact, each with `change` (`true` if the answer asks for a code change, `false` if it keeps the code), at least one of each. A promotion to a lower or equal tier does nothing or is refused.
 - **`items`**: a finding that is a judgment call and that no existing item covers. Reason `stack-design` (the stack's shape: duplication, a bypassed helper, a misplaced boundary) or `decision` (a deviation from the spec, an exemption, a changed default). Each with `id`, `layer` (the PR number), `tier`, `title`, `context`, `claim`, `question`, `options`, `ranges`, `proposed_by: "stack-review"`, and where they help, `examples`, a `diagram` and `used_by`.
 - **`confirmations`**: per layer, a `{layer, note}` when you approve its AI-cleared tier. The page then says "AI-approved: N lines, by triage and stack review". Do not confirm a layer whose AI-cleared code you did not read; say what you sampled in the note.
 - **`reads`**: `{agent: "stack-review", layer, ranges}`, everything you read.

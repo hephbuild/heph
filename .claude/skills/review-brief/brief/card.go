@@ -118,6 +118,18 @@ func (st *Stack) checkCard(d *LayerData, it *Item, where string, ref *Refusals) 
 		}
 		if len(it.Options) == 0 {
 			ref.add("%s: a Scrutinize card needs options: %d to %d answers to its question, each with its impact", where, minOptions, maxOptions)
+		} else {
+			keeps, changes := false, false
+			for _, o := range it.Options {
+				keeps = keeps || !o.Change
+				changes = changes || o.Change
+			}
+			if !keeps {
+				ref.add("%s: no option has change: false: a Scrutinize card offers at least one answer that keeps the code as it is, so \"it's fine\" is one click", where)
+			}
+			if !changes {
+				ref.add("%s: no option has change: true: a Scrutinize card offers at least one answer that asks for a code change", where)
+			}
 		}
 	}
 	capped := func(field, s string, max int) {
