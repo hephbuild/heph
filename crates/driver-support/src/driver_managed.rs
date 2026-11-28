@@ -445,7 +445,8 @@ fn complete_deferred(
                 let origin_id = srcs.get(r.arg).ok_or_else(|| {
                     anyhow::anyhow!(
                         "the host did not resolve `{}` — a deferred value is filled in before the \
-                         command runs, so this is a bug in heph rather than in the BUILD file",
+                         command runs, so this is a bug in heph rather than in the target's \
+                         definition",
                         r.raw
                     )
                 })?;

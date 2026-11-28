@@ -3290,7 +3290,7 @@ mod tests {
     // A caller that predates the capability (ABI < 0.15.0) sends no
     // `accepts_declarations`, which reads as false. A declaring function must
     // then fail the call: the old caller would skip the declaration fields, and
-    // build a target-less package from a BUILD file that asked for one. The
+    // build a target-less package from a source file that asked for one. The
     // plugin's functions handle is driven directly, since the host-side proxy
     // always advertises support.
     #[test]
