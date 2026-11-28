@@ -1,5 +1,6 @@
 mod entrypoint_mode;
 mod filterenv;
+mod not_found;
 mod spec;
 
 use anyhow::Context;
@@ -1186,12 +1187,14 @@ async fn pty_session_output(
 ///
 /// Shared by every exit from a tee loop — EOF *and* a read error — because a tail
 /// that is not flushed is output that silently disappears, which is the failure
-/// [`SinkLoss`] exists to make visible.
+/// [`SinkLoss`] exists to make visible. `scan` reads the tail too, when the
+/// stream is one it reads (stderr): a shell's last line is often the tail.
 async fn flush_redacted(
     redactor: &mut Option<redact::Redactor>,
     log: Option<&Arc<std::sync::Mutex<std::fs::File>>>,
     sink: &mut Option<&mut (dyn tokio::io::AsyncWrite + Send + Sync + Unpin)>,
     lost: &mut SinkLoss,
+    scan: Option<&std::sync::Mutex<not_found::NotFoundScan>>,
 ) {
     use std::io::Write as _;
     use tokio::io::AsyncWriteExt as _;
@@ -1199,6 +1202,9 @@ async fn flush_redacted(
     let tail = r.finish();
     if tail.is_empty() {
         return;
+    }
+    if let Some(Ok(mut scan)) = scan.map(std::sync::Mutex::lock) {
+        scan.push(&tail);
     }
     if let Some(Ok(mut g)) = log.map(|l| l.lock()) {
         drop(g.write_all(&tail));
@@ -1310,6 +1316,9 @@ async fn tee_output<'io>(
     stdout_bytes: &std::sync::atomic::AtomicUsize,
     stderr_bytes: &std::sync::atomic::AtomicUsize,
     needles: Option<Arc<redact::Needles>>,
+    // Shared, not borrowed: the run reads it after the tee, which a drain
+    // timeout may drop unfinished. Locked once per stderr chunk, uncontended.
+    missing: Arc<std::sync::Mutex<not_found::NotFoundScan>>,
 ) {
     use tokio::io::AsyncWriteExt;
     let Some(mut reader) = reader else { return };
@@ -1330,8 +1339,25 @@ async fn tee_output<'io>(
                 // target's output disappear. A refused write is recorded rather
                 // than dropped, for the same reason every other sink write here
                 // is — see [`SinkLoss`].
-                flush_redacted(&mut red_out, log.as_ref(), &mut stdout, &mut lost_stdout).await;
-                flush_redacted(&mut red_err, log.as_ref(), &mut stderr, &mut lost_stderr).await;
+                flush_redacted(
+                    &mut red_out,
+                    log.as_ref(),
+                    &mut stdout,
+                    &mut lost_stdout,
+                    None,
+                )
+                .await;
+                flush_redacted(
+                    &mut red_err,
+                    log.as_ref(),
+                    &mut stderr,
+                    &mut lost_stderr,
+                    Some(&missing),
+                )
+                .await;
+                if let Ok(mut m) = missing.lock() {
+                    m.finish();
+                }
                 break;
             }
             // One reader now carries both streams, so treating a read error as
@@ -1364,6 +1390,11 @@ async fn tee_output<'io>(
         let chunk: &[u8] = scrubbed.as_deref().unwrap_or(&chunk);
         if chunk.is_empty() {
             continue;
+        }
+        if stream == proc_exec::StreamId::Stderr
+            && let Ok(mut m) = missing.lock()
+        {
+            m.push(chunk);
         }
         if let Some(Ok(mut g)) = log.as_ref().map(|l| l.lock()) {
             drop(g.write_all(chunk));
@@ -2035,6 +2066,19 @@ impl Driver {
             "the target's tools and heph's builtin utilities".to_string()
         } else {
             self.search_path.join(":")
+        }
+    }
+
+    /// What `def`'s PATH holds besides its tools, as the not-found hint says
+    /// it. `caller_path`: the run sits on a caller's environment.
+    fn path_env(&self, def: &TargetDef, caller_path: bool) -> not_found::PathEnv {
+        not_found::PathEnv {
+            // Materialized before the spawn already; an error there failed
+            // the run before it got here.
+            coreutils: matches!(self.coreutils_dir(), Ok(Some(_))),
+            search_path: self.search_path.join(":"),
+            runner: def.runner.as_ref().map(|t| t.r#ref.format()),
+            caller_path,
         }
     }
 
@@ -2735,20 +2779,21 @@ impl Driver {
                         ""
                     },
                 )
-            } else if e.kind() == std::io::ErrorKind::NotFound && has_base_env {
-                anyhow::anyhow!(
-                    "spawn child process {program:?}{via}: {e} — not found on the run's PATH \
-                     (the target's tools, then the caller's PATH, then heph's builtin \
-                     utilities). Declare it as a tool, call it by absolute path, or put it on \
-                     your PATH. Also check that the working directory {cwd:?} exists.",
-                    cwd = spawned_as.cwd,
-                )
             } else if e.kind() == std::io::ErrorKind::NotFound {
-                anyhow::anyhow!(
-                    "spawn child process {program:?}{via}: {e} — not found on the target's PATH ({path}). A target sees only what it declares as a tool plus heph's builtin utilities; the host's directories are deliberately not there, so a program on your interactive PATH is still missing here. Declare it as a tool, call it by absolute path, or name the directories back with the driver's `path` option in .hephconfig. Also check that the working directory {cwd:?} exists.",
-                    path = self.sandbox_path_display(),
-                    cwd = spawned_as.cwd,
-                )
+                // RUN-07: the program, when it is a word looked up on PATH
+                // and not a runner's wrapper, gets the 127 hint; the cwd is
+                // named only when it is in fact missing.
+                let (message, hint) = not_found::spawn_not_found(
+                    &not_found::SpawnFailed {
+                        program,
+                        via: &via,
+                        error: &e,
+                        path: &self.sandbox_path_display(),
+                        cwd: &spawned_as.cwd,
+                    },
+                    &self.path_env(def, has_base_env),
+                );
+                hplugin::error::RunHints::error(message, hint.into_iter().collect())
             } else {
                 anyhow::Error::new(e).context(format!("spawn child process {program:?}{via}"))
             }
@@ -2950,6 +2995,10 @@ impl Driver {
         let addr_str = rreq.target.addr.format();
         let stdout_bytes = std::sync::atomic::AtomicUsize::new(0);
         let stderr_bytes = std::sync::atomic::AtomicUsize::new(0);
+        // The programs a shell said it could not find, for the 127 hint. Fed
+        // only from piped stderr: a PTY merges the streams, and its output is
+        // on the user's terminal already.
+        let missing = Arc::new(std::sync::Mutex::new(not_found::NotFoundScan::default()));
 
         let io_futures: IoFutures<'_> = if let Some(master) = pty_master {
             let read_fd = master.try_clone().context("dup pty master for read")?;
@@ -3001,6 +3050,7 @@ impl Driver {
                 &stdout_bytes,
                 &stderr_bytes,
                 needles.clone(),
+                Arc::clone(&missing),
             ));
             let stdin_fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> =
                 match (rreq.stdin, stdin_pump) {
@@ -3159,6 +3209,21 @@ impl Driver {
             // run. A `--shell` session wrote none, and printed everything it
             // had to say.
             let failed = anyhow::Error::new(hplugin::error::ProcessFailed::from_status(status));
+            // RUN-06: a 127 whose stderr has a shell's not-found line names
+            // the programs. Any other exit, or a 127 with no such line (a
+            // script's own `exit 127`), gets no hint.
+            let failed = if hplugin::error::Exit::from_std(status)
+                == Some(hplugin::error::Exit::Code(127))
+            {
+                let env = self.path_env(def, has_base_env);
+                let hint = missing.lock().ok().and_then(|m| {
+                    let (words, overflow) = m.words();
+                    not_found::path_hint(words, overflow, &env)
+                });
+                hplugin::error::RunHints::attach(failed, hint.into_iter().collect())
+            } else {
+                failed
+            };
             let log = if writes_log {
                 log_response(&output_log_path)?.artifacts
             } else {

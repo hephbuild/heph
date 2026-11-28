@@ -207,6 +207,11 @@ pub(crate) fn compact(
     {
         diagnostic.addr = Some(addr.format());
     }
+    // A builtin driver's hints about its run (the 127 hint): scrubbed with
+    // the rest of the record below, so a program word is the scrubbed one.
+    if let Some(h) = downcast_chain_ref::<hplugin::error::RunHints>(e) {
+        diagnostic.hints.extend(h.hints.iter().cloned());
+    }
 
     let mut rec = FailureRecord::new(diagnostic);
     rec.addr = culprit.target().map(Addr::format);
@@ -1076,6 +1081,35 @@ mod tests {
         let plain = anyhow::Error::new(ProcessFailed::new("exit status: 1", Some(Exit::Code(1))));
         let told = exec_failure(&addr("//p:t"), &plain, &scrub).expect("a process failure");
         assert!(told.message_is_status(), "{told:?}");
+    }
+
+    /// RUN-06: a driver's run hint rides the exit as `RunHints`. The record
+    /// keeps the engine's status as its message, appends the hint, and the
+    /// program word in it is the scrubbed one (I7).
+    #[test]
+    fn hint_127_program_word_scrubbed() {
+        let e = hplugin::error::RunHints::attach(
+            anyhow::Error::new(ProcessFailed::new(
+                "exit status: 127",
+                Some(Exit::Code(127)),
+            )),
+            vec![Hint::new(
+                HintKind::DeclareTool,
+                "`SECRET-VALUE-1` is not on this target's PATH",
+            )],
+        );
+        let scrub = Scrub::new(["SECRET-VALUE-1".to_owned()]);
+        let rec = compact(&e, &Culprit::Target(addr("//p:t")), &addr("//p:t"), &scrub);
+        assert_eq!(rec.diagnostic.message, "exit status 127");
+        assert_eq!(
+            rec.diagnostic.hints,
+            vec![Hint::new(
+                HintKind::DeclareTool,
+                "`[redacted]` is not on this target's PATH"
+            )]
+        );
+        assert!(rec.message_is_status(), "{rec:?}");
+        assert_eq!(rec.failed_in, FailedIn::Exec);
     }
 
     #[test]

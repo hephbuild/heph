@@ -615,6 +615,48 @@ impl fmt::Display for AfterProcess {
 
 impl std::error::Error for AfterProcess {}
 
+/// Hints a driver adds to its run's failure without raising a
+/// [`Diagnostic`](hcore::diagnostic::Diagnostic) of its own: the record keeps
+/// the engine's message (`exit status 127`) and appends these, each scrubbed
+/// as the record is (I7). Attached to an error, its `Display` is empty, like
+/// [`AfterProcess`]: it adds no words to the chain. As an error of its own
+/// ([`RunHints::error`]), it says its message.
+///
+/// In-process only: it does not cross the plugin seam, so only a builtin
+/// driver's hints reach the record.
+#[derive(Debug, Clone, Default)]
+pub struct RunHints {
+    pub hints: Vec<hcore::diagnostic::Hint>,
+    message: String,
+}
+
+impl RunHints {
+    /// `e` carrying `hints`; `e` itself when there are none.
+    pub fn attach(e: anyhow::Error, hints: Vec<hcore::diagnostic::Hint>) -> anyhow::Error {
+        if hints.is_empty() {
+            e
+        } else {
+            e.context(Self {
+                hints,
+                message: String::new(),
+            })
+        }
+    }
+
+    /// An error saying `message` and carrying `hints`.
+    pub fn error(message: String, hints: Vec<hcore::diagnostic::Hint>) -> anyhow::Error {
+        anyhow::Error::new(Self { hints, message })
+    }
+}
+
+impl fmt::Display for RunHints {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for RunHints {}
+
 /// A run failure that crossed the plugin seam with a structured exit status
 /// ([`ProcessFailed::exit`] on the plugin's side).
 ///

@@ -65,6 +65,7 @@ mod log_api;
 mod log_cmd;
 mod matrix;
 mod names;
+mod not_found_hint;
 mod oci;
 mod oci_docker;
 mod oci_image;
