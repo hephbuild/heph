@@ -641,7 +641,9 @@ impl FailureSlots {
             let tail_of = |source: &LogSource| match memory_tail(source, lines) {
                 Ok(mut t) => {
                     // Scrubbed whole, then cut (H-M1).
-                    t.text = scrub.apply(&t.text);
+                    if let std::borrow::Cow::Owned(clean) = scrub.apply(&t.text) {
+                        t.text = clean;
+                    }
                     let (tail, cut) = capped_tail(t);
                     Some(FailureLog::in_memory(tail, cut))
                 }
