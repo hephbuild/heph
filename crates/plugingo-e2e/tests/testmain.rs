@@ -65,7 +65,7 @@ async fn testmain_exit_code_survives_the_pinned_toolchain() -> anyhow::Result<()
     // These two assertions pin the mechanism:
     //   - the `--- FAIL:` line says the test binary ran and the Go test failed,
     //     so we reached the runner rather than dying before it;
-    //   - `exit status: 1` is the value that came back out through the
+    //   - `exit status 1` is the value that came back out through the
     //     `exitCode` field. A reflection read that silently yielded 0 turns this
     //     into a *pass*, which is the failure mode worth catching.
     assert!(
@@ -73,7 +73,7 @@ async fn testmain_exit_code_survives_the_pinned_toolchain() -> anyhow::Result<()
         "expected the Go test's own failure in the error, got: {err}"
     );
     assert!(
-        err.contains("exit status: 1"),
+        err.contains("exit status 1"),
         "the failing test's exit code must survive the `exitCode` reflection \
          read — a read yielding 0 would report every broken package green. \
          Got: {err}"
