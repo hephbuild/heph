@@ -343,6 +343,128 @@ async fn failure_report_killed_by_signal() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// U6, D6.1c "execution went fine, then a later step failed", through the
+/// real bash driver: a run that streamed, exited 0 and never wrote its
+/// declared `out`. The failure is past the run (`AfterRun`, not
+/// `BeforeRun`: the process ran, and its log is the run's), so it is not
+/// told in a one-liner and its box points at the log instead of repeating
+/// it. The PTY form is bin-e2e `streamed_then_missing_output_box_without_log`.
+#[tokio::test]
+async fn streamed_then_missing_output_box_without_log() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "p",
+        r#"target(name = "t", driver = "bash", cache = False, out = "never.txt", run = "echo streamed-line")"#,
+    );
+    let wrapper: heph::engine::InteractiveWrapper =
+        Arc::new(move |inner: heph::engine::InteractiveInner| {
+            Box::pin(async move {
+                let (mut out, mut err) = (tokio::io::sink(), tokio::io::sink());
+                inner(None, Some(&mut out), Some(&mut err), None).await?;
+                Ok(heph::engine::TerminalUse { streamed: true })
+            })
+        });
+    let opts = ResultOptions {
+        interactive: Some(wrapper),
+        ..ResultOptions::default()
+    };
+    let rs = ws.engine.new_state();
+    let res = Arc::clone(&ws.engine)
+        .result_addr(
+            Arc::clone(&rs),
+            &parse_addr("//p:t")?,
+            OutputMatcher::All,
+            &opts,
+        )
+        .await;
+    assert!(res.is_err(), "the declared output is never written");
+    let failures = rs.take_failures_with_logs().await;
+    let [failure] = failures.as_slice() else {
+        panic!("one failure: {failures:?}");
+    };
+    let rec = &failure.record;
+    let msg = &rec.diagnostic.message;
+    assert!(msg.contains("never.txt"), "the missing output: {msg}");
+    assert_eq!(rec.failed_in, hcore::events::FailedIn::AfterRun, "{msg}");
+    assert!(rec.streamed, "{msg}");
+    assert!(
+        !rec.told_streamed(),
+        "a failure past the run gets its box: {msg}"
+    );
+
+    let report = ReportContext::gather(&failures, |_| false, None, rs.log_tail_lines())
+        .with_width(WIDTH)
+        .render(false);
+    assert!(report.contains("✗ //p:t"), "{report}");
+    assert!(
+        report.contains("(output not shown here: 1 line · heph log //p:t)"),
+        "{report}"
+    );
+    assert!(!report.contains("streamed-line"), "{report}");
+    ends_with_log(&report, "//p:t");
+    Ok(())
+}
+
+/// U6, D6.1c "failed before it ran", through the real bash driver: an
+/// option the driver refuses fails the parse, under a wrapper that would
+/// have streamed. The process never ran, so the record is `BeforeRun`, not
+/// streamed, and the box is the full one: the refusal, no pointer and no
+/// `log:` row. The PTY form is bin-e2e `streamed_target_bad_option_full_box`.
+#[tokio::test]
+async fn streamed_target_bad_option_full_box() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "p",
+        r#"target(name = "t", driver = "bash", cache = False, timeout = "banana", run = "echo never-ran")"#,
+    );
+    let wrapper: heph::engine::InteractiveWrapper =
+        Arc::new(move |inner: heph::engine::InteractiveInner| {
+            Box::pin(async move {
+                let (mut out, mut err) = (tokio::io::sink(), tokio::io::sink());
+                inner(None, Some(&mut out), Some(&mut err), None).await?;
+                Ok(heph::engine::TerminalUse { streamed: true })
+            })
+        });
+    let opts = ResultOptions {
+        interactive: Some(wrapper),
+        ..ResultOptions::default()
+    };
+    let rs = ws.engine.new_state();
+    let res = Arc::clone(&ws.engine)
+        .result_addr(
+            Arc::clone(&rs),
+            &parse_addr("//p:t")?,
+            OutputMatcher::All,
+            &opts,
+        )
+        .await;
+    assert!(res.is_err(), "the bad option is refused");
+    let failures = rs.take_failures_with_logs().await;
+    let [failure] = failures.as_slice() else {
+        panic!("one failure: {failures:?}");
+    };
+    let rec = &failure.record;
+    let msg = &rec.diagnostic.message;
+    assert_eq!(rec.failed_in, hcore::events::FailedIn::BeforeRun, "{msg}");
+    assert!(!rec.streamed, "nothing ran, so nothing streamed: {msg}");
+
+    let report = ReportContext::gather(&failures, |_| false, None, rs.log_tail_lines())
+        .with_width(WIDTH)
+        .render(false);
+    let mut lines = report.lines().skip_while(|l| l.is_empty());
+    assert_eq!(lines.next(), Some("✗ //p:t"), "{report}");
+    assert!(
+        lines
+            .next()
+            .is_some_and(|l| l.contains("\"banana\" is not a duration")),
+        "{report}"
+    );
+    for needle in ["output not shown here", "never-ran", "log:"] {
+        assert!(!report.contains(needle), "{needle:?} in:\n{report}");
+    }
+    Ok(())
+}
+
 /// `--keep-failed-sandboxes` adds one `sandbox: <path> (kept)` row, and it
 /// is the only line naming a sandbox, or anything else in heph's home.
 #[tokio::test]
