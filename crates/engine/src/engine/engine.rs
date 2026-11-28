@@ -1621,7 +1621,11 @@ impl Engine {
             if self.plugins.contains_key(name) {
                 anyhow::bail!("builtin plugin '{name}' is already registered");
             }
-            anyhow::bail!("unknown builtin plugin '{name}'");
+            // The names a `builtin:` entry can still apply.
+            return Err(hconfig::unknown_builtin(
+                name,
+                self.plugin_factories.keys().map(String::as_str),
+            ));
         };
         let parts = factory(&self.plugin_init_payload(name), options)
             .with_context(|| format!("constructing builtin plugin {name:?}"))?;

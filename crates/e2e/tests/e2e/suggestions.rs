@@ -64,3 +64,33 @@ async fn unknown_driver_suggests_nearest() {
         text(&f)
     );
 }
+
+/// CLI-27: a typo'd plugin option in `.hephconfig` names the nearest option
+/// when the engine applies the plugin, and still lists the allowed ones.
+#[tokio::test]
+async fn plugin_option_typo_suggests() {
+    use heph::commands::bootstrap;
+    use heph::engine::{ConfigYamlExt as _, Engine, config_yaml};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    std::fs::write(
+        root.join(".hephconfig"),
+        "plugins:\n  - builtin: buildfile\n    options:\n      pattern: [BUILD]\n",
+    )
+    .expect("write .hephconfig");
+    let file = config_yaml::load_from_root(root).expect("load .hephconfig");
+    let config = file.resolve(root).expect("resolve config");
+    let home = config.home_dir.to_path_buf();
+    let mut e = Engine::new(config).expect("engine");
+    bootstrap::register_builtin_plugins(&mut e, &home).expect("builtin plugins");
+    bootstrap::register_builtin_factories(&mut e, &home).expect("builtin factories");
+    let err = e
+        .register_plugins(&file.plugins)
+        .expect_err("a typo'd option is refused");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("unknown option `pattern`; did you mean `patterns`? (allowed: patterns, "),
+        "{msg}"
+    );
+}
