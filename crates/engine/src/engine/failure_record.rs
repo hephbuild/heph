@@ -499,6 +499,31 @@ fn scrubbed(mut rec: FailureRecord, clean: &impl Fn(&str) -> String) -> FailureR
     rec
 }
 
+/// `rec`, as [`compact`] bounded it, located at `at`, the declaration a
+/// Parse-stage failure is about: the location set and, when the file
+/// changed since evaluation, ` (file changed since evaluation)` after the
+/// message, still within [`MESSAGE_CAP`](hcore::diagnostic::MESSAGE_CAP)
+/// and [`RECORD_CAP`]. The message is cut to make room, never the marker
+/// (CQ r2): a re-bound after appending could cut the marker itself.
+pub(crate) fn locate(rec: &mut FailureRecord, at: hplugin::provider::DeclAt) {
+    rec.diagnostic.location = Some(at.loc);
+    let marker = at
+        .changed
+        .then(|| format!(" ({})", hplugin::provider::DeclAt::CHANGED));
+    let extra = marker.as_ref().map_or(0, String::len);
+    let over = (rec.text_len() + extra).saturating_sub(RECORD_CAP);
+    let message = &rec.diagnostic.message;
+    let room = hcore::diagnostic::MESSAGE_CAP
+        .saturating_sub(extra)
+        .min(message.len().saturating_sub(over));
+    if message.len() > room {
+        rec.diagnostic.message = bound_text(message, room, &mut rec.diagnostic.truncated);
+    }
+    if let Some(marker) = marker {
+        rec.diagnostic.message.push_str(&marker);
+    }
+}
+
 /// `rec` within every cap, each cut marking the diagnostic `truncated`: the
 /// diagnostic's own caps, the causes (the first [`CAUSES_CAP`], each within
 /// [`CAUSE_CAP`]), the frozen diff as a snippet, the in-memory log tail (its

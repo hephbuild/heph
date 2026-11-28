@@ -670,8 +670,8 @@ mod tests {
         Ok(())
     }
 
-    /// An index that puts every option at `at`.
-    struct FixedIndex(hcore::diagnostic::Span);
+    /// An index that answers every lookup with what it holds.
+    struct FixedIndex(crate::engine::provider::Located);
 
     impl SourceIndex for FixedIndex {
         fn locate(
@@ -680,7 +680,7 @@ mod tests {
             _name: &str,
             _field: Option<&str>,
         ) -> crate::engine::provider::Located {
-            crate::engine::provider::Located::Field(self.0)
+            self.0
         }
     }
 
@@ -702,11 +702,19 @@ mod tests {
     fn located_engine(
         source_index: Option<SourceIndexFn>,
     ) -> anyhow::Result<(Arc<Engine>, tempfile::TempDir)> {
+        located_engine_with("nope", source_index)
+    }
+
+    /// [`located_engine`] with its targets naming `driver`.
+    fn located_engine_with(
+        driver: &str,
+        source_index: Option<SourceIndexFn>,
+    ) -> anyhow::Result<(Arc<Engine>, tempfile::TempDir)> {
         let root = tempfile::tempdir()?;
         let mut engine = Engine::new(Config::for_tests(root.path()))?;
         let nope = |a: &str| pluginstatictarget::Target {
             addr: a.to_string(),
-            driver: "nope".to_string(),
+            driver: driver.to_string(),
             ..Default::default()
         };
         let provider = FaultProvider::new(
@@ -724,12 +732,15 @@ mod tests {
         Ok((Arc::new(engine), root))
     }
 
-    /// `targets`, which must fail, in a fresh request: each failure's culprit
-    /// and location, sorted, and how many indexes the request loaded.
-    async fn locations(
+    /// `targets`, which must fail, in a fresh request: the request, and the
+    /// failures it recorded.
+    async fn failures(
         engine: &Arc<Engine>,
         targets: &[&str],
-    ) -> (Vec<(String, Option<(String, u32, u32)>)>, usize) {
+    ) -> (
+        Arc<crate::engine::request_state::RequestState>,
+        Vec<Arc<hplugin::error::TargetFailure>>,
+    ) {
         use crate::engine::result::{OutputMatcher, ResultOptions};
         let rs = engine.new_state_with_events(false, None);
         let m = Matcher::Or(targets.iter().map(|a| Matcher::Addr(addr(a))).collect());
@@ -742,8 +753,18 @@ mod tests {
             )
             .await;
         assert!(res.map_or(true, |b| !b.errors.is_empty()), "must fail");
-        let mut got: Vec<_> = rs
-            .take_failures()
+        let failures = rs.take_failures();
+        (rs, failures)
+    }
+
+    /// `targets`, which must fail, in a fresh request: each failure's culprit
+    /// and location, sorted, and how many indexes the request loaded.
+    async fn locations(
+        engine: &Arc<Engine>,
+        targets: &[&str],
+    ) -> (Vec<(String, Option<(String, u32, u32)>)>, usize) {
+        let (rs, failures) = failures(engine, targets).await;
+        let mut got: Vec<_> = failures
             .iter()
             .map(|f| {
                 let d = &f.record.diagnostic;
@@ -773,6 +794,32 @@ mod tests {
         Ok(())
     }
 
+    /// A message `compact` already cut to the cap, in a file that changed
+    /// since evaluation: the message makes room for the marker, so the record
+    /// stays within the cap and still says the file changed (CQ r2).
+    #[tokio::test]
+    async fn a_changed_marker_keeps_the_message_within_its_cap() -> anyhow::Result<()> {
+        use hcore::diagnostic::MESSAGE_CAP;
+        let index = SourceIndexFn::new(|_| {
+            Some(
+                Arc::new(FixedIndex(crate::engine::provider::Located::Changed))
+                    as Arc<dyn SourceIndex>,
+            )
+        });
+        let (engine, _root) = located_engine_with(&"n".repeat(MESSAGE_CAP), Some(index))?;
+        let (_, failures) = failures(&engine, &["//a:x"]).await;
+        let [f] = failures.as_slice() else {
+            panic!("one failure, got {}", failures.len());
+        };
+        let d = &f.record.diagnostic;
+        let marker = format!(" ({})", crate::engine::provider::DeclAt::CHANGED);
+        assert!(d.message.len() <= MESSAGE_CAP, "{} bytes", d.message.len());
+        assert!(d.message.ends_with(&marker), "{}", d.message);
+        assert!(d.message.contains("driver not found: nnn"), "{}", d.message);
+        assert!(d.truncated, "the message was cut");
+        Ok(())
+    }
+
     /// The engine asks for a file's index on the blocking pool, never on a
     /// reactor worker (the provider may read and parse the file), and two
     /// files' indexes load at the same time: each ask waits until the other
@@ -794,7 +841,11 @@ mod tests {
                     .timed_out();
                 drop(n);
                 seen.lock().push((file.to_owned(), blocking, both));
-                Some(Arc::new(FixedIndex(span(3, 7))) as Arc<dyn SourceIndex>)
+                Some(
+                    Arc::new(FixedIndex(crate::engine::provider::Located::Field(span(
+                        3, 7,
+                    )))) as Arc<dyn SourceIndex>,
+                )
             }
         });
         let (engine, _root) = located_engine(Some(index))?;
