@@ -202,6 +202,14 @@ impl FileSlot {
     /// failed on the file evaluated one of the packages the file was reached
     /// through without error, and so loaded every file of that package
     /// cleanly (rule b).
+    ///
+    /// Rule (b) assumes a listed package still loads the file, which the
+    /// engine cannot see: no provider reports a package's loaded files. A
+    /// listed package that stops loading a still-broken `F` clears `F`'s slot,
+    /// although other packages still fail on it. Accepted: a slot is
+    /// diagnostics only (never hashed, never selects an artifact), and the
+    /// next evaluation of a package that still loads `F` fills it again.
+    /// Closing it needs the provider to report each package's load set.
     fn cleared_by(&self, source: Option<&str>, package: &str, provider: &str) -> bool {
         source == Some(&*self.file)
             || (self.provider.as_deref().is_none_or(|p| p == provider)

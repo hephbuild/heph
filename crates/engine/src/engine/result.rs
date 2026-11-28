@@ -2329,20 +2329,20 @@ fn first_member(e: anyhow::Error) -> anyhow::Error {
 /// the driver's spec parse refused, an unknown option, the `driver` no plugin
 /// registered), else the call itself for a failure to parse the spec. `None`
 /// for any other failure: a run, a link or a cache failure is not about the
-/// declaration.
+/// declaration, even when its chain happens to name an option.
 fn culprit_location(
     rs: &RequestState,
     culprit: &Addr,
     e: &anyhow::Error,
     stage: hcore::diagnostic::Stage,
 ) -> Option<hplugin::provider::DeclAt> {
-    let field = hplugin::htspec::error_option(e).or_else(|| {
-        downcast_chain_ref::<hplugin::error::DriverNotFound>(e)
-            .map(|_| hplugin::error::DriverNotFound::FIELD)
-    });
-    (field.is_some() || stage == hcore::diagnostic::Stage::Parse)
-        .then(|| rs.decl_field_loc(culprit, field))
-        .flatten()
+    let no_driver = downcast_chain_ref::<hplugin::error::DriverNotFound>(e).is_some();
+    if stage != hcore::diagnostic::Stage::Parse && !no_driver {
+        return None;
+    }
+    let field = hplugin::htspec::error_option(e)
+        .or_else(|| no_driver.then_some(hplugin::error::DriverNotFound::FIELD));
+    rs.decl_field_loc(culprit, field)
 }
 
 /// Records `e` against `culprit`, entered through `entry`, and returns the

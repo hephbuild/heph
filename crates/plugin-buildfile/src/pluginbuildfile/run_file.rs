@@ -705,10 +705,10 @@ impl DeclSite {
 /// file is outside the workspace or not UTF-8.
 fn spec_source(extra: &Extra, span: &starlark::codemap::FileSpan) -> Option<SpecSource> {
     let file = {
-        let mut last = extra.source_file.borrow_mut();
-        match &*last {
-            Some((abs, rel)) if abs == span.filename() => Arc::clone(rel),
-            _ => {
+        let mut files = extra.source_file.borrow_mut();
+        match files.get(span.filename()) {
+            Some(rel) => Arc::clone(rel),
+            None => {
                 // The span's file is a `str`, so the relative path is UTF-8
                 // whenever the prefix strips.
                 let Some(rel) = Path::new(span.filename())
@@ -725,7 +725,7 @@ fn spec_source(extra: &Extra, span: &starlark::codemap::FileSpan) -> Option<Spec
                     return None;
                 };
                 let rel: Arc<str> = rel.into();
-                *last = Some((span.filename().to_owned(), Arc::clone(&rel)));
+                files.insert(span.filename().to_owned(), Arc::clone(&rel));
                 rel
             }
         }
@@ -1174,10 +1174,11 @@ pub(crate) struct Extra<'a> {
     /// overhead there); on only for the LSP, which needs it to map a source
     /// position back to the targets a symbol produced.
     pub capture_provenance: bool,
-    /// The last file a declaration was made in, as its span names it, and its
+    /// Each file a declaration was made in, as its span names it, and its
     /// workspace-relative path: what [`DeclSite::source`] points at, shared by
-    /// that file's targets rather than built once per target.
-    pub source_file: std::cell::RefCell<Option<(String, Arc<str>)>>,
+    /// that file's targets rather than built once per target, however BUILD
+    /// and macro declarations interleave. One evaluation sees few files.
+    pub source_file: std::cell::RefCell<HashMap<String, Arc<str>>>,
 }
 
 /// Unsupported starlark value types (not str/bool/int/float/list/dict) are a
@@ -2871,7 +2872,7 @@ fn eval_ast(
             root: &loader.root,
             cell: std::cell::RefCell::new(None),
             capture_provenance,
-            source_file: std::cell::RefCell::new(None),
+            source_file: std::cell::RefCell::default(),
             on_target: {
                 let targets = targets.clone();
                 Box::new(move |p| {
