@@ -139,8 +139,10 @@ fn scan(text: &str) -> Scanned {
             }
             '\'' => {
                 // A char literal (`'{'`, `'\''`, `'\u{7b}'`) or a lifetime.
+                // An escape's first char is skipped: in `'\''` it is the
+                // quote, which must not end the literal.
                 if next == Some('\\') {
-                    let mut j = i + 2;
+                    let mut j = i + 3;
                     while j < chars.len() && chars[j] != '\'' {
                         j += 1;
                     }
@@ -362,6 +364,8 @@ struct S {
     kept: u8,
 }
 fn after() { let raw = r#"a "quoted" .bzl"#; let buildfile = 2; }
+fn chars<'a>(x: &'a str) { let pair = ('\'','"'); let dq = '"'; let bs = br#"e/BUILD"#; }
+fn slashes() { let url = "http://h//p"; let after_url = 3; }
 "####;
     let s = scan(src);
     let strings: Vec<&str> = s.strings.iter().map(|(_, s)| s.as_str()).collect();
@@ -373,13 +377,21 @@ fn after() { let raw = r#"a "quoted" .bzl"#; let buildfile = 2; }
             "x",
             "test-support",
             "test-support",
-            "a \"quoted\" .bzl"
+            "a \"quoted\" .bzl",
+            "e/BUILD",
+            "http://h//p"
         ],
         "{strings:?}"
     );
     assert_eq!(s.test_mods, ["fixture"]);
     let code: String = s.code.iter().map(|(_, c)| c.as_str()).collect();
     assert!(code.contains("fn after"), "{code}");
+    // A char literal is no code, and a lifetime before a string, an escaped
+    // quote or a `"` char swallows nothing after it.
+    assert!(code.contains("let dq"), "{code}");
+    assert!(code.contains("let bs"), "{code}");
+    // `//` in a string starts no comment.
+    assert!(code.contains("let after_url"), "{code}");
     assert!(code.contains("kept"), "{code}");
     assert!(code.contains("let buildfile"), "{code}");
     assert!(!code.contains("starlark"), "{code}");
