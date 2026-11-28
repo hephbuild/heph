@@ -267,7 +267,21 @@ The brief is a **private Claude artifact**, republished to the same URL each rou
   `null` when its layer has left the stack.
 - Keep the URL: `echo <url> > "$ST/brief-url.txt"`. If the file is missing, find the artifact
   with `action: "list"`.
-- Print the URL for the user. No PR comment for now.
+- Print the URL for the user. No PR comment for now. Tell them, in two lines, how to review on
+  the page (below).
+
+### Reviewing on the page
+
+On each Scrutinize card the user can pick one of its answers, write a note, and mark the card
+Fine or Concern. Picking an answer or marking it closes the card in the layer's count. All of it
+stays in their browser, keyed by the code's content, and no agent can read it. At the bottom:
+
+- **Copy GitHub review** copies every card with a concern, an answer or a note as markdown. It
+  goes into the PR's "Review changes" box, where the user requests changes or approves.
+- **Copy fix prompt** copies the same list behind a `/goal apply my review of the stack …` line.
+  It starts a fresh session that makes the changes, layer by layer.
+
+The brief never approves, requests changes or merges (I10); GitHub does.
 
 Inside an artifact the page's freshness check against the GitHub API may be blocked. The header
 then says "freshness unknown", which is the designed answer, never "current".

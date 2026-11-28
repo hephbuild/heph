@@ -94,11 +94,18 @@ details.layer[open] > summary { margin-bottom: 1rem; }
 .decision { background: var(--callout-bg); border-left: 3px solid var(--t-scrutinize); border-radius: 0 6px 6px 0; padding: 0.7rem 0.9rem; display: grid; gap: 0.6rem; }
 .decision .question { font-weight: 500; max-width: 70ch; line-height: 1.55; }
 .options { list-style: none; margin: 0; padding: 0; display: grid; }
-.options li { display: grid; grid-template-columns: minmax(7rem, 15rem) 1fr; gap: 0.15rem 1rem; padding: 0.45rem 0; border-top: 1px solid var(--line); font-size: 0.9rem; line-height: 1.5; }
+.options li { border-top: 1px solid var(--line); }
+.options button.option { display: grid; grid-template-columns: 1.1rem minmax(7rem, 15rem) 1fr; gap: 0.15rem 0.8rem; width: 100%; text-align: left; padding: 0.45rem 0.3rem; border: 0; border-radius: 4px; background: none; font-size: 0.9rem; font-weight: 400; line-height: 1.5; color: var(--fg); }
+.options button.option:hover { background: var(--surface); }
+.options button.option::before { content: "○"; color: var(--muted); }
+.options button.option[aria-pressed="true"] { background: var(--surface); color: var(--fg); }
+.options button.option[aria-pressed="true"]::before { content: "●"; color: var(--accent); }
 .options .choice { font-weight: 600; }
 .options .impact { color: var(--muted); max-width: 62ch; }
-@media (max-width: 560px) { .options li { grid-template-columns: 1fr; } }
-.examples { display: grid; gap: 0.6rem; }
+@media (max-width: 560px) { .options button.option { grid-template-columns: 1.1rem 1fr; } .options .impact { grid-column: 2; } }
+.review-note { display: grid; gap: 0.3rem; font-size: 0.85rem; }
+.review-note textarea { font: inherit; font-size: 0.9rem; min-height: 2.6rem; padding: 0.4rem 0.55rem; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--fg); resize: vertical; width: 100%; max-width: 70ch; box-sizing: border-box; }
+.card[data-answered="true"][data-state="unread"] { opacity: 0.85; }.examples { display: grid; gap: 0.6rem; }
 figure { margin: 0; display: grid; gap: 0.3rem; min-width: 0; }
 pre.text { margin: 0; padding: 0.6rem 0.75rem; background: var(--pre-bg); border: 1px solid var(--line); border-radius: 6px; font: 0.8rem/1.5 var(--mono); overflow-x: auto; white-space: pre; }
 .diagram svg { max-width: 100%; height: auto; }
@@ -470,44 +477,66 @@ textarea#review-text { width: 100%; min-height: 8rem; font: 0.8rem var(--mono); 
 
   // A card's state derives from its ranges' content hashes, so regrouping
   // cards resets nothing and a changed range reopens its card.
+  // A card's review is its state (fine, concern or none), the answer picked
+  // from its options and the user's note. A note outlives a change to the
+  // code: the anchor keeps it, and a reopened card shows it again.
   function cardState(stack, c) {
-    let state = null, reopened = false, surroundings = false;
+    let state = null, reopened = false, surroundings = false, choice = null, note = "";
+    let first = true;
     for (const r of c.ranges) {
       const s = store.get(stateKey(stack, r.hash));
       if (!s) {
         const a = store.get(anchorKey(stack, r.anchor));
         if (a && a.hash !== r.hash) reopened = true;
-        return { state: null, reopened, surroundings };
+        return { state: null, choice: null, note: (a && a.note) || "", reopened, surroundings };
       }
       if (s.context !== r.context) surroundings = true;
-      state = state === null || state === s.state ? s.state : "mixed";
+      state = first || state === s.state ? s.state : "mixed";
+      if (first) { choice = s.choice || null; note = s.note || ""; }
+      first = false;
     }
-    return { state: state === "mixed" ? null : state, reopened, surroundings };
+    return { state: state === "mixed" ? null : state, choice, note, reopened, surroundings };
   }
 
-  function setCardState(stack, c, state) {
+  function setCardReview(stack, c, patch) {
+    const cur = cardState(stack, c);
+    const v = { state: cur.state, choice: cur.choice, note: cur.note, ...patch };
     for (const r of c.ranges) {
-      if (state) {
-        store.set(stateKey(stack, r.hash), { state, context: r.context });
-        store.set(anchorKey(stack, r.anchor), { hash: r.hash });
-      } else {
-        store.del(stateKey(stack, r.hash));
-      }
+      if (v.state || v.choice || v.note) store.set(stateKey(stack, r.hash), { state: v.state, choice: v.choice, note: v.note, context: r.context });
+      else store.del(stateKey(stack, r.hash));
+      store.set(anchorKey(stack, r.anchor), { hash: r.hash, note: v.note || undefined });
     }
   }
+
+  // A card is closed once it is marked fine or concern, or an answer is picked.
+  function isClosed(s) { return s.state === "fine" || s.state === "concern" || !!s.choice; }
 
   function drawCard(stack, l, manifest, c, onChange) {
     const st = cardState(stack, c);
-    const card = el("article", { class: "card", id: "card-" + l.pr + "-" + c.id, "data-state": st.state || "unread" });
+    const card = el("article", { class: "card", id: "card-" + l.pr + "-" + c.id, "data-state": st.state || "unread", "data-answered": String(!!st.choice) });
     const buttons = ["unread", "fine", "concern"].map((s) => el("button", {
       type: "button", "aria-pressed": String((st.state || "unread") === s), text: s === "unread" ? "Unread" : s === "fine" ? "Fine" : "Concern",
       onclick: (ev) => {
-        setCardState(stack, c, s === "unread" ? null : s);
+        setCardReview(stack, c, { state: s === "unread" ? null : s });
         card.dataset.state = s;
         for (const b of buttons) b.setAttribute("aria-pressed", String(b === ev.currentTarget));
         onChange();
       },
     }));
+    // Picking an answer records it; picking it again clears it.
+    const optionButtons = (c.options || []).map((o) => el("button", {
+      type: "button", class: "option", "aria-pressed": String(st.choice === o.choice),
+      onclick: (ev) => {
+        const on = ev.currentTarget.getAttribute("aria-pressed") !== "true";
+        setCardReview(stack, c, { choice: on ? o.choice : null });
+        card.dataset.answered = String(on);
+        for (const b of optionButtons) b.setAttribute("aria-pressed", String(on && b === ev.currentTarget));
+        onChange();
+      },
+    }, el("span", { class: "choice", text: o.choice }), el("span", { class: "impact", text: o.impact })));
+    const noteBox = el("textarea", { rows: 2, placeholder: "What should change, or why you picked this answer. Kept in this browser; it goes into the copied review.",
+      oninput: (ev) => { setCardReview(stack, c, { note: ev.currentTarget.value.trim() ? ev.currentTarget.value : "" }); onChange(); } });
+    noteBox.value = st.note || "";
     add(card,
       el("div", { class: "row" },
         c.reason_title ? el("span", { class: "chip reason", text: c.reason_title }) : null,
@@ -516,8 +545,8 @@ textarea#review-text { width: 100%; min-height: 8rem; font: 0.8rem var(--mono); 
       el("h4", { class: "card-title", text: c.title || c.claim }),
       c.question ? el("div", { class: "decision" },
         el("p", { class: "question", text: c.question }),
-        c.options && c.options.length ? el("ul", { class: "options", "aria-label": "What each answer means" },
-          c.options.map((o) => el("li", {}, el("span", { class: "choice", text: o.choice }), el("span", { class: "impact", text: o.impact })))) : null) : null,
+        optionButtons.length ? el("ul", { class: "options", "aria-label": "Pick an answer; each says what it means" },
+          optionButtons.map((b) => el("li", {}, b))) : null) : null,
       c.context ? el("p", { class: "context prose", text: c.context }) : null,
       diagramOf(c),
       examplesOf(c),
@@ -525,6 +554,7 @@ textarea#review-text { width: 100%; min-height: 8rem; font: 0.8rem var(--mono); 
       usesOf(stack, l, manifest, c),
       c.title ? el("div", { class: "why" }, el("span", { class: "label", text: "Why it's flagged" }), el("p", { class: "prose", text: c.claim })) : null,
       cardFoot(c),
+      el("label", { class: "review-note" }, el("span", { class: "label", text: st.reopened && st.note ? "Your note (written on earlier code)" : "Your note" }), noteBox),
       el("div", { class: "states" }, buttons));
     return card;
   }
@@ -577,7 +607,7 @@ textarea#review-text { width: 100%; min-height: 8rem; font: 0.8rem var(--mono); 
     const cleared = data.cards.filter((c) => c.tier === "ai-cleared");
     const progress = el("span", { class: "muted" });
     const update = () => {
-      const closed = cards.filter((c) => { const s = cardState(stack, c); return s.state === "fine" || s.state === "concern"; }).length;
+      const closed = cards.filter((c) => isClosed(cardState(stack, c))).length;
       progress.textContent = cards.length === 0 ? "No cards in this layer." :
         closed === cards.length ? "All " + cards.length + " cards closed: this layer has none left." : closed + " of " + cards.length + " cards closed.";
     };
@@ -629,30 +659,67 @@ textarea#review-text { width: 100%; min-height: 8rem; font: 0.8rem var(--mono); 
       blocks);
   }
 
+  // reviewedItems is every card, in stack order, that the user marked as a
+  // concern, answered or wrote a note on.
+  function reviewedItems(stack, layers) {
+    const items = [];
+    for (const l of stack.layers) for (const c of layers[l.pr].cards) {
+      const s = cardState(stack, c);
+      if (s.state === "concern" || s.choice || s.note) items.push({ l, c, s });
+    }
+    return items;
+  }
+
+  function count(n, word) { return n + " " + word + (n === 1 ? "" : "s"); }
+
+  // reviewMarkdown is one card in the copied review. The note is quoted
+  // line by line, so a blank line in it cannot end the item.
+  function reviewMarkdown({ l, c, s }) {
+    const r = c.ranges[0];
+    const lines = ["### #" + l.pr + " · " + (c.title || c.claim), "[`" + refText(r) + "`](" + r.link + ")" + (c.ranges.length > 1 ? " and " + (c.ranges.length - 1) + " more range" + (c.ranges.length > 2 ? "s" : "") : "")];
+    if (s.state === "concern") lines.push("**Concern.**");
+    if (c.question) lines.push("Question: " + c.question);
+    if (s.choice) {
+      const o = (c.options || []).find((x) => x.choice === s.choice);
+      lines.push("Answer: **" + s.choice + "**" + (o ? ": " + o.impact : ""));
+    }
+    if (s.note) lines.push("Note:\n" + s.note.trim().split("\n").map((x) => "> " + x).join("\n"));
+    return lines.join("\n");
+  }
+
   function drawFooter(stack, layers) {
-    const out = el("textarea", { id: "review-text", readonly: true, hidden: true, "aria-label": "Review to paste into GitHub" });
+    const out = el("textarea", { id: "review-text", readonly: true, hidden: true, rows: 14, "aria-label": "The copied review" });
     const note = el("span", { class: "muted" });
-    const copy = el("button", { type: "button", text: "Copy review", onclick: () => {
-      const lines = [];
-      for (const l of stack.layers) for (const c of layers[l.pr].cards) {
-        if (cardState(stack, c).state !== "concern") continue;
-        const r = c.ranges[0];
-        lines.push("- **#" + l.pr + " " + refText(r) + "**: " + (c.title || c.claim) + (c.question ? "\n  " + c.question : "") + "\n  " + r.link);
-      }
-      const text = lines.length ? "Concerns from the review brief:\n\n" + lines.join("\n") : "No card is marked as a concern.";
+    const chain = stack.layers.map((l) => "#" + l.pr).join(" → ");
+    const show = (text) => {
       out.value = text; out.hidden = false;
-      const fallback = () => { out.select(); note.textContent = "Select and copy the text above."; };
+      const fallback = () => { out.select(); note.textContent = "Select and copy the text below."; };
       if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(() => { note.textContent = "Copied."; }, fallback);
       else fallback();
+    };
+    const empty = "No card has a concern, an answer or a note yet.";
+    const copyGitHub = el("button", { type: "button", text: "Copy GitHub review", onclick: () => {
+      const items = reviewedItems(stack, layers);
+      if (!items.length) { show(empty); return; }
+      const concerns = items.filter((i) => i.s.state === "concern").length;
+      show("Review of " + chain + ", from its review brief: " + count(concerns, "concern") + ", " + count(items.filter((i) => i.s.choice).length, "answer") + ".\n\n" +
+        items.map(reviewMarkdown).join("\n\n"));
+    } });
+    const copyPrompt = el("button", { type: "button", text: "Copy fix prompt", onclick: () => {
+      const items = reviewedItems(stack, layers);
+      if (!items.length) { show(empty); return; }
+      show("/goal apply my review of the stack " + chain + ". For each item below, change the code in the layer it names (fix a lower layer from the top branch with a fixup commit), then push. " +
+        "Where I picked an answer, carry out that answer. Where I marked a concern, address my note; if the note is missing or unclear, ask me before changing the code.\n\n" +
+        items.map(reviewMarkdown).join("\n\n"));
     } });
     const nic = stack.not_in_code || [];
     return el("footer", {},
       nic.length ? el("section", { class: "notincode stack" }, el("h3", { text: "Not in the code" }),
         el("p", { text: "Points with no code to show. They are not part of what you approve." }),
         el("ul", {}, nic.map((n) => el("li", {}, n.text, " ", link(n.link, "where it was raised"))))) : null,
-      el("div", { class: "row" }, copy, note),
+      el("div", { class: "row" }, copyGitHub, copyPrompt, note),
       out,
-      el("p", { text: "Card states (unread, fine, concern) are kept in this browser only, keyed by each range's content: a rebase keeps them and a change to the code reopens the card. No agent can read them. A concern counts once it is a comment on the PR: follow the card's link and leave a line comment, or paste the copied review into a GitHub review." }),
+      el("p", { text: "Each card's state, the answer you picked and your note are kept in this browser only, keyed by each range's content: a rebase keeps them, and a change to the code reopens the card with your note kept. No agent can read them. The copied review lists every card with a concern, an answer or a note. Paste the GitHub review into the PR's \"Review changes\" box (request changes there), or paste the fix prompt into a new Claude session to have the changes made." }),
       el("p", { text: "Format " + stack.format + ". Approval and merge stay on GitHub." }));
   }
 

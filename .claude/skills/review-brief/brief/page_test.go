@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"html"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -169,6 +170,89 @@ func Test_card_reads_top_to_bottom(t *testing.T) {
 	text := regexp.MustCompile(`(?s)<script\b.*?</script>|<style\b.*?</style>|<[^>]*>`).ReplaceAllString(dom, " ")
 	if strings.Contains(text, "https://") || strings.Contains(text, "[object ") {
 		t.Errorf("the page shows a URL or a stringified object as text")
+	}
+}
+
+// reviewDriver is served beside the brief, same origin, and drives it in an
+// iframe the way a reviewer would. --dump-dom cannot click, so the driver
+// writes what it saw into its own DOM.
+const reviewDriver = `<!doctype html><meta charset="utf-8"><title>driver</title>
+<pre id="gh"></pre><pre id="prompt"></pre><pre id="progress"></pre><pre id="persist"></pre><pre id="err"></pre>
+<iframe id="f" src="index.html"></iframe>
+<script>
+const f = document.getElementById("f");
+const put = (id, v) => { document.getElementById(id).textContent = v; };
+const until = (cond, then, n = 0) => { const v = cond(); if (v) then(v); else if (n < 200) setTimeout(() => until(cond, then, n + 1), 25); else put("err", "timed out"); };
+const doc = () => f.contentDocument;
+const card = () => doc() && doc().querySelector("article.card");
+const button = (text) => [...doc().querySelectorAll("button")].find((b) => b.textContent === text);
+until(card, (c) => {
+  try {
+    c.querySelectorAll("button.option")[1].click();
+    const note = c.querySelector(".review-note textarea");
+    note.value = "Drop it: nobody reads S.\n\nAnd rename a().";
+    note.dispatchEvent(new Event("input"));
+    [...c.querySelectorAll(".states button")].find((b) => b.textContent === "Concern").click();
+    put("progress", doc().querySelector(".layer summary").textContent);
+    button("Copy GitHub review").click();
+    put("gh", doc().getElementById("review-text").value);
+    button("Copy fix prompt").click();
+    put("prompt", doc().getElementById("review-text").value);
+    f.src = "index.html?again";
+    setTimeout(() => until(() => card() && card().querySelector(".review-note textarea") && f.contentWindow.location.search === "?again" && card(), (c2) => {
+      put("persist", [c2.querySelector(".review-note textarea").value, c2.querySelector('button.option[aria-pressed="true"] .choice').textContent, c2.dataset.state].join("|"));
+    }), 50);
+  } catch (e) { put("err", e.message); }
+});
+</script>`
+
+// A reviewer picks an answer, writes a note and marks a concern; both copied
+// reviews carry them, the layer counts the card closed, and a reload keeps
+// all three.
+func Test_review_answers_and_notes_reach_the_copied_review(t *testing.T) {
+	dir, url := servedBrief(t, apiDown)
+	if err := os.WriteFile(filepath.Join(dir, "driver.html"), []byte(reviewDriver), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dom := dumpDOM(t, strings.TrimSuffix(url, "index.html")+"driver.html")
+	field := func(id string) string {
+		m := regexp.MustCompile(`(?s)<pre id="` + id + `">(.*?)</pre>`).FindStringSubmatch(dom)
+		if m == nil {
+			t.Fatalf("driver output lacks #%s:\n%s", id, tail(dom))
+		}
+		return html.UnescapeString(m[1])
+	}
+	if e := field("err"); e != "" {
+		t.Fatalf("driver: %s", e)
+	}
+	if p := field("progress"); !strings.Contains(p, "All 1 cards closed") {
+		t.Errorf("progress after answering: %q", p)
+	}
+	item := []string{
+		"### #1 · A string constant joins a()",
+		"[`src/a.rs:2`](https://github.com/o/r/",
+		"**Concern.**",
+		"Answer: **Drop it**: " + hostile,
+		"Note:\n> Drop it: nobody reads S.\n> \n> And rename a().",
+	}
+	gh := field("gh")
+	if !strings.HasPrefix(gh, "Review of #1, from its review brief: 1 concern, 1 answer.") {
+		t.Errorf("GitHub review starts %q", gh[:min(80, len(gh))])
+	}
+	prompt := field("prompt")
+	if !strings.HasPrefix(prompt, "/goal apply my review of the stack #1.") {
+		t.Errorf("fix prompt starts %q", prompt[:min(80, len(prompt))])
+	}
+	for _, want := range item {
+		if !strings.Contains(gh, want) {
+			t.Errorf("GitHub review lacks %q:\n%s", want, gh)
+		}
+		if !strings.Contains(prompt, want) {
+			t.Errorf("fix prompt lacks %q", want)
+		}
+	}
+	if p := field("persist"); p != "Drop it: nobody reads S.\n\nAnd rename a().|Drop it|concern" {
+		t.Errorf("after a reload the card holds %q", p)
 	}
 }
 
