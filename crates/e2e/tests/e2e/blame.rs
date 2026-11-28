@@ -615,6 +615,34 @@ async fn missing_transitive_dep_blames_declarer() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// CQ-M2: `//c:y` builds, and only its consumer's merge of its
+/// `transitive` finds the missing dep, so `//c:y` is blamed after its own
+/// scope ended. It has one `ResultStart`: the claim's winner does not
+/// reopen a row that already closed. The failing `ResultEnd` still comes,
+/// last, for a consumer that reads the culprit from it.
+#[tokio::test]
+async fn culprit_that_already_ended_gets_no_second_start() -> anyhow::Result<()> {
+    let ws = chain_to_c(
+        r#"transitive = {"deps": ["//d:missing"]}"#,
+        &[("d", D_PRESENT)],
+    );
+    let r = run(&ws.engine, "//a:root").await;
+    r.assert_blames("//c:y");
+    let of_c: Vec<&str> = r
+        .events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            BuildEventKind::ResultStart { addr } if addr == "//c:y" => Some("start"),
+            BuildEventKind::ResultEnd { addr, error, .. } if addr == "//c:y" => {
+                Some(if error.is_some() { "failed" } else { "ok" })
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(of_c, ["start", "ok", "failed"], "{:#?}", r.events);
+    Ok(())
+}
+
 #[tokio::test]
 async fn missing_scratch_blames_declarer() -> anyhow::Result<()> {
     let ws = chain_to_c(r#"scratch = ["//d:missing"]"#, &[("d", D_PRESENT)]);

@@ -2339,7 +2339,8 @@ fn classify_each(
 /// The event that announces a culprit with no scope of its own, sent once by
 /// the claim's winner: a `FileFailed` for a BUILD file that did not evaluate
 /// (a path never goes in an address field), else a synthetic
-/// `ResultStart`/`ResultEnd` pair for the culprit target.
+/// `ResultStart`/`ResultEnd` pair for the culprit target, or only the
+/// `ResultEnd` when the target's own scope already opened.
 fn announce_culprit(
     rs: &RequestState,
     culprit: &Culprit,
@@ -2357,8 +2358,21 @@ fn announce_culprit(
             path,
         }),
         Culprit::Target(addr) => {
+            // A culprit whose own scope already opened (its locked
+            // resolution is done: a target blamed for the `transitive` its
+            // consumer merged, after it built) has its row: a second
+            // `ResultStart` would reopen a row that already ended. Only
+            // the End, which a consumer that missed the failure (the JSON
+            // fold's culprit record) still needs.
+            let opened = rs
+                .data
+                .mem_locked_result
+                .peek(&AddrKey(addr.clone()))
+                .is_some();
             let addr = addr.format();
-            rs.emit(BuildEventKind::ResultStart { addr: addr.clone() });
+            if !opened {
+                rs.emit(BuildEventKind::ResultStart { addr: addr.clone() });
+            }
             rs.emit(result_end_event(
                 rs,
                 addr,
