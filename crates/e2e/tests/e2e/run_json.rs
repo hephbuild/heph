@@ -28,7 +28,7 @@ target(name = "blk", driver = "bash", run = "echo b > $OUT", out = "blk.txt", de
 "#;
 
 /// The default fields: every `free` one but `outputs`.
-const DEFAULT_KEYS: [&str; 14] = [
+const DEFAULT_KEYS: [&str; 15] = [
     "addr",
     "cache",
     "duration_ms",
@@ -41,6 +41,7 @@ const DEFAULT_KEYS: [&str; 14] = [
     "path",
     "remote",
     "root",
+    "root_file",
     "selected",
     "timed_out",
 ];
@@ -220,7 +221,16 @@ async fn run_json_entries() {
     assert_eq!(e["exit_code"], 0, "{e}");
     assert_eq!(e["timed_out"], false, "{e}");
     assert_eq!(e["selected"], true, "{e}");
-    for null in ["error", "failure", "remote", "file", "root", "more", "path"] {
+    for null in [
+        "error",
+        "failure",
+        "remote",
+        "file",
+        "root",
+        "root_file",
+        "more",
+        "path",
+    ] {
         assert!(e[null].is_null(), "{null}: {e}");
     }
 
@@ -409,6 +419,7 @@ async fn fail_fast_siblings_are_cancelled_and_listed() {
     let slow = run.entry("//p:slow");
     assert_eq!(slow["outcome"], "cancelled", "{slow}");
     assert!(slow["root"].is_null(), "a stop blames no one: {slow}");
+    assert!(slow["root_file"].is_null(), "{slow}");
     assert!(slow["exit_code"].is_null(), "{slow}");
     let ends: Vec<_> = run
         .events
@@ -567,13 +578,18 @@ async fn run_json_broken_build_two_requested_targets() {
     let file = &two.entries[0];
     assert!(file["addr"].is_null(), "{file}");
     assert_eq!(file["file"], "d/BUILD", "{file}");
-    assert_eq!(file["root"], "d/BUILD", "{file}");
+    assert_eq!(file["root_file"], "d/BUILD", "{file}");
+    assert!(
+        file["root"].is_null(),
+        "a file culprit has no `root`: {file}"
+    );
     assert_eq!(file["selected"], false, "{file}");
     assert_eq!(file["path"], serde_json::json!(["//d:t1"]), "{file}");
     for t in ["//d:t1", "//d:t2"] {
         let e = two.entry(t);
         assert_eq!(e["outcome"], "skipped", "{e}");
-        assert_eq!(e["root"], "d/BUILD", "{e}");
+        assert_eq!(e["root_file"], "d/BUILD", "{e}");
+        assert!(e["root"].is_null(), "{e}");
         assert_eq!(e["selected"], true, "{e}");
         assert_eq!(e["path"], serde_json::json!([t]), "{e}");
         assert!(e["error"].is_null(), "{e}");
@@ -585,7 +601,11 @@ async fn run_json_broken_build_two_requested_targets() {
     let file = &one.entries[0];
     assert!(file["addr"].is_null(), "{file}");
     assert_eq!(file["file"], "d/BUILD", "{file}");
-    assert_eq!(file["root"], "d/BUILD", "{file}");
+    assert_eq!(file["root_file"], "d/BUILD", "{file}");
+    assert!(
+        file["root"].is_null(),
+        "a file culprit has no `root`: {file}"
+    );
     assert_eq!(file["outcome"], "failed", "{file}");
     assert_eq!(file["selected"], false, "{file}");
     assert_eq!(file["path"], serde_json::json!(["//d:t1"]), "{file}");
@@ -596,7 +616,8 @@ async fn run_json_broken_build_two_requested_targets() {
     let t1 = &one.entries[1];
     assert_eq!(t1["addr"], "//d:t1", "{t1}");
     assert_eq!(t1["outcome"], "skipped", "{t1}");
-    assert_eq!(t1["root"], "d/BUILD", "{t1}");
+    assert_eq!(t1["root_file"], "d/BUILD", "{t1}");
+    assert!(t1["root"].is_null(), "{t1}");
     assert_eq!(t1["selected"], true, "{t1}");
     assert_eq!(t1["path"], serde_json::json!(["//d:t1"]), "{t1}");
 }
@@ -722,7 +743,11 @@ async fn file_culprit_record_shape() {
     );
     assert_eq!(file["file"], "d/BUILD", "{file}");
     assert_eq!(file["outcome"], "failed", "{file}");
-    assert_eq!(file["root"], "d/BUILD", "a culprit is its own root: {file}");
+    assert_eq!(
+        file["root_file"], "d/BUILD",
+        "a culprit is its own root: {file}"
+    );
+    assert!(file["root"].is_null(), "{file}");
     assert_eq!(file["selected"], false, "a file is never selected: {file}");
     assert_eq!(
         file["path"],
@@ -744,7 +769,8 @@ async fn file_culprit_record_shape() {
         assert_eq!(keys(e), DEFAULT_KEYS, "{e}");
         assert_eq!(e["outcome"], "skipped", "{e}");
         assert_eq!(e["selected"], true, "{e}");
-        assert_eq!(e["root"], "d/BUILD", "{e}");
+        assert_eq!(e["root_file"], "d/BUILD", "{e}");
+        assert!(e["root"].is_null(), "{e}");
         assert_eq!(
             e["path"],
             serde_json::json!([t, "//b:t", "//c:t", "//d:t"]),
@@ -790,14 +816,16 @@ async fn package_matcher_broken_dep_file() {
         let file = &run.entries[0];
         assert!(file["addr"].is_null(), "{m:?}: {file}");
         assert_eq!(file["file"], "d/BUILD", "{m:?}: {file}");
-        assert_eq!(file["root"], "d/BUILD", "{m:?}: {file}");
+        assert_eq!(file["root_file"], "d/BUILD", "{m:?}: {file}");
+        assert!(file["root"].is_null(), "{m:?}: {file}");
         assert_eq!(file["outcome"], "failed", "{m:?}: {file}");
         assert_eq!(file["selected"], false, "{m:?}: {file}");
         for t in ["//q:a", "//q:b"] {
             let e = run.entry(t);
             assert_eq!(e["outcome"], "skipped", "{m:?}: {e}");
             assert_eq!(e["selected"], true, "{m:?}: {e}");
-            assert_eq!(e["root"], "d/BUILD", "{m:?}: {e}");
+            assert_eq!(e["root_file"], "d/BUILD", "{m:?}: {e}");
+            assert!(e["root"].is_null(), "{m:?}: {e}");
             assert_eq!(e["path"], serde_json::json!([t, "//d:t"]), "{m:?}: {e}");
             assert_eq!(e["more"], 0, "{m:?}: {e}");
             assert!(e["error"].is_null(), "{m:?}: {e}");
@@ -839,7 +867,10 @@ async fn culprit_record_precedes_its_skipped_records() {
             if e["outcome"] != "skipped" {
                 continue;
             }
-            let root = e["root"].as_str().expect("a skipped record names its root");
+            let root = e["root"]
+                .as_str()
+                .or_else(|| e["root_file"].as_str())
+                .expect("a skipped record names its root");
             let me = id(e).expect("an id");
             let at = |x: &str| seen.iter().position(|s| s == x);
             assert!(

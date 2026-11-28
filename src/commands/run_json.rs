@@ -11,10 +11,12 @@
 //! Output contract 2 (D5): every culprit has a record, `selected: false` when
 //! the selection did not name it, and a BUILD file that did not evaluate is
 //! one with `addr: null` and `file` set. A skipped target names its culprit
-//! in `root`, with the full `path` to it and the count of `more` culprits it
-//! reaches: those come from the request-end pass over the dependency graph,
-//! so skipped records are written once the run returns, after every culprit.
-//! `blocked_by` and the `blocked` outcome are gone.
+//! in `root` (a target) or `root_file` (a file), never both, with the full
+//! `path` to it and the count of `more` culprits it reaches: those come from
+//! the request-end pass over the dependency graph, so skipped records are
+//! written once the run returns, after every culprit. `blocked_by` and the
+//! `blocked` outcome are gone; `docs/JSON_OUTPUT.md`, "Migrating from
+//! contract 1", is what a contract 1 reader changes.
 //!
 //! The list is closed only when it is whole (D10): the matcher finished, the
 //! walk skipped nothing, the run was not cancelled, and every matched target
@@ -47,7 +49,8 @@ pub enum Outcome {
     Ran,
     /// It failed: its own run, or resolving it.
     Failed,
-    /// It did not run because a culprit it depends on failed (`root`).
+    /// It did not run because a culprit it depends on failed (`root` or
+    /// `root_file`).
     Skipped,
     /// The run was stopped (Ctrl-C) while it was pending.
     Cancelled,
@@ -81,7 +84,8 @@ pub struct RunFailure {
 }
 
 /// `heph run --json`: one element per matched target and per culprit, in
-/// the order they finish; a culprit before every record naming it as `root`.
+/// the order they finish; a culprit before every record naming it as `root`
+/// or `root_file`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, output::Record)]
 pub struct RunEntry {
     /// The target's address; null for a BUILD file that did not evaluate
@@ -107,16 +111,24 @@ pub struct RunEntry {
     /// Why it failed, on one line; null on success and on `skipped`. Its
     /// wording is not contract.
     pub error: Option<String>,
-    /// The culprit: the record itself for a failed culprit, the nearest
-    /// culprit for `skipped`. An address, or a file's path when it does not
-    /// start with `//`. Null for ran, cached and cancelled.
+    /// The culprit when it is a target: the record itself for a failed
+    /// culprit, the nearest culprit for `skipped`. Always an address; null
+    /// when the culprit is a file (`root_file`), and for ran, cached and
+    /// cancelled.
     pub root: Option<String>,
-    /// On `skipped`: how many culprits other than `root` it reaches; null
+    /// The culprit when it is a BUILD or `.bzl` file that did not evaluate:
+    /// the file record's own `file`, or a skipped target's nearest culprit.
+    /// Always a workspace-relative path; at most one of `root` and
+    /// `root_file` is set, the pair mirroring `addr` and `file`.
+    pub root_file: Option<String>,
+    /// On `skipped`: how many culprits other than its own it reaches; null
     /// elsewhere.
     pub more: Option<u64>,
-    /// On a failed culprit: the shortest path from a requested target to
-    /// it. On `skipped`: from this target to `root`'s address. Inclusive and
-    /// never elided; null elsewhere.
+    /// On a failed culprit: a shortest path from a requested target to it,
+    /// the one known when it failed (it can differ between runs in rare
+    /// cases). On `skipped`: from this target to where its culprit was
+    /// recorded, over the final graph. Inclusive and never elided; null
+    /// elsewhere.
     pub path: Option<Vec<String>>,
     /// The selection named it. A culprit outside the selection is written
     /// too, with false; a file record is never selected.
@@ -176,7 +188,7 @@ enum Early {
 }
 
 /// A selected target's `skipped` record, waiting for the request-end pass
-/// that gives it `root`, `path` and `more`.
+/// that gives it `root` or `root_file`, `path` and `more`.
 #[derive(Debug)]
 struct Held {
     entry: RunEntry,
@@ -236,6 +248,7 @@ fn blank(addr: Option<String>, outcome: Outcome) -> RunEntry {
         timed_out: false,
         error: None,
         root: None,
+        root_file: None,
         more: None,
         path: None,
         selected: false,
@@ -443,7 +456,7 @@ impl Fold {
                     let failure = culprits.failure(&Culprit::File(Arc::from(file.as_str())));
                     let mut rec = blank(None, Outcome::Failed);
                     rec.file = Some(file.clone());
-                    rec.root = Some(file.clone());
+                    rec.root_file = Some(file.clone());
                     rec.path = Some(match (&failure, path.is_empty()) {
                         (Some(f), true) => f.path.iter().map(Addr::format).collect(),
                         _ => path.clone(),
@@ -567,7 +580,10 @@ impl Fold {
             let mut entry = h.entry;
             match addr.as_ref().and_then(|a| report.get(a)) {
                 Some(rec) => {
-                    entry.root = Some(rec.root.to_string());
+                    match rec.root {
+                        Culprit::Target(a) => entry.root = Some(a.format()),
+                        Culprit::File(f) => entry.root_file = Some(f.to_string()),
+                    }
                     entry.path = Some(rec.path.iter().map(Addr::format).collect());
                     entry.more = Some(u64::try_from(rec.more).unwrap_or(u64::MAX));
                 }
@@ -579,7 +595,10 @@ impl Fold {
                     } else {
                         vec![me, h.of.clone()]
                     });
-                    entry.root = Some(h.file.unwrap_or(h.of));
+                    match h.file {
+                        Some(file) => entry.root_file = Some(file),
+                        None => entry.root = Some(h.of),
+                    }
                     entry.more = Some(0);
                 }
             }
@@ -1028,6 +1047,7 @@ mod tests {
             timed_out: true,
             error: Some("boom".to_string()),
             root: Some("//p:d".to_string()),
+            root_file: Some("p/BUILD".to_string()),
             more: Some(1),
             path: Some(vec!["//p:t".to_string()]),
             selected: true,
@@ -1190,9 +1210,10 @@ mod tests {
         assert!(f.held[0].entry.selected);
     }
 
-    /// A BUILD file that did not evaluate: one record, `addr` null, `file`
-    /// and `root` the file, never selected, however many targets it took
-    /// down; the requested target that led into it is held as skipped.
+    /// A BUILD file that did not evaluate: one record, `addr` and `root`
+    /// null, `file` and `root_file` the file, never selected, however many
+    /// targets it took down; the requested target that led into it is held
+    /// as skipped.
     #[test]
     fn file_failed_one_record_and_holds_its_entry() {
         let dup = |a: &str, file: Option<&str>| {
@@ -1224,7 +1245,8 @@ mod tests {
         let rec = &entries[0];
         assert_eq!(rec.addr, None);
         assert_eq!(rec.file.as_deref(), Some("d/BUILD"));
-        assert_eq!(rec.root.as_deref(), Some("d/BUILD"));
+        assert_eq!(rec.root_file.as_deref(), Some("d/BUILD"));
+        assert_eq!(rec.root, None, "a file is never an address");
         assert_eq!(rec.path.as_deref(), Some(&["//d:t1".to_string()][..]));
         assert!(!rec.selected);
         assert_eq!(
@@ -1303,6 +1325,7 @@ mod tests {
                     e.addr.as_deref(),
                     e.outcome,
                     e.root.as_deref(),
+                    e.root_file.as_deref(),
                     e.path.clone(),
                     e.more,
                     e.selected,
@@ -1317,6 +1340,7 @@ mod tests {
                     Some("//p:a"),
                     Outcome::Skipped,
                     Some("//p:c"),
+                    None,
                     s(&["//p:a", "//p:c"]),
                     Some(0),
                     true
@@ -1324,6 +1348,7 @@ mod tests {
                 (
                     Some("//d:t"),
                     Outcome::Skipped,
+                    None,
                     Some("d/BUILD"),
                     s(&["//d:t"]),
                     Some(0),
@@ -1334,6 +1359,69 @@ mod tests {
         let rs = engine.new_state_with_events(false, None);
         assert!(Fold::default().finish(&rs).is_empty());
         assert_eq!(rs.report_passes(), 0, "a green run pays for no pass");
+    }
+
+    /// The request-end pass over a real graph: a skipped target whose
+    /// nearest culprit is a target names it in `root` alone, one whose
+    /// culprit is a file names it in `root_file` alone.
+    #[tokio::test]
+    async fn finish_splits_root_and_root_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine =
+            Arc::new(Engine::new(crate::engine::Config::for_tests(dir.path())).expect("engine"));
+        let rs = engine.new_state_with_events(false, None);
+        let a = |s: &str| crate::htaddr::parse_addr(s).expect("addr");
+        rs.add_dep_for_test(&a("//a:x"), &a("//c:y")).expect("edge");
+        rs.add_dep_for_test(&a("//b:z"), &a("//d:t")).expect("edge");
+        rs.record_failure(
+            Culprit::Target(a("//c:y")),
+            Arc::new(TargetFailure::new(
+                a("//c:y"),
+                None,
+                anyhow::anyhow!("boom"),
+            )),
+        );
+        let mut file = TargetFailure::new(a("//d:t"), None, anyhow::anyhow!("eval"));
+        file.file = Some(Arc::from("d/BUILD"));
+        rs.record_failure(Culprit::File(Arc::from("d/BUILD")), Arc::new(file));
+        let mut to_file = end("//b:z", Some("dependency failed"), Some("//d:t"));
+        if let BuildEventKind::ResultEnd { upstream_file, .. } = &mut to_file {
+            *upstream_file = Some("d/BUILD".to_string());
+        }
+        let (_, mut f) = fold_with(
+            vec![
+                ev(0, matched(&["//a:x", "//b:z"], true)),
+                ev(1, end("//a:x", Some("dependency failed"), Some("//c:y"))),
+                ev(2, to_file),
+            ],
+            &Known::default(),
+        );
+        let got: Vec<_> = f
+            .finish(&rs)
+            .into_iter()
+            .map(|e| (e.addr, e.outcome, e.root, e.root_file, e.path))
+            .collect();
+        let o = |s: &str| Some(s.to_string());
+        let p = |v: &[&str]| Some(v.iter().map(|a| (*a).to_string()).collect::<Vec<_>>());
+        assert_eq!(
+            got,
+            [
+                (
+                    o("//a:x"),
+                    Outcome::Skipped,
+                    o("//c:y"),
+                    None,
+                    p(&["//a:x", "//c:y"])
+                ),
+                (
+                    o("//b:z"),
+                    Outcome::Skipped,
+                    None,
+                    o("d/BUILD"),
+                    p(&["//b:z", "//d:t"])
+                ),
+            ]
+        );
     }
 
     /// A dependency that built, then was blamed when it later ended failed,
