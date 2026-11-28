@@ -47,13 +47,20 @@ pub fn left_behind_rows_in(
     if let Some(sandbox) = &left.sandbox {
         out.push_str(&format!("  sandbox: {sandbox}\n"));
     }
-    match &left.outputs {
-        Some(outputs) if paths => out.push_str(&format!("  outputs: {outputs}\n")),
-        Some(_) => out.push_str(&format!(
-            "  outputs: kept · heph inspect failure {}\n",
-            shell_quote(addr)
-        )),
-        None => {}
+    if let Some(outputs) = &left.outputs {
+        // What was kept, then where: the path, or the command that names it.
+        let what = kept_groups(left);
+        if paths && what.is_empty() {
+            out.push_str(&format!("  outputs: {outputs}\n"));
+        } else if paths {
+            out.push_str(&format!("  outputs: {what} · {outputs}\n"));
+        } else {
+            let what = if what.is_empty() { "kept" } else { &what };
+            out.push_str(&format!(
+                "  outputs: {what} · heph inspect failure {}\n",
+                shell_quote(addr)
+            ));
+        }
     }
     if let Some(fixes) = &left.fixes {
         fixes_rows(&mut out, fixes);
@@ -67,6 +74,51 @@ pub fn left_behind_rows_in(
         out.push_str("  log: none kept\n");
     }
     out
+}
+
+/// The kept `failure_out` groups, as a row names them: `report/ (3 files),
+/// a.txt +2 more`. Empty when the slot counted none.
+fn kept_groups(left: &LeftBehindData) -> String {
+    let mut groups: Vec<String> = left
+        .kept
+        .iter()
+        .map(|g| {
+            let name = crate::tui::text::clean_inline(&g.name);
+            match g.files {
+                1 if !name.ends_with('/') => name.into_owned(),
+                1 => format!("{name} (1 file)"),
+                n => format!(
+                    "{name} ({} files)",
+                    hcore::units::thousands(usize::try_from(n).unwrap_or(usize::MAX))
+                ),
+            }
+        })
+        .collect();
+    if left.kept_more > 0 {
+        groups.push(format!("+{} more", left.kept_more));
+    }
+    groups.join(", ")
+}
+
+/// The `took down:` row of a culprit others failed because of: the first
+/// few by name, then `+N more`. `None` when it took down nothing.
+pub fn took_down_row(td: &hcore::events::TookDownData) -> Option<String> {
+    if td.total == 0 {
+        return None;
+    }
+    let mut named = td
+        .named
+        .iter()
+        .map(|a| crate::tui::text::clean_inline(a).into_owned())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more = td
+        .total
+        .saturating_sub(u64::try_from(td.named.len()).unwrap_or(u64::MAX));
+    if more > 0 {
+        named.push_str(&format!(" +{more} more"));
+    }
+    Some(format!("took down: {named}"))
 }
 
 /// A path of more targets than this is elided in text (error-reporting U3,
@@ -378,6 +430,7 @@ mod tests {
                 reason: "--frozen checks the tree, it never writes it".into(),
             }),
             log_readable: Some(true),
+            ..LeftBehindData::default()
         };
         assert_eq!(
             left_behind_rows("//p:x", &left),

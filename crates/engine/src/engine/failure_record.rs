@@ -187,13 +187,17 @@ pub(crate) fn compact(
     };
 
     if let Some(slot) = downcast_chain_ref::<FailureSlot>(e) {
-        rec.left_behind = Some(hplugin::error::left_behind(
-            slot.log.as_ref(),
-            slot.sandbox.as_ref(),
-            slot.out.as_deref(),
-            slot.fixes.as_ref(),
-            None,
-        ));
+        rec.left_behind = Some(hcore::events::LeftBehindData {
+            kept: slot.kept.clone(),
+            kept_more: slot.kept_more,
+            ..hplugin::error::left_behind(
+                slot.log.as_ref(),
+                slot.sandbox.as_ref(),
+                slot.out.as_deref(),
+                slot.fixes.as_ref(),
+                None,
+            )
+        });
         rec.log = slot.log.as_ref().map(|log| LogRef {
             path: log.path().map(|p| p.display().to_string()),
             fill_id: slot.fill_id.clone(),

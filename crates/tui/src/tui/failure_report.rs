@@ -46,7 +46,7 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::tui::failure_rows::{
     TailRows, left_behind_rows_in, log_line_count, log_readable, reached_by_rows, shell_quote,
-    tail_rows,
+    tail_rows, took_down_row,
 };
 use crate::tui::text::{
     ELLIPSIS, Redact, WorkspaceRel, clean_inline, cut_right, escape_control, escape_log_tail,
@@ -292,6 +292,9 @@ pub fn render_box(rec: &FailureRecord, ctx: &RenderCtx) -> String {
         b.diff(diff);
     }
     for row in reached_by_rows(&rec.path, rec.file.is_some()) {
+        b.row(&row);
+    }
+    if let Some(row) = rec.took_down.as_ref().and_then(took_down_row) {
         b.row(&row);
     }
     if let Some(log) = &rec.log {

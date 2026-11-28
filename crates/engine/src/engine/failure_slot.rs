@@ -186,6 +186,11 @@ pub struct FailureSlot {
     pub log: Option<FailureLog>,
     /// The slot's `out/`, when the run's `failure_out` matches were kept.
     pub out: Option<PathBuf>,
+    /// What `out` holds at the target's package, grouped ([`kept_groups`]):
+    /// counted once here, so no renderer walks the slot.
+    pub kept: Vec<hcore::events::KeptGroup>,
+    /// How many groups past `kept` were left out.
+    pub kept_more: u32,
     /// Why the run's `failure_out` matches were not kept, when keeping them
     /// failed: the target's error carries it as one context line.
     pub out_error: Option<String>,
@@ -566,6 +571,11 @@ impl FailureSlots {
                             .log
                             .map(|(path, file, _)| FailureLog::open(path, file, lines))
                             .or(memory),
+                        kept: built
+                            .out
+                            .as_deref()
+                            .map(|out| kept_groups(out, addr.package.as_ref()))
+                            .unwrap_or_default(),
                         out: built.out,
                         out_error: built.out_error.map(|e| format!("{e:#}")),
                         fixes: built.fixes,
@@ -602,6 +612,8 @@ impl FailureSlots {
         FailureSlot {
             log: filled.log,
             out: filled.out,
+            kept: filled.kept.0,
+            kept_more: filled.kept.1,
             out_error: filled.out_error,
             fixes,
             sandbox: None,
@@ -812,9 +824,57 @@ struct Filled {
     log_lines: u64,
     log: Option<FailureLog>,
     out: Option<PathBuf>,
+    kept: (Vec<hcore::events::KeptGroup>, u32),
     out_error: Option<String>,
     /// The slot's `fixes.txt`, when one was written.
     fixes: Option<PathBuf>,
+}
+
+/// The files under `out` (a slot's `out/`) at `package`, grouped by first
+/// path component: a directory (`report/`) with how many files it holds, or
+/// a top-level file alone. Sorted by name; the first
+/// [`KEPT_GROUPS_CAP`](hcore::events::KEPT_GROUPS_CAP), and how many more.
+/// `failure_out` is package-relative and the slot mirrors the workspace, so
+/// `//web:lint`'s groups read `report/`, not `web/`. Symlinks are counted,
+/// never followed; an unreadable directory reads as empty.
+pub(crate) fn kept_groups(out: &Path, package: &str) -> (Vec<hcore::events::KeptGroup>, u32) {
+    use hcore::events::{KEPT_GROUPS_CAP, KeptGroup};
+    let Ok(entries) = std::fs::read_dir(out.join(package)) else {
+        return (Vec::new(), 0);
+    };
+    let count_files = |dir: PathBuf| {
+        let mut n = 0u64;
+        let mut stack = vec![dir];
+        while let Some(d) = stack.pop() {
+            for entry in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+                match entry.file_type() {
+                    Ok(t) if t.is_dir() => stack.push(entry.path()),
+                    Ok(_) => n += 1,
+                    Err(_) => {}
+                }
+            }
+        }
+        n
+    };
+    let mut groups: Vec<KeptGroup> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                let files = count_files(entry.path());
+                (files > 0).then(|| KeptGroup {
+                    name: format!("{name}/"),
+                    files,
+                })
+            } else {
+                Some(KeptGroup { name, files: 1 })
+            }
+        })
+        .collect();
+    groups.sort_by(|a, b| a.name.cmp(&b.name));
+    let more = groups.len().saturating_sub(KEPT_GROUPS_CAP);
+    groups.truncate(KEPT_GROUPS_CAP);
+    (groups, u32::try_from(more).unwrap_or(u32::MAX))
 }
 
 /// The file operations a fill performs, injectable for tests.
@@ -1219,6 +1279,33 @@ mod tests {
 
     fn addr(s: &str) -> Addr {
         hmodel::htaddr::parse_addr(s).expect("addr")
+    }
+
+    /// The kept files are grouped at the target's package, a directory by
+    /// its file count and a file alone, sorted and capped; an empty
+    /// directory is no group.
+    #[test]
+    fn kept_groups_at_package_sorted_and_capped() {
+        let dir = hcore::fsutil::tempdir().expect("tempdir");
+        let pkg = dir.path().join("web");
+        for f in ["report/a", "report/deep/b", "report/deep/c", "z.txt", "a.txt"] {
+            let p = pkg.join(f);
+            std::fs::create_dir_all(p.parent().expect("parent")).expect("mkdir");
+            std::fs::write(&p, "x").expect("write");
+        }
+        std::fs::create_dir_all(pkg.join("empty")).expect("mkdir");
+        let (groups, more) = kept_groups(dir.path(), "web");
+        let named: Vec<_> = groups.iter().map(|g| (g.name.as_str(), g.files)).collect();
+        assert_eq!(named, [("a.txt", 1), ("report/", 3), ("z.txt", 1)]);
+        assert_eq!(more, 0);
+
+        for i in 0..7 {
+            std::fs::write(pkg.join(format!("m{i}")), "x").expect("write");
+        }
+        let (groups, more) = kept_groups(dir.path(), "web");
+        assert_eq!(groups.len(), hcore::events::KEPT_GROUPS_CAP);
+        assert_eq!(more, 5);
+        assert_eq!(kept_groups(dir.path(), "gone"), (Vec::new(), 0));
     }
 
     fn manifest_for(a: &Addr) -> SlotManifest {

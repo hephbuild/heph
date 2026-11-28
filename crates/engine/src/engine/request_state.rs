@@ -1559,12 +1559,20 @@ impl RequestState {
             .into_iter()
             .zip(paths)
             .map(|(f, path)| {
-                if f.path == path {
+                // What it took down is known only now, as the path is.
+                let took_down = Some(self.took_down(&f.addr.format()))
+                    .filter(|t| t.total > 0)
+                    .map(|t| hcore::events::TookDownData {
+                        named: t.named,
+                        total: u64::try_from(t.total).unwrap_or(u64::MAX),
+                    });
+                if f.path == path && f.record.took_down == took_down {
                     f
                 } else {
                     // The record says the same path as the failure it is of.
                     let mut record = f.record.as_ref().clone();
                     record.path = path.iter().map(Addr::format).collect();
+                    record.took_down = took_down;
                     Arc::new(
                         f.as_ref()
                             .clone()
@@ -1608,7 +1616,16 @@ impl RequestState {
                         return f;
                     }
                     let readable = engine.log_readable(&f.addr).await;
-                    Arc::new(f.as_ref().clone().with_log_readable(readable))
+                    // The record answers as the failure does: the box reads
+                    // only the record.
+                    let mut record = f.record.as_ref().clone();
+                    record.left_behind.get_or_insert_default().log_readable = Some(readable);
+                    Arc::new(
+                        f.as_ref()
+                            .clone()
+                            .with_log_readable(readable)
+                            .with_record(Arc::new(record)),
+                    )
                 }
             })
             .buffered(crate::engine::fanout::discovery_concurrency())

@@ -1070,6 +1070,9 @@ pub fn left_behind(
             },
         }),
         log_readable,
+        // Counted when the slot is filled, and carried by its record.
+        kept: Vec::new(),
+        kept_more: 0,
     }
 }
 
