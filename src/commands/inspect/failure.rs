@@ -6,7 +6,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use clap_complete::engine::ArgValueCompleter;
 use hcore::diagnostic::{Hint, SourceLoc, Stage};
-use hcore::failure::{FailedIn, FailureRecord, LogRef};
+use hcore::failure::{FailureRecord, LogRef};
 use serde::Serialize;
 
 use crate::commands::GlobalOptions;
@@ -164,10 +164,11 @@ fn slot_view(dir: &Path, manifest: SlotManifest, text: &ViewText) -> anyhow::Res
         });
         rec
     });
-    let before_run = match &record {
-        Some(rec) => file.is_some() || rec.failed_in == FailedIn::BeforeRun,
-        None => manifest.hashin.is_none() && log.is_none(),
-    };
+    // The slot says whether the target ran, never the record (compat F2): a
+    // cdylib's failure after its run can be recorded `before_run`, and an
+    // older slot has no record. A run leaves a revision or a log; a failure
+    // before it leaves neither.
+    let before_run = file.is_some() || (manifest.hashin.is_none() && log.is_none());
     let (stage, message, location, hints, truncated, log_replaced) = match &record {
         Some(rec) => {
             let facts = crate::tui::failure_report::json_facts(rec);
@@ -355,6 +356,26 @@ mod tests {
         });
         std::fs::write(dir.join("manifest.json"), manifest.to_string()).expect("write manifest");
         (home, slots)
+    }
+
+    /// "Before the run" is the slot's to say, not the record's (compat F2):
+    /// a slot with a revision and a log ran, though its record (a cdylib's
+    /// after-run failure) says `before_run`. Its revision and time are kept.
+    #[test]
+    fn before_run_comes_from_the_slot() {
+        let addr = htaddr::parse_addr("//web:lint").expect("addr");
+        let (_home, slots) = slot(&addr, false);
+        let dir = slots.slot_dir(&addr);
+        std::fs::write(
+            dir.join("diagnostic.json"),
+            r#"{"version":1,"diagnostic":{"stage":"run","message":"boom"},"addr":"//web:lint"}"#,
+        )
+        .expect("write diagnostic");
+        let view = failure_view(&slots, &addr).expect("read").expect("a slot");
+        assert_eq!(view.message, "boom", "the record was read");
+        assert!(!view.before_run(), "{view:?}");
+        assert_eq!(view.hashin.as_deref(), Some("h1"));
+        assert_eq!(view.failed_at, Some(42));
     }
 
     #[test]
