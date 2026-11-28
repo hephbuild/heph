@@ -336,5 +336,28 @@ target(name = "two", driver = "bash", out = "o.txt", credentials = ["//auth:a", 
     let json = inspect_json(&ws.engine, "//app:two")?;
     assert_ne!(json.trim(), "null", "//app:two has a record");
     assert_no([HELD], "inspect failure --json //app:two", &json);
+    assert_no_held_in_events(&run, [HELD], "//app:");
     Ok(())
+}
+
+/// No event of `run`, as JSON, and not the spotlight folded from them,
+/// holds any of `secrets` (HERM r2, as [`no_secret_in_events`] checks).
+/// The spotlight names `culprit_prefix`, so the fold saw the failure.
+fn assert_no_held_in_events<'a>(
+    run: &JsonRun,
+    secrets: impl IntoIterator<Item = &'a str> + Clone,
+    culprit_prefix: &str,
+) {
+    for ev in &run.events {
+        let json = serde_json::to_string(ev).expect("an event serializes");
+        assert_no(secrets.clone(), "an event", &json);
+    }
+    let mut fold = heph::tui::progress::BuildState::new();
+    for ev in &run.events {
+        fold.apply(ev);
+    }
+    let at = run.events.last().map_or(0, |ev| ev.at_unix_ms);
+    let spot = fold.spotlight(at).map(|s| s.text()).unwrap_or_default();
+    assert!(spot.contains(culprit_prefix), "the spotlight: {spot:?}");
+    assert_no(secrets, "the spotlight", &spot);
 }
