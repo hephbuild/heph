@@ -1132,6 +1132,61 @@ target(name = "h", driver = "group", deps = ["//e:ep"])
     Ok(())
 }
 
+/// D1.f: two inputs of `//top:t` reach one broken `e/BUILD` through two
+/// different targets (`//d:x → //e:a`, `//d:y → //e:b`). Under keep-going
+/// the members blame the same file through different entries: one culprit,
+/// the file, and the classification terminates (it once regrouped the
+/// members forever and overflowed the stack).
+#[tokio::test]
+async fn two_entries_into_one_broken_file_blame_the_file() -> anyhow::Result<()> {
+    let ws = build_ws(&[
+        ("top", &t("t", r#"deps = ["//d:x", "//d:y"]"#)),
+        (
+            "d",
+            &format!(
+                "{}\n{}\n",
+                t("x", r#"deps = ["//e:a"]"#),
+                t("y", r#"deps = ["//e:b"]"#)
+            ),
+        ),
+        (
+            "e",
+            &format!("{}\n{}\nfail(\"boom\")\n", t("a", ""), t("b", "")),
+        ),
+    ]);
+    let r = run(&ws.engine, "//top:t").await;
+    assert_eq!(r.culprits(), ["e/BUILD"], "{}", r.describe());
+    assert_not_blamed(&r, &["//top:t", "//d:x", "//d:y"]);
+    // The record keeps the first member's entry, and its path ends there.
+    let f = r.failure("e/BUILD");
+    assert_eq!(f.addr.format(), "//e:a", "{}", r.describe());
+    assert_eq!(r.path("e/BUILD"), ["//top:t", "//d:x", "//e:a"]);
+    assert_eq!(r.skipped("//top:t").0, "e/BUILD");
+    Ok(())
+}
+
+/// D1.f: `//top:t`'s two inputs live in one `d/BUILD` that fails at
+/// evaluation. Keep-going blames the file, as fail-fast does, never the
+/// consumer that resolved both inputs.
+#[tokio::test]
+async fn two_inputs_in_one_broken_file_blame_the_file() -> anyhow::Result<()> {
+    let ws = build_ws(&[
+        ("top", &t("t", r#"deps = ["//d:x", "//d:y"]"#)),
+        (
+            "d",
+            &format!("{}\n{}\nfail(\"boom\")\n", t("x", ""), t("y", "")),
+        ),
+    ]);
+    let r = run(&ws.engine, "//top:t").await;
+    assert_eq!(r.culprits(), ["d/BUILD"], "{}", r.describe());
+    assert_not_blamed(&r, &["//top:t"]);
+    let f = r.failure("d/BUILD");
+    assert_eq!(f.addr.format(), "//d:x", "{}", r.describe());
+    assert_eq!(r.path("d/BUILD"), ["//top:t", "//d:x"]);
+    assert_eq!(r.skipped("//top:t").0, "d/BUILD");
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Paths and counts (D1.e, P18, U17)
 // ---------------------------------------------------------------------------
